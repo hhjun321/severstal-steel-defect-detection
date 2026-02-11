@@ -1,0 +1,32 @@
+ROI Extraction Statistics
+================================================================================
+
+Total ROIs extracted: 272
+
+ROIs per class:
+  Class 1: 50
+  Class 2: 2
+  Class 3: 189
+  Class 4: 31
+
+ROIs per defect subtype:
+  general: 121
+  compact_blob: 83
+  linear_scratch: 62
+  irregular: 6
+
+ROIs per background type:
+  complex_pattern: 171
+  vertical_stripe: 47
+  smooth: 29
+  horizontal_stripe: 24
+  textured: 1
+
+Average scores:
+  Suitability: 0.669
+  Matching: 0.691
+  Continuity: 0.691
+
+Recommendation distribution:
+  acceptable: 182
+  suitable: 90

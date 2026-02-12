@@ -41,6 +41,61 @@ class ControlNetDatasetPackager:
         self.hint_generator = hint_generator or HintImageGenerator()
         self.prompt_generator = prompt_generator or PromptGenerator(style=prompt_style)
     
+    def _stratified_sample(self, df: pd.DataFrame, n_samples: int) -> pd.DataFrame:
+        """
+        클래스별 균등 분포로 샘플링합니다.
+        
+        각 클래스에서 동일한 수의 샘플을 추출하되,
+        샘플 수가 부족한 클래스는 가용한 전체 샘플을 사용하고
+        남은 할당량은 다른 클래스에 재분배합니다.
+        
+        Args:
+            df: ROI metadata DataFrame (class_id 컬럼 필요)
+            n_samples: 추출할 총 샘플 수
+            
+        Returns:
+            균등 분포로 샘플링된 DataFrame
+        """
+        if 'class_id' not in df.columns:
+            # class_id가 없으면 랜덤 샘플링 fallback
+            return df.sample(n=min(n_samples, len(df)), random_state=42)
+        
+        classes = sorted(df['class_id'].unique())
+        n_classes = len(classes)
+        
+        # 각 클래스별 균등 할당
+        per_class = n_samples // n_classes
+        remainder = n_samples % n_classes
+        
+        sampled_parts = []
+        deficit = 0  # 부족한 클래스에서 채우지 못한 수
+        
+        for i, cls in enumerate(classes):
+            cls_df = df[df['class_id'] == cls]
+            # 나머지는 앞쪽 클래스에 1개씩 추가 할당
+            target = per_class + (1 if i < remainder else 0)
+            
+            if len(cls_df) >= target:
+                sampled_parts.append(cls_df.sample(n=target, random_state=42))
+            else:
+                # 부족한 클래스: 전체 사용
+                sampled_parts.append(cls_df)
+                deficit += target - len(cls_df)
+        
+        # 부족분 재분배: 여유가 있는 클래스에서 추가 샘플링
+        if deficit > 0:
+            already_sampled_idx = pd.concat(sampled_parts).index
+            remaining_df = df[~df.index.isin(already_sampled_idx)]
+            
+            if len(remaining_df) > 0:
+                additional = remaining_df.sample(
+                    n=min(deficit, len(remaining_df)), random_state=42
+                )
+                sampled_parts.append(additional)
+        
+        result = pd.concat(sampled_parts).reset_index(drop=True)
+        return result
+    
     def package_single_roi(self, roi_data: Dict, 
                           roi_image: np.ndarray,
                           roi_mask: np.ndarray,
@@ -210,9 +265,13 @@ class ControlNetDatasetPackager:
         # Load train.csv for mask decoding
         train_df = pd.read_csv(train_csv)
         
-        # Limit samples if specified
-        if max_samples:
-            roi_metadata_df = roi_metadata_df.head(max_samples)
+        # Limit samples if specified (stratified sampling by class)
+        if max_samples and max_samples < len(roi_metadata_df):
+            roi_metadata_df = self._stratified_sample(roi_metadata_df, max_samples)
+            print(f"Stratified sampling: {max_samples} samples selected")
+            if 'class_id' in roi_metadata_df.columns:
+                class_dist = roi_metadata_df['class_id'].value_counts().sort_index()
+                print(f"  Class distribution: {dict(class_dist)}")
         
         packaged_data = []
         

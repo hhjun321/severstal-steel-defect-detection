@@ -1,0 +1,111 @@
+20260212 작업 일지 #3 - NaN Loss 원인 분석 기반 코드 개선 적용
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+20260212_2.docs에서 도출한 NaN Loss 수정 방안 4가지를 실제 코드에 반영한다.
+  - 4-1. [필수] Warmup Steps 기본값 축소
+  - 4-2. [필수] 데이터셋 클래스별 균등분포 샘플링
+  - 4-3. [권장] Mixed Precision 안정화
+  - 4-4. [권장] NaN 처리 로직 개선
+
+2. 수정 대상 파일
+--------------------------------------------------------------------------------
+  - scripts/train_controlnet.py
+  - src/preprocessing/controlnet_packager.py
+
+3. 수행 내용
+--------------------------------------------------------------------------------
+
+3-1. [필수] Warmup Steps 기본값 축소
+  - 문제:
+    - lr_warmup_steps 기본값이 500이지만, 소량 데이터(10개) 학습 시
+      총 step(200)보다 warmup이 커서 학습 전 구간이 warmup 구간에 해당
+    - LR이 목표값(1e-5)에 도달하지 못하고 4e-6에서 학습 종료
+  - 변경 사항:
+    (a) 기본값 축소
+      - 파일: scripts/train_controlnet.py:1107
+      - 변경: --lr_warmup_steps default=500 → default=50
+    (b) 자동 조정 로직 강화
+      - 파일: scripts/train_controlnet.py:628-629
+      - 변경 전: effective_warmup = min(args.lr_warmup_steps, max(1, max_train_steps // 10))
+      - 변경 후: auto_warmup = max(10, max_train_steps // 20)
+                 effective_warmup = min(args.lr_warmup_steps, auto_warmup)
+      - 총 step의 5%로 상한 제한, 하한 10 step으로 최소 warmup 보장
+
+3-2. [필수] 데이터셋 클래스별 균등분포 샘플링
+  - 문제:
+    - max_samples=10 지정 시 DataFrame.head(10)으로 앞에서부터 순서대로 자름
+    - 결과: Class1 9개, Class3 1개 → 극심한 클래스 불균형
+  - 변경 사항:
+    (a) _stratified_sample() 메서드 신규 추가
+      - 파일: src/preprocessing/controlnet_packager.py:44-97
+      - 클래스별 균등 할당 (n_samples // n_classes)
+      - 샘플 부족 클래스는 전체 사용 후 잔여 할당량을 다른 클래스에 재분배
+      - random_state=42로 재현성 보장
+    (b) package_dataset() 내 샘플링 로직 교체
+      - 파일: src/preprocessing/controlnet_packager.py:268-274
+      - 변경 전: roi_metadata_df = roi_metadata_df.head(max_samples)
+      - 변경 후: roi_metadata_df = self._stratified_sample(roi_metadata_df, max_samples)
+      - 샘플링 후 클래스 분포를 콘솔에 출력하여 확인 가능
+
+3-3. [권장] Mixed Precision 안정화
+  - 문제:
+    - 단일 autocast 블록 내에서 ControlNet(fp32)과 UNet(fp16) 간
+      텐서 교환 시 dtype 변환 과정에서 수치 불안정(NaN gradient) 가능
+  - 변경 사항:
+    - 파일: scripts/train_controlnet.py:765-838
+    - 기존: 하나의 autocast 블록에 VAE, ControlNet, UNet 전부 포함
+    - 변경: 3단 구조로 분리
+      (1) autocast 블록 1: VAE 인코딩 + noise 추가 + Text 인코딩 (frozen, fp16)
+      (2) autocast 외부: ControlNet forward (fp32, 학습 대상)
+      (3) autocast 블록 2: UNet forward + Loss 계산 (frozen, fp16)
+    - ControlNet의 gradient가 fp16 범위를 벗어나는 문제를 원천 차단
+
+3-4. [권장] NaN 처리 로직 개선 (3가지)
+
+  (a) 연속 NaN 카운터 통합
+    - 파일: scripts/train_controlnet.py:840-916
+    - 변경 전: loss NaN만 nan_count 증가, gradient NaN은 별도 처리(카운트 미반영)
+    - 변경 후: gradient NaN 발생 시에도 nan_count 증가
+    - gradient accumulation 경계와 무관하게 NaN 누적 추적
+
+  (b) Adaptive LR 감소 전략
+    - 파일: scripts/train_controlnet.py:852-859, 902-909
+    - NaN이 3회 연속 발생할 때마다 learning rate를 50%로 감소
+    - loss NaN, gradient NaN 양쪽 모두에서 동일하게 적용
+    - 감소 시 로그 출력: "Adaptive LR reduction: {old} -> {new}"
+
+  (c) 1-Step Training Sanity Check 추가
+    - 파일: scripts/train_controlnet.py:323-415 (함수 정의)
+    - 파일: scripts/train_controlnet.py:703-718 (호출부)
+    - 학습 시작 전 1 step forward/backward 전체 파이프라인 테스트
+    - 검증 범위:
+      - 데이터 로딩 → VAE 인코딩 → ControlNet forward (autocast 외부)
+      → UNet forward → Loss 계산 → Backward → Gradient norm 계산
+    - Loss 또는 Gradient가 NaN/Inf이면 학습을 시작하지 않고 즉시 중단
+    - resume_from_checkpoint 시에는 스킵 (이미 학습이 진행된 상태)
+
+4. 변경 파일 요약
+--------------------------------------------------------------------------------
+
+  scripts/train_controlnet.py:
+    - line 323-415:  run_training_sanity_check() 함수 신규 추가
+    - line 624-629:  warmup steps 자동 조정 로직 강화 (// 10 → // 20, 하한 10)
+    - line 703-718:  학습 전 1-step sanity check 호출부 추가
+    - line 765-838:  forward pass를 autocast 3단 구조로 분리
+    - line 840-869:  loss NaN 처리에 adaptive LR 감소 추가
+    - line 888-916:  gradient NaN도 nan_count에 반영 + adaptive LR 감소
+    - line 1107:     lr_warmup_steps 기본값 500 → 50
+
+  src/preprocessing/controlnet_packager.py:
+    - line 44-97:    _stratified_sample() 메서드 신규 추가
+    - line 268-274:  head() → _stratified_sample()로 교체 + 분포 출력
+
+5. 후속 작업
+--------------------------------------------------------------------------------
+  1. prepare_controlnet_data.py 재실행 → 전체 272개 ROI 패키징
+     (또는 --max_samples N으로 클래스별 균등 샘플링 적용 확인)
+  2. Colab 환경에서 수정된 train_controlnet.py로 재학습 실행
+  3. training_log.json에서 loss 수렴 확인 (NaN 없이 감소 추이)
+  4. test_controlnet.py로 생성 품질 검증

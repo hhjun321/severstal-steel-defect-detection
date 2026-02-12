@@ -1,0 +1,131 @@
+20260212 작업 일지 #2 - ControlNet 학습 실패(NaN Loss) 원인 분석
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+학습 완료된 ControlNet 모델의 테스트를 시도하던 중, training_log.json의 모든
+loss가 NaN임을 발견. 학습 실패의 근본 원인을 분석하고 수정 방안을 도출한다.
+
+2. 학습 로그 분석 결과
+--------------------------------------------------------------------------------
+- 파일: controlnet_training/training_log.json
+- 총 200 step (100 epoch, epoch당 2 step) 동안 모든 loss가 NaN
+- learning rate는 warmup 구간에서 2e-7 ~ 4e-6 범위로 매우 낮게 유지됨
+- best_loss 갱신 없이 학습 종료 → 저장된 모델은 사실상 미학습 상태
+
+3. NaN Loss 원인 분석 (5가지)
+--------------------------------------------------------------------------------
+
+3-1. Target 이미지 경로 누락 (데이터 로딩 실패)
+  - 현상:
+    - train.jsonl의 source/target 경로가 모두 Google Colab 경로
+      예: /content/drive/MyDrive/data/Severstal/roi_patches/images/...
+    - 로컬에는 data/processed/roi_patches/images/ 디렉토리 자체가 존재하지 않음
+    - roi_metadata.csv의 roi_image_path, roi_mask_path도 동일한 Colab 경로
+  - 영향:
+    - SteelDefectControlNetDataset._resolve_image_path()에서 FileNotFoundError 발생
+    - target(pixel_values)을 로드할 수 없어 VAE 인코딩 단계에서 실패
+    - hint 이미지(10개)만 로컬에 존재하고, 실제 학습 대상인 ROI 이미지는 없음
+  - 해결:
+    - 해당 내용은 colab 에서 모델을 학습하고, 참조하기에 문제없음
+
+3-2. [치명적] Warmup Steps > Total Training Steps
+  - 현상:
+    - lr_warmup_steps = 500 (설정값)
+    - max_train_steps = 200 (10샘플 / batch=1 / grad_accum=4 = epoch당 2 step x 100 epoch)
+    - warmup이 학습 전체 기간을 초과
+  - 영향:
+    - 학습 전 구간이 warmup 구간에 해당
+    - learning rate가 최종 목표값(1e-5)에 도달하지 못하고 4e-6에서 종료
+    - 실질적으로 학습이 이루어지지 않음
+  - 코드상 자동 조정 로직 존재:
+    - scripts/train_controlnet.py:532
+      effective_warmup = min(args.lr_warmup_steps, max(1, max_train_steps // 10))
+    - 이 로직에 의해 500 → 20으로 조정되어야 하지만,
+      training_log를 보면 LR이 warmup 패턴을 보이므로 실제로는 적용되었을 가능성 있음
+    - 다만 3-1 문제(데이터 누락)가 선행하므로 이 문제만으로 NaN이 발생하지는 않음
+
+3-3. [중요] Mixed Precision dtype 충돌
+  - 현상:
+    - mixed_precision=fp16 설정
+    - Frozen 모델(UNet, VAE, Text Encoder): fp16
+    - ControlNet: fp32 (학습 대상)
+  - 위험 요소:
+    - autocast 블록 내에서 ControlNet(fp32)과 UNet(fp16) 간 텐서 교환 시
+      dtype 변환 과정에서 수치 불안정 가능
+    - scripts/train_controlnet.py:681-689: ControlNet 입력을 명시적으로 fp32로 변환
+    - scripts/train_controlnet.py:696-699: ControlNet 출력을 fp16으로 변환하여 UNet에 전달
+    - 이 과정에서 gradient가 fp16 범위를 벗어나면 NaN 발생 가능
+  - 보완 필요:
+    - GradScaler가 구현되어 있으나(551행), autocast 영역 설정이 불완전할 수 있음
+
+3-4. [중요] NaN Tolerance 로직 문제
+  - 현상:
+    - max_nan_tolerance = 10 (연속 NaN 10회 시 학습 중단)
+    - 그러나 training_log에는 200 step까지 기록됨
+  - 분석:
+    - NaN 검출 시 continue로 배치 스킵(734행)
+    - 이때 global_step은 증가하지 않음 (772행에서만 증가)
+    - 따라서 NaN이 계속 발생해도 global_step이 증가하지 않아
+      logging_steps 조건(786행)에 도달하지 못할 수 있음
+    - training_log의 200 step은 NaN 배치를 스킵하면서도
+      일부 배치는 정상 통과했을 가능성을 시사
+    - 또는 loss 자체는 유한값이지만 avg_loss 계산에서 NaN이 발생했을 수 있음
+  - 관련 코드:
+    - scripts/train_controlnet.py:720-734 (NaN 검출 및 스킵)
+    - scripts/train_controlnet.py:786-799 (로깅 시 avg_loss 계산)
+
+3-5. [중요] 학습 데이터 극소량 (10개)
+  - 현상:
+    - ROI 추출: 272개 (50 Class1, 2 Class2, 189 Class3, 31 Class4)
+    - ControlNet 데이터셋 패키징: 10개만 처리됨
+    - 클래스 분포: Class1 9개, Class3 1개 (극심한 불균형)
+  - 영향:
+    - Stable Diffusion 기반 ControlNet fine-tuning에는 최소 수십~수백 샘플 필요
+    - 10개 샘플로는 과적합 및 수치 불안정 유발
+    - epoch당 2 step(batch=1, grad_accum=4, 10샘플)으로 학습 신호가 부족
+  - 내용:
+    - 해당 학습을 진행할 때 파라미터값으로 10을 인자로 받아 실행하였음.
+  - 개선:
+    - 파라미터값은 유지하되 클래스별 균등분포로 샘플링하여 처리한다.
+
+4. 수정 방안
+--------------------------------------------------------------------------------
+
+4-1. [필수] Warmup Steps 기본값 축소
+  - 현재: lr_warmup_steps = 500 (기본값)
+  - 변경: 총 step의 5~10% 또는 max(10, total_steps // 20)
+  - 자동 조정 로직이 이미 있으나 기본값 자체를 합리적으로 변경
+
+4-2. [필수] 데이터셋 확장
+  - prepare_controlnet_data.py를 --max_samples 없이 재실행
+  - 272개 전체 ROI를 ControlNet 데이터셋으로 패키징
+  - 이를 통해 epoch당 step 수 증가 및 학습 안정성 확보
+
+4-3. [권장] Mixed Precision 안정화
+  - ControlNet forward를 autocast 블록 외부로 분리하는 방안 검토
+  - 또는 초기 학습 시 mixed_precision=no로 안정성 우선 확보 후
+    fp16으로 전환하는 2단계 학습 전략
+
+4-4. [권장] NaN 처리 로직 개선
+  - 연속 NaN 카운터가 gradient accumulation 경계와 무관하게 동작하도록 수정
+  - 첫 N step은 NaN 발생 시 learning rate를 추가 감소하는 adaptive 전략
+  - 학습 초기 sanity check에서 1 step forward/backward 완전 테스트 추가
+
+5. 현재 파일 상태 요약
+--------------------------------------------------------------------------------
+  - controlnet_training/final_model/: 미학습 상태의 모델 가중치 (NaN loss)
+  - controlnet_training/pipeline/: 불완전 (unet, vae, tokenizer 누락)
+  - controlnet_training/training_log.json: 전 구간 NaN loss
+  - controlnet_training/training_config.json: 학습 설정 기록
+  - data/processed/controlnet_dataset/train.jsonl: Colab 경로 (로컬 미존재, 그러나 colab에서 학습하였고, 실행예정)
+  - data/processed/controlnet_dataset/hints/: hint 이미지 10개 (정상)
+  - data/processed/roi_patches/roi_metadata.csv: 272개 ROI 메타 (경로는 Colab, 그러나 colab 에서 실행예정)
+  - train_images/: 디렉토리 미존재 (원본 이미지 필요)
+
+6. 후속 작업 우선순위
+--------------------------------------------------------------------------------
+  1. prepare_controlnet_data.py 재실행 → 272개 전체 ROI 패키징 (로컬 경로)
+  2. train_controlnet.py 수정 사항 적용
+  3. 재학습 실행 및 loss 수렴 확인
+  4. test_controlnet.py로 생성 품질 검증

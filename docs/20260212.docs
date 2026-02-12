@@ -1,0 +1,107 @@
+20260212 작업 일지 - ControlNet 학습 스크립트 구현
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+Hugging Face diffusers 라이브러리 기반의 ControlNet 학습 파이프라인 구축.
+[마스크/힌트 이미지 → 결함 이미지] 매핑을 학습하는 스크립트 작성.
+
+2. 수행 내용
+--------------------------------------------------------------------------------
+
+2-1. requirements.txt 업데이트
+  - 추가된 패키지:
+    - diffusers>=0.25.0
+    - transformers>=4.30.0
+    - accelerate>=0.20.0
+    - xformers>=0.0.20 (optional, memory-efficient attention)
+    - safetensors>=0.3.0
+
+2-2. train.jsonl 데이터 현황 확인
+  - 위치: data/processed/controlnet_dataset/train.jsonl
+  - 샘플 수: 10개
+  - hint 이미지: 10개 (data/processed/controlnet_dataset/hints/)
+  - source/target 경로: Colab 경로(/content/drive/MyDrive/...) 형식
+    → 학습 스크립트에서 로컬 경로 자동 변환 로직 구현
+  - 클래스 분포: class 1 (9개), class 3 (1개)
+
+2-3. scripts/train_controlnet.py 전면 재작성
+  - 기존: SimpleControlNet (단순 CNN placeholder, L1+MSE loss)
+  - 변경: Hugging Face diffusers 기반 실제 ControlNet 학습 파이프라인
+
+  [아키텍처]
+  - Base Model: runwayml/stable-diffusion-v1-5 (UNet, VAE, Text Encoder - frozen)
+  - ControlNet: lllyasviel/sd-controlnet-canny 초기 가중치 (trainable)
+  - Conditioning: 3채널 hint 이미지 (R=defect shape, G=structure, B=texture)
+  - Loss: MSE (noise prediction, DDPM)
+
+  [구현된 기능]
+  - SteelDefectControlNetDataset: train.jsonl 기반 데이터셋 클래스
+    - Colab 경로 → 로컬 경로 자동 변환 (6단계 경로 해석)
+    - CLIP tokenizer 기반 텍스트 인코딩
+    - 이미지 전처리 (resize, center crop, normalize)
+  - 학습 루프:
+    - VAE latent 인코딩 → 노이즈 추가 → ControlNet + UNet forward → MSE loss
+    - Mixed precision (fp16/bf16) 지원
+    - Gradient checkpointing (VRAM 절약)
+    - Gradient accumulation (소규모 데이터 대응)
+  - 체크포인트 관리:
+    - 주기적 저장 (--checkpointing_steps)
+    - 최근 N개만 유지 (--checkpoints_total_limit)
+    - 학습 재개 (--resume_from_checkpoint latest)
+    - Best model 자동 저장
+  - Validation: 학습 중 주기적으로 검증 이미지 생성
+  - 최종 출력: ControlNet 가중치 + 전체 파이프라인 저장
+
+3. 실행 방법
+--------------------------------------------------------------------------------
+
+  # 패키지 설치
+  pip install diffusers transformers accelerate xformers safetensors
+
+  # 기본 학습
+  python scripts/train_controlnet.py \
+      --data_dir data/processed/controlnet_dataset \
+      --image_root <ROI이미지_디렉토리> \
+      --output_dir outputs/controlnet_training
+
+  # 메모리 절약 모드 (fp16 + gradient checkpointing)
+  python scripts/train_controlnet.py \
+      --data_dir data/processed/controlnet_dataset \
+      --image_root <ROI이미지_디렉토리> \
+      --mixed_precision fp16 \
+      --gradient_checkpointing \
+      --gradient_accumulation_steps 4 \
+      --train_batch_size 1
+
+  # 학습 재개
+  python scripts/train_controlnet.py \
+      --data_dir data/processed/controlnet_dataset \
+      --resume_from_checkpoint latest
+
+4. 주요 파라미터 기본값
+--------------------------------------------------------------------------------
+  - resolution: 512
+  - train_batch_size: 1
+  - num_train_epochs: 100
+  - learning_rate: 1e-5
+  - gradient_accumulation_steps: 4
+  - lr_scheduler: constant_with_warmup
+  - lr_warmup_steps: 500
+  - checkpointing_steps: 500
+  - max_grad_norm: 1.0
+
+5. 주의사항 및 후속 작업
+--------------------------------------------------------------------------------
+  - ROI 이미지가 로컬에 없음: train.jsonl의 source/target이 Colab 경로로 되어 있어
+    --image_root로 실제 ROI 이미지 위치를 지정해야 함.
+  - 데이터 부족: 현재 10개 샘플만 존재. prepare_controlnet_data.py를 재실행하여
+    272개 전체 ROI를 패키징하는 것을 권장.
+  - VRAM 요구: SD 1.5 + ControlNet 학습 시 최소 12GB VRAM 필요
+    (fp16 + gradient checkpointing). fp32는 24GB 이상.
+  - 후속 작업: 데이터 확보 후 실제 학습 실행 및 결과 검증 필요.
+
+6. 변경된 파일 목록
+--------------------------------------------------------------------------------
+  - requirements.txt (수정: diffusers 관련 패키지 추가)
+  - scripts/train_controlnet.py (전면 재작성: diffusers 기반 ControlNet 학습)

@@ -51,8 +51,11 @@ def main():
     parser.add_argument(
         '--roi_size',
         type=int,
-        default=512,
-        help='Size of ROI patches'
+        default=256,
+        help='Target ROI patch size. v5에서 256으로 변경 '
+             '(Severstal 이미지 높이 256px에 맞춤). '
+             '기존 512는 1600x256 이미지에서 항상 실패하여 '
+             'defect_bbox fallback이 발생했음.'
     )
     parser.add_argument(
         '--grid_size',

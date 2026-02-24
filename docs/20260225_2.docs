@@ -1,0 +1,189 @@
+20260225 작업 일지 #2 - ControlNet v5 개선 코드 구현
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+20260225.docs(#1)에서 진단한 v4 근본 원인 5가지에 대한 코드 수정을 구현한다.
+코드 변경만 수행하며, 데이터셋 재생성 및 재학습은 별도 수행 필요.
+
+
+2. 변경 파일
+================================================================================
+
+  | 파일                                  | 변경 내용                              | 우선순위 |
+  |---------------------------------------|----------------------------------------|---------|
+  | src/analysis/roi_suitability.py       | optimize_roi_position() 전면 재작성     | P0      |
+  | src/preprocessing/roi_extraction.py   | ROI 크기 256, fallback 패딩 추가        | P0      |
+  | scripts/extract_rois.py              | --roi_size 기본값 512→256               | P0/P4   |
+  | scripts/train_controlnet.py          | gray_loss_lambda=0, cond_scale=1.0,     | P1/P2/P5|
+  |                                       | validation_steps=200, 관련 주석 갱신    |         |
+  | scripts/test_controlnet.py           | --resolution 기본값 None→512            | P3      |
+  | src/preprocessing/controlnet_packager.py | edge_filter docstring 갱신           | P0(문서)|
+
+
+3. 주요 변경 내용
+================================================================================
+
+3.1 [P0] ROI 추출 Adaptive Sizing (가장 핵심적 변경)
+------------------------------------------------------
+
+  문제: 기존 optimize_roi_position()은 512x512 정사각 ROI만 시도.
+        Severstal 이미지(1600x256)에서 높이 부족으로 항상 None 반환.
+        → defect_bbox fallback → 15~45px 패치 → 512x512로 10~34x 업스케일.
+
+  해결:
+    src/analysis/roi_suitability.py  L165-294 (optimize_roi_position 전면 재작성)
+
+    핵심 로직:
+      1. effective_size = min(roi_size, image_height, image_width)
+         → 1600x256 이미지에서 effective_size = 256
+      2. roi_h = max(base_size, defect_h + 2 * min_context_pixels)
+         → 결함 주변 최소 64px 컨텍스트 보장
+      3. roi를 이미지 경계 내로 clamp
+      4. 결함이 ROI에 완전 포함되는지 검증 및 확장
+      5. search_radius 범위에서 background continuity 최적화
+
+    결과 예시:
+      기존: 19x40px 패치 → 512x512 (27x 업스케일)
+      개선: 256x256 패치 → 512x512 (2x 업스케일)
+
+  src/preprocessing/roi_extraction.py  L29-56 (roi_size 기본값 256)
+    - ROIExtractor.__init__() roi_size: 512 → 256
+
+  src/preprocessing/roi_extraction.py  L99-134 (process_single_image)
+    기존: suitability 점수에 따라 조건부 optimize → 실패 시 defect_bbox
+    개선: 항상 optimize_roi_position() 호출 (adaptive sizing이므로 항상 성공)
+          fallback도 defect_bbox 대신 64px 패딩 추가
+
+  scripts/extract_rois.py  L51-59 (--roi_size 기본값 256)
+
+
+3.2 [P1] Gray Consistency Loss 비활성화
+-----------------------------------------
+
+  scripts/train_controlnet.py  L1366-1374:
+    --gray_loss_lambda 기본값: 0.1 → 0.0
+
+    변경된 help text:
+      "VAE latent 4채널은 RGB에 직접 대응하지 않으므로
+       ch0==ch1==ch2 제약은 latent 표현력을 제한합니다.
+       v4에서 0.1 사용 시 생성 품질 저하 확인됨. v5부터 비활성화."
+
+  scripts/train_controlnet.py  L941-958 (주석 갱신):
+    기존: "3채널은 RGB에 대응하는 색상 정보를 인코딩합니다"
+    수정: "latent space의 4채널은 entangled representation이며
+           RGB에 직접 대응하지 않습니다"
+
+
+3.3 [P2] conditioning_scale 학습 시 1.0 복원
+---------------------------------------------
+
+  scripts/train_controlnet.py  L1337-1342:
+    --controlnet_conditioning_scale 기본값: 0.7 → 1.0
+
+    변경된 help text:
+      "학습 시에는 1.0이 표준이며, 추론 시에만 0.7~1.0 범위로 조절합니다.
+       v4에서 학습 시 0.7 사용 시 추론에서 이중 감쇠(0.49)가 발생하여 품질 저하."
+
+  scripts/train_controlnet.py  L891-894 (학습 루프 내 주석 갱신):
+    기존: "v2에서 neon 패턴이 발생했으므로 v3부터 0.7 권장"
+    수정: "학습 시에는 scale=1.0이 표준 (v5).
+           추론 시에만 0.7~1.0 범위로 조절하여 hint 영향력 조정."
+
+
+3.4 [P3] 추론 해상도 고정 (학습 해상도와 일치)
+-----------------------------------------------
+
+  scripts/test_controlnet.py  L574-579:
+    --resolution 기본값: None → 512
+
+    변경된 help text:
+      "학습 시 사용한 해상도와 반드시 일치해야 합니다. 기본값 512.
+       v4에서 None (hint 크기 기반 자동 계산)으로 설정 시
+       tiny hint에서 64x64 등 극소 해상도로 생성하여 품질 저하 발생."
+
+
+3.5 [P5] Validation 모니터링 기본 활성화
+------------------------------------------
+
+  scripts/train_controlnet.py  L1409-1412:
+    --validation_steps 기본값: 0 (비활성화) → 200
+
+  scripts/train_controlnet.py  L530-536 (log_validation):
+    pipeline 호출에 height/width=args.resolution 및
+    controlnet_conditioning_scale=0.8 추가.
+    기존: 해상도/scale 미지정으로 hint 크기 기반 자동 결정.
+
+
+4. 미변경 사항 (의도적 유지)
+================================================================================
+
+  | 항목                            | 이유                                     |
+  |---------------------------------|------------------------------------------|
+  | 힌트 grayscale 변환              | color-shortcut learning 방지 (확인 완료)  |
+  | force_grayscale_target           | 철강 이미지 도메인 특성                    |
+  | Min-SNR weighting (snr_gamma=5)  | timestep별 가중치 균형화                  |
+  | Cosine LR scheduler             | 이미 기본값으로 설정됨                     |
+  | NaN loss 감지 및 스킵            | 수치 안정성 보장                          |
+  | GradScaler (fp16 mixed)          | 메모리 효율성                            |
+
+
+5. 다음 단계 (수동 실행 필요)
+================================================================================
+
+  v5 데이터셋 재구축 순서:
+
+  Step 1: ROI 재추출 (Colab)
+    python scripts/extract_rois.py \
+        --image_dir train_images \
+        --train_csv train.csv \
+        --output_dir data/processed/roi_patches_v5 \
+        --roi_size 256
+
+  Step 2: ControlNet 데이터셋 패키징
+    python scripts/prepare_controlnet_data.py \
+        --roi_metadata data/processed/roi_patches_v5/roi_metadata.csv \
+        --train_images train_images \
+        --train_csv train.csv \
+        --output_dir outputs/controlnet_dataset_v5 \
+        --max_samples 1000
+
+  Step 3: ControlNet 학습
+    python scripts/train_controlnet.py \
+        --data_dir outputs/controlnet_dataset_v5 \
+        --output_dir controlnet_training_v5 \
+        --resolution 512 \
+        --num_train_epochs 100 \
+        --learning_rate 1e-5 \
+        --train_batch_size 4
+
+    주의: gray_loss_lambda=0.0, conditioning_scale=1.0,
+          validation_steps=200이 기본값으로 자동 적용됨.
+
+  Step 4: 검증
+    python scripts/test_controlnet.py \
+        --controlnet_path controlnet_training_v5/best_model \
+        --hint_dir outputs/controlnet_dataset_v5/hints \
+        --output_dir outputs/test_results_v5 \
+        --resolution 512
+
+  목표 지표:
+    SSIM > 0.3 (v4: 0.027)
+    LPIPS < 0.4 (v4: 0.577)
+    quality_score > 0.7 통과율 50% 이상 (v4: 0%)
+
+
+6. 요약
+================================================================================
+v4 실패의 5가지 근본 원인에 대한 코드 수정을 모두 구현했다.
+
+가장 핵심적인 변경은 P0 (ROI adaptive sizing)으로, 기존 512x512 고정 ROI가
+256px 높이 이미지에서 항상 실패하던 문제를 min(roi_size, image_h, image_w)로
+동적 조정하여 해결했다. 결과적으로 256x256 패치가 추출되며, 512x512 학습
+해상도까지 2x 업스케일만 발생한다 (기존 10~34x 대비 대폭 개선).
+
+나머지 P1~P5는 기본값 변경 + 주석 갱신으로, 학습 시 별도 인자 없이
+올바른 설정이 자동 적용된다.
+
+코드 변경만 수행했으므로, 데이터셋 재구축(Step 1-2)과
+재학습(Step 3-4)은 Colab에서 별도 실행해야 한다.

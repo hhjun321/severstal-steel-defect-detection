@@ -533,6 +533,9 @@ def log_validation(
                 image=control_image,
                 num_inference_steps=20,
                 generator=generator,
+                height=args.resolution,
+                width=args.resolution,
+                controlnet_conditioning_scale=0.8,  # 추론 시 0.7~1.0 범위
             ).images[0]
 
         image.save(output_dir / f"val_{i:03d}_generated.png")
@@ -890,8 +893,8 @@ def train(args):
                 # 5. UNet forward (ControlNet residual 주입)
                 # conditioning_scale 적용: residual을 스케일링하여
                 # SD의 자연 이미지 생성 능력을 보존.
-                # v2에서 scale=1.0 (기본)으로 neon 패턴이 발생했으므로
-                # v3부터 0.7 권장.
+                # 학습 시에는 scale=1.0이 표준 (v5).
+                # 추론 시에만 0.7~1.0 범위로 조절하여 hint 영향력 조정.
                 cond_scale = args.controlnet_conditioning_scale
                 scaled_down_residuals = [
                     s.to(dtype=weight_dtype) * cond_scale
@@ -939,14 +942,16 @@ def train(args):
                 loss = loss.mean()
 
                 # [B2] Grayscale 일관성 loss (channel-consistency loss)
-                # 생성되는 latent의 채널 간 차이를 최소화하여
-                # 디코딩 후 R==G==B(grayscale) 출력을 유도합니다.
+                # 주의: VAE latent 4채널은 RGB에 직접 대응하지 않으므로
+                # ch0==ch1==ch2 제약은 잘못된 가정에 기반합니다.
+                # v5부터 기본값 0.0으로 비활성화.
                 # L_total = L_mse + gray_loss_lambda * L_gray
                 # L_gray = MSE(pred[:,0]-pred[:,1]) + MSE(pred[:,1]-pred[:,2])
                 if args.gray_loss_lambda > 0:
                     pred_f = model_pred.float()
-                    # latent space의 4채널 중 처음 3채널은 RGB에 대응하는
-                    # 색상 정보를 인코딩합니다. 이들 간 차이를 최소화합니다.
+                    # latent space의 4채널은 entangled representation이며
+                    # RGB에 직접 대응하지 않습니다. 이 제약은 latent 표현력을
+                    # 불필요하게 제한하므로 v5부터 비활성화를 권장합니다.
                     ch0 = pred_f[:, 0]
                     ch1 = pred_f[:, 1]
                     ch2 = pred_f[:, 2]
@@ -1335,10 +1340,12 @@ def parse_args():
         choices=["no", "fp16", "bf16"],
     )
     parser.add_argument(
-        "--controlnet_conditioning_scale", type=float, default=0.7,
-        help="ControlNet conditioning scale. 1.0이면 ControlNet이 SD의 "
-             "생성 능력을 완전히 덮어씀. v2에서 이 값이 1.0 (기본)으로 "
-             "neon/rainbow 패턴이 발생. v3부터 0.7을 기본값으로 적용.",
+        "--controlnet_conditioning_scale", type=float, default=1.0,
+        help="ControlNet conditioning scale. 학습 시에는 1.0이 표준이며, "
+             "추론 시에만 0.7~1.0 범위로 조절합니다. "
+             "v2에서 neon 패턴이 발생한 원인은 conditioning_scale이 아닌 "
+             "tiny ROI 극한 업스케일이었음. v4에서 학습 시 0.7 사용 시 "
+             "추론에서 이중 감쇠(0.49)가 발생하여 품질 저하. v5부터 1.0 복원.",
     )
     parser.add_argument(
         "--snr_gamma", type=float, default=5.0,
@@ -1364,10 +1371,13 @@ def parse_args():
         help="Target grayscale 강제 변환을 비활성화합니다.",
     )
     parser.add_argument(
-        "--gray_loss_lambda", type=float, default=0.1,
+        "--gray_loss_lambda", type=float, default=0.0,
         help="[B2] Grayscale 일관성 loss 가중치 (lambda). "
              "L_total = L_mse + lambda * L_gray. "
-             "0이면 비활성화. 권장 범위: 0.1~0.5. 기본값 0.1.",
+             "0이면 비활성화 (기본값). "
+             "주의: VAE latent 4채널은 RGB에 직접 대응하지 않으므로 "
+             "ch0==ch1==ch2 제약은 latent 표현력을 제한합니다. "
+             "v4에서 0.1 사용 시 생성 품질 저하 확인됨. v5부터 비활성화.",
     )
     parser.add_argument(
         "--augment", action="store_true", default=False,
@@ -1399,8 +1409,9 @@ def parse_args():
     parser.add_argument("--checkpointing_steps", type=int, default=500)
     parser.add_argument("--checkpoints_total_limit", type=int, default=3)
     parser.add_argument(
-        "--validation_steps", type=int, default=0,
-        help="Run validation every N steps (0=disabled)",
+        "--validation_steps", type=int, default=200,
+        help="Run validation every N steps. v5부터 200으로 기본 활성화하여 "
+             "학습 중 생성 품질을 모니터링합니다. 0이면 비활성화.",
     )
 
     # Model Save Optimization

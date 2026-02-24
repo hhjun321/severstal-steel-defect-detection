@@ -30,7 +30,7 @@ class ROIExtractor:
                  defect_analyzer: Optional[DefectCharacterizer] = None,
                  background_analyzer: Optional[BackgroundAnalyzer] = None,
                  roi_evaluator: Optional[ROISuitabilityEvaluator] = None,
-                 roi_size: int = 512,
+                 roi_size: int = 256,
                  min_suitability: float = 0.5):
         """
         Initialize ROI extractor.
@@ -39,7 +39,9 @@ class ROIExtractor:
             defect_analyzer: DefectCharacterizer instance
             background_analyzer: BackgroundAnalyzer instance
             roi_evaluator: ROISuitabilityEvaluator instance
-            roi_size: Size of ROI patches
+            roi_size: Target ROI patch size. v5에서 256으로 변경 
+                (Severstal 이미지 높이 256px에 맞춤, 학습 시 2x 업스케일).
+                기존 512는 1600x256 이미지에서 항상 실패함.
             min_suitability: Minimum suitability score to accept ROI
         """
         self.defect_analyzer = defect_analyzer or DefectCharacterizer()
@@ -98,43 +100,38 @@ class ROIExtractor:
                 # Get initial bbox from defect
                 defect_bbox = defect_metrics['bbox']
                 
-                # Evaluate suitability with initial bbox
+                # Always optimize ROI position (v5: adaptive sizing for
+                # non-square images like 1600x256 Severstal images)
+                optimized_bbox = self.roi_evaluator.optimize_roi_position(
+                    image_rgb,
+                    defect_metrics,
+                    background_analysis,
+                    roi_size=self.roi_size,
+                    search_radius=32
+                )
+                
+                if optimized_bbox is not None:
+                    roi_bbox = optimized_bbox
+                else:
+                    # Fallback: pad defect bbox with context (v5)
+                    # 기존 v4에서는 defect_bbox를 그대로 사용하여
+                    # 15-45px 패치가 512x512로 10-34x 업스케일되는 문제 발생.
+                    # v5: 최소 min_context_pixels 만큼 패딩 추가.
+                    dx1, dy1, dx2, dy2 = defect_bbox
+                    pad = 64  # minimum context padding
+                    roi_bbox = (
+                        max(0, dx1 - pad),
+                        max(0, dy1 - pad),
+                        min(w, dx2 + pad),
+                        min(h, dy2 + pad),
+                    )
+                
+                # Evaluate suitability with the ROI bbox
                 suitability = self.roi_evaluator.evaluate_roi_suitability(
                     defect_metrics,
                     background_analysis,
-                    defect_bbox
+                    roi_bbox
                 )
-                
-                # If unsuitable, try to optimize position
-                if suitability['suitability_score'] < self.min_suitability:
-                    optimized_bbox = self.roi_evaluator.optimize_roi_position(
-                        image_rgb,
-                        defect_metrics,
-                        background_analysis,
-                        roi_size=self.roi_size,
-                        search_radius=32
-                    )
-                    
-                    if optimized_bbox is not None:
-                        # Re-evaluate with optimized position
-                        suitability = self.roi_evaluator.evaluate_roi_suitability(
-                            defect_metrics,
-                            background_analysis,
-                            optimized_bbox
-                        )
-                        roi_bbox = optimized_bbox
-                    else:
-                        roi_bbox = None
-                else:
-                    # Optimize anyway to potentially improve
-                    optimized_bbox = self.roi_evaluator.optimize_roi_position(
-                        image_rgb,
-                        defect_metrics,
-                        background_analysis,
-                        roi_size=self.roi_size,
-                        search_radius=32
-                    )
-                    roi_bbox = optimized_bbox if optimized_bbox is not None else defect_bbox
                 
                 # Only keep ROIs above threshold
                 if roi_bbox is not None and suitability['suitability_score'] >= self.min_suitability:

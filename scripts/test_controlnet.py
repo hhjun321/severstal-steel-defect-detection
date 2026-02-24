@@ -572,9 +572,11 @@ def parse_args():
     parser.add_argument("--num_images_per_sample", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
-        "--resolution", type=int, default=None,
-        help="생성 해상도 (정사각형). 지정 시 resolution×resolution 고정 해상도 사용. "
-             "미지정 시 hint 이미지 크기에서 8의 배수로 올림 자동 계산 (최소 64px). "
+        "--resolution", type=int, default=512,
+        help="생성 해상도 (정사각형). 학습 시 사용한 해상도와 반드시 일치해야 합니다. "
+             "기본값 512 (학습 해상도와 동일). "
+             "v4에서 None (hint 크기 기반 자동 계산)으로 설정 시 "
+             "tiny hint에서 64x64 등 극소 해상도로 생성하여 품질 저하 발생. "
              "예: --resolution 512",
     )
     parser.add_argument(

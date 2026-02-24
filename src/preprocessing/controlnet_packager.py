@@ -49,10 +49,10 @@ class ControlNetDatasetPackager:
         DatasetValidator.visual_check_sample()에서 경고만 출력하던
         edge proximity 검사를 패키징 시점에 실제 제외 로직으로 적용합니다.
 
-        NOTE: roi_bbox == defect_bbox인 경우 (ROI 최적화가 실패하여
-        결함 bbox를 그대로 ROI로 사용하는 경우) edge margin이 항상 0이므로
-        해당 샘플은 검사를 건너뜁니다. 이 상황은 Severstal 이미지
-        (1600x256)에서 512x512 ROI 창이 맞지 않아 발생합니다.
+        v5: optimize_roi_position이 adaptive sizing을 사용하여
+        roi_bbox != defect_bbox가 정상적으로 됩니다 (256x256 패치).
+        v4에서는 512x512 ROI가 256px 높이 이미지에 맞지 않아
+        roi_bbox == defect_bbox로 fallback되었습니다.
 
         Args:
             df: ROI metadata DataFrame (roi_bbox, defect_bbox 컬럼 필요)

@@ -80,6 +80,12 @@ def main():
         action='store_true',
         help='Do not save image/mask patches (only generate metadata)'
     )
+    parser.add_argument(
+        '--num_workers',
+        type=int,
+        default=0,
+        help='Number of parallel workers (0 = sequential, recommended for Colab)'
+    )
     
     args = parser.parse_args()
     
@@ -111,6 +117,7 @@ def main():
     print(f"Min suitability: {args.min_suitability}")
     print(f"Max images: {args.max_images or 'all'}")
     print(f"Save patches: {not args.no_save_patches}")
+    print(f"Workers: {args.num_workers or 'sequential'}")
     print("="*80)
     
     # Initialize analyzers
@@ -139,7 +146,8 @@ def main():
         train_csv=train_csv,
         output_dir=output_dir,
         save_patches=not args.no_save_patches,
-        max_images=args.max_images
+        max_images=args.max_images,
+        num_workers=args.num_workers
     )
     
     # Save metadata to CSV

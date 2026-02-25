@@ -154,6 +154,9 @@ class DefectCharacterizer:
         """
         Analyze all separate defect regions in a mask (handles multiple disconnected defects).
         
+        Performance (v5): removed unused region_mask allocation per region.
+        All metrics are computed directly from regionprops objects.
+        
         Args:
             mask: Binary mask (H, W) that may contain multiple disconnected defects
             class_id: Defect class identifier (1-4)
@@ -167,9 +170,6 @@ class DefectCharacterizer:
         
         results = []
         for idx, region in enumerate(regions):
-            # Create a binary mask for this specific region
-            region_mask = (labeled_mask == region.label).astype(np.uint8)
-            
             # Compute bounding box
             minr, minc, maxr, maxc = region.bbox
             

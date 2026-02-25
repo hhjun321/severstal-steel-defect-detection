@@ -126,6 +126,10 @@ class BackgroundAnalyzer:
         """
         Classify a single patch into a background type.
         
+        Performance (v5): lazy evaluation — skip expensive Sobel/FFT
+        when variance alone determines the classification (SMOOTH case).
+        FFT is only computed when edge analysis is inconclusive.
+        
         Args:
             patch: Grayscale image patch
             
@@ -133,53 +137,49 @@ class BackgroundAnalyzer:
             Tuple of (background_type, stability_score)
             stability_score indicates how stable/uniform the background is (0-1)
         """
-        # Step 1: Variance analysis
+        # Step 1: Variance analysis (cheap — single np.var call)
         variance = self.compute_variance(patch)
         
-        # Step 2: Edge direction analysis
+        # Early exit: low variance -> SMOOTH (skip Sobel + FFT entirely)
+        if variance < self.variance_threshold:
+            stability = 1.0 - (variance / self.variance_threshold)
+            return BackgroundType.SMOOTH, float(np.clip(stability, 0.0, 1.0))
+        
+        # Step 2: Edge direction analysis (moderate cost — Sobel only)
         edge_info = self.compute_edge_directions(patch)
         
-        # Step 3: Frequency analysis
+        v_strength = edge_info['vertical']
+        h_strength = edge_info['horizontal']
+        total_strength = edge_info['total']
+        
+        if total_strength < 1.0:  # Very weak edges
+            return BackgroundType.TEXTURED, 0.5
+        
+        # Normalize strengths
+        v_ratio = v_strength / (total_strength + 1e-6)
+        h_ratio = h_strength / (total_strength + 1e-6)
+        
+        # Check for dominant direction (no FFT needed)
+        if v_ratio > self.edge_threshold and v_ratio > h_ratio * 1.5:
+            return BackgroundType.VERTICAL_STRIPE, float(np.clip(v_ratio, 0.0, 1.0))
+        elif h_ratio > self.edge_threshold and h_ratio > v_ratio * 1.5:
+            return BackgroundType.HORIZONTAL_STRIPE, float(np.clip(h_ratio, 0.0, 1.0))
+        
+        # Step 3: Only compute FFT when edge analysis is inconclusive
         freq_info = self.compute_frequency_spectrum(patch)
+        if freq_info['high_freq_ratio'] > 0.3:
+            stability = 1.0 - freq_info['high_freq_ratio']
+            return BackgroundType.COMPLEX_PATTERN, float(np.clip(stability, 0.0, 1.0))
         
-        # Classification logic
-        if variance < self.variance_threshold:
-            # Low variance -> Smooth
-            bg_type = BackgroundType.SMOOTH
-            stability = 1.0 - (variance / self.variance_threshold)
-        else:
-            # High variance -> Check edge patterns
-            v_strength = edge_info['vertical']
-            h_strength = edge_info['horizontal']
-            total_strength = edge_info['total']
-            
-            if total_strength < 1.0:  # Very weak edges
-                bg_type = BackgroundType.TEXTURED
-                stability = 0.5
-            else:
-                # Normalize strengths
-                v_ratio = v_strength / (total_strength + 1e-6)
-                h_ratio = h_strength / (total_strength + 1e-6)
-                
-                # Check for dominant direction
-                if v_ratio > self.edge_threshold and v_ratio > h_ratio * 1.5:
-                    bg_type = BackgroundType.VERTICAL_STRIPE
-                    stability = v_ratio
-                elif h_ratio > self.edge_threshold and h_ratio > v_ratio * 1.5:
-                    bg_type = BackgroundType.HORIZONTAL_STRIPE
-                    stability = h_ratio
-                elif freq_info['high_freq_ratio'] > 0.3:
-                    bg_type = BackgroundType.COMPLEX_PATTERN
-                    stability = 1.0 - freq_info['high_freq_ratio']
-                else:
-                    bg_type = BackgroundType.TEXTURED
-                    stability = 0.5
-        
-        return bg_type, float(np.clip(stability, 0.0, 1.0))
+        return BackgroundType.TEXTURED, 0.5
     
     def analyze_image(self, image: np.ndarray) -> Dict:
         """
         Analyze entire image using grid-based approach.
+        
+        Performance (v5): pre-allocates arrays, skips grid_info list
+        construction (only needed for debug). The heavy lifting is in
+        classify_patch() which now uses lazy evaluation.
         
         Args:
             image: Input image (H, W, C) or (H, W)
@@ -194,7 +194,7 @@ class BackgroundAnalyzer:
         if len(image.shape) == 3:
             gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
         else:
-            gray = image.copy()
+            gray = image
         
         h, w = gray.shape
         grid_h = h // self.grid_size
@@ -205,20 +205,19 @@ class BackgroundAnalyzer:
         stability_map = np.zeros((grid_h, grid_w), dtype=np.float32)
         grid_info = []
         
-        # Analyze each grid cell
+        # Pre-compute all patch slices to avoid repeated min() calls
+        gs = self.grid_size
         for i in range(grid_h):
+            y1 = i * gs
+            y2 = y1 + gs  # Always exact since grid_h = h // grid_size
             for j in range(grid_w):
-                # Extract patch
-                y1 = i * self.grid_size
-                x1 = j * self.grid_size
-                y2 = min(y1 + self.grid_size, h)
-                x2 = min(x1 + self.grid_size, w)
+                x1 = j * gs
+                x2 = x1 + gs
                 patch = gray[y1:y2, x1:x2]
                 
-                # Classify patch
+                # Classify patch (lazy eval: skips FFT when possible)
                 bg_type, stability = self.classify_patch(patch)
                 
-                # Store results
                 background_map[i, j] = bg_type.value
                 stability_map[i, j] = stability
                 

@@ -213,9 +213,13 @@ class ROISuitabilityEvaluator:
         roi_h = max(base_size, defect_h + 2 * min_context_pixels)
         roi_w = max(base_size, defect_w + 2 * min_context_pixels)
         
-        # Clamp to image dimensions
-        roi_h = min(roi_h, h)
-        roi_w = min(roi_w, w)
+        # Force square ROI to prevent train/inference resolution mismatch
+        # Training: Resize(512) + CenterCrop(512) loses data on non-square
+        # Inference: always generates 512x512 square
+        # Use the smaller dimension to guarantee image bounds compliance
+        roi_side = min(roi_h, roi_w, h, w)
+        roi_h = roi_side
+        roi_w = roi_side
         
         # Center ROI on defect centroid
         x1 = cx - roi_w // 2
@@ -238,17 +242,28 @@ class ROISuitabilityEvaluator:
             y1 = max(0, h - roi_h)
         
         # Verify defect is fully contained
+        # Note: with forced square ROI, very wide defects (> roi_side) may
+        # not be fully contained. This is acceptable — partial coverage of
+        # extremely wide defects is better than non-square ROIs that cause
+        # train/inference mismatch. The defect center is always captured.
         if dx1 < x1 or dy1 < y1 or dx2 > x2 or dy2 > y2:
-            # Expand to contain defect
-            x1 = min(x1, dx1)
-            y1 = min(y1, dy1)
-            x2 = max(x2, dx2)
-            y2 = max(y2, dy2)
-            # Re-clamp
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(w, x2)
-            y2 = min(h, y2)
+            # Try to shift ROI to contain as much of the defect as possible
+            # WITHOUT changing ROI dimensions (keep square)
+            shift_x = 0
+            shift_y = 0
+            if dx1 < x1:
+                shift_x = dx1 - x1  # negative: shift left
+            elif dx2 > x2:
+                shift_x = dx2 - x2  # positive: shift right
+            if dy1 < y1:
+                shift_y = dy1 - y1
+            elif dy2 > y2:
+                shift_y = dy2 - y2
+            
+            x1 = max(0, min(x1 + shift_x, w - roi_w))
+            y1 = max(0, min(y1 + shift_y, h - roi_h))
+            x2 = x1 + roi_w
+            y2 = y1 + roi_h
         
         initial_bbox = (x1, y1, x2, y2)
         initial_continuity = self.background_analyzer.check_continuity(

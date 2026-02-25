@@ -1,0 +1,158 @@
+20260225 작업 일지 #3 - ROI 추출 파이프라인 성능 최적화
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+extract_rois.py 실행 속도 개선. Colab에서 v5 ROI 재추출(Step 1)이
+지나치게 느린 문제를 진단하고, 알고리즘 수준에서 최적화를 구현한다.
+
+
+2. 병목 진단 결과
+================================================================================
+
+  | 병목 지점                              | 위치 (파일:라인)                       | 심각도 |
+  |----------------------------------------|----------------------------------------|--------|
+  | DataFrame 반복 필터링                  | rle_utils.py:65,74-91                  | 최상   |
+  | 이미지 이중 로드                       | roi_extraction.py:74 + 277             | 상     |
+  | 마스크 이중 디코딩                     | roi_extraction.py:85 + 280             | 상     |
+  | 패치별 FFT 무조건 실행                 | background_characterization.py:125-178 | 중     |
+  | 미사용 region_mask 할당               | defect_characterization.py:171         | 하     |
+
+  2-1. DataFrame 반복 필터링 (최상)
+  ────────────────────────────────
+  get_all_masks_for_image()가 이미지당 4회 DataFrame 전체 스캔:
+    train_df[(train_df['ImageId'] == image_id) & (train_df['ClassId'] == class_id)]
+  이미지 M개, 행 N개 기준 O(4×N×M). Severstal train.csv는 ~7,095행,
+  이미지 ~6,666개 → 약 1.89억 비교 연산.
+  
+  process_dataset()에서 masks를 2번 디코딩 (process_single_image + 저장용)
+  하므로 실제로는 이미지당 8회 DataFrame 필터링.
+
+  2-2. 이미지/마스크 이중 로드 (상)
+  ──────────────────────────────
+  process_dataset()가 각 이미지를:
+  (a) process_single_image() 내부에서 cv2.imread() + get_all_masks_for_image()
+  (b) 패치 저장용으로 다시 cv2.imread() + get_all_masks_for_image()
+  → 이미지 I/O 2x, RLE 디코딩 2x
+
+  2-3. FFT 무조건 실행 (중)
+  ─────────────────────────
+  classify_patch()가 variance, Sobel, FFT를 모두 순차 실행.
+  하지만 variance가 낮으면 (SMOOTH) Sobel/FFT 불필요.
+  FFT가 필요한 경우는 Sobel로도 분류 불가한 경우뿐.
+  1600×256 이미지, grid_size=64 → 패치 100개/이미지.
+  smooth 패치가 많은 steel 이미지에서 불필요한 FFT가 다수.
+
+
+3. 최적화 구현
+================================================================================
+
+  3-1. rle_utils.py — DataFrame 사전 인덱싱 + RLE 벡터화
+  ──────────────────────────────────────────────────────
+  변경:
+  - build_image_index(train_df) 함수 추가 (L49-66)
+    → groupby('ImageId')로 O(N) 1회 실행, 이후 O(1) dict 조회
+  - get_all_masks_for_image()에 image_index 매개변수 추가 (L117-152)
+    → 인덱스 있으면 해당 이미지 행만 순회 (1-4행), 없으면 기존 방식 fallback
+  - decode_mask_from_csv()에도 image_index 매개변수 추가 (L86-114)
+  - rle_decode(): Python for-loop → np.concatenate + np.arange 벡터화 (L37-44)
+
+  효과: DataFrame 필터링 O(4×N×M) → O(N + M). 약 10-50x 개선 예상.
+  하위 호환: image_index=None (기본값)이면 기존 방식과 동일 동작.
+
+  3-2. background_characterization.py — 지연 평가 (Lazy Evaluation)
+  ──────────────────────────────────────────────────────────────────
+  변경:
+  - classify_patch() (L125-): 3단계 지연 평가로 전환
+    Step 1: variance 계산 → 낮으면 SMOOTH 즉시 반환 (Sobel/FFT 건너뜀)
+    Step 2: Sobel만 계산 → 방향성 확인되면 즉시 반환 (FFT 건너뜀)
+    Step 3: FFT는 Sobel 결과가 불확정적일 때만 실행
+  - analyze_image() (L180-): image.copy() 제거, grid 루프 간소화
+
+  효과: steel 이미지의 smooth 패치 비율에 따라 30-60% FFT 호출 절감 예상.
+
+  3-3. roi_extraction.py — 단일 로드 패턴 + 사전 인덱싱
+  ────────────────────────────────────────────────────
+  변경:
+  - process_single_image() 시그니처 확장 (L64-):
+    image_rgb, masks, image_index 매개변수 추가
+    → 이미 로드된 이미지/마스크를 전달받아 재사용
+    → 반환값도 (roi_results, image_rgb, masks) 튜플로 변경
+  - process_dataset() (L256-):
+    (a) build_image_index() 호출로 사전 인덱싱 (L284-285)
+    (b) 이미지당 cv2.imread() 1회만 실행 (기존 2회)
+    (c) get_all_masks_for_image() 1회만 실행 (기존 2회)
+    (d) 로드된 데이터를 process_single_image()과 save_roi_data()에 공유
+    (e) num_workers 매개변수 추가 (향후 병렬화 확장용)
+  - build_image_index import 추가 (L26)
+
+  효과: 이미지 I/O 50% 감소, RLE 디코딩 50% 감소.
+
+  3-4. defect_characterization.py — 미사용 할당 제거
+  ──────────────────────────────────────────────────
+  변경:
+  - analyze_all_defects_in_mask() (L153-):
+    region_mask = (labeled_mask == region.label).astype(np.uint8) 제거
+    → 모든 지표가 regionprops 객체에서 직접 계산되므로 불필요
+
+  효과: 결함 수에 비례한 256×1600 배열 할당 절감. 영향은 미미하나 코드 정확성 개선.
+
+  3-5. extract_rois.py — --num_workers 인자 추가
+  ──────────────────────────────────────────────
+  변경:
+  - --num_workers 인자 추가 (L83-88), 기본값 0 (순차 처리)
+  - process_dataset() 호출 시 num_workers 전달 (L150)
+
+  효과: 향후 ProcessPoolExecutor 기반 병렬화 확장 가능. 현재는 순차 처리 권장
+  (Colab 2코어에서 프로세스 생성 오버헤드 > 병렬화 이득).
+
+
+4. 변경 파일 요약
+================================================================================
+
+  | 파일                                    | 변경 요약                            | 라인   |
+  |-----------------------------------------|--------------------------------------|--------|
+  | src/utils/rle_utils.py                  | build_image_index(), 벡터화, 인덱싱  | 전체   |
+  | src/analysis/background_characterization.py | classify_patch() 지연 평가        | L125+  |
+  | src/preprocessing/roi_extraction.py     | 단일 로드, 인덱싱, 시그니처 확장     | L64+   |
+  | src/analysis/defect_characterization.py | 미사용 region_mask 제거             | L153+  |
+  | scripts/extract_rois.py                | --num_workers 인자                   | L83+   |
+
+
+5. 예상 성능 개선
+================================================================================
+
+  | 최적화 항목           | 기존                    | 개선 후                | 예상 배수 |
+  |-----------------------|-------------------------|------------------------|-----------|
+  | DataFrame 조회        | O(4×N×M) ≈ 1.89억 비교 | O(N + M) ≈ 1.4만       | ~13,000x  |
+  | 이미지 I/O            | 2회/이미지              | 1회/이미지             | 2x        |
+  | RLE 디코딩            | 2회/이미지              | 1회/이미지             | 2x        |
+  | FFT 호출 (smooth패치) | 100% 호출               | ~40-70% 건너뜀         | 1.5-2x    |
+  | 메모리 (region_mask)  | 결함당 409,600 bytes    | 0                      | -         |
+
+  종합 예상: 전체 파이프라인 약 3-5x 속도 향상.
+  (DataFrame 인덱싱이 가장 큰 기여, 나머지는 점진적 개선)
+
+
+6. 하위 호환성
+================================================================================
+모든 변경이 하위 호환됨:
+- build_image_index()는 선택적 (image_index=None이면 기존 방식)
+- process_single_image() 새 매개변수는 모두 Optional, 기본값 None
+- process_dataset()의 num_workers=0은 기존 순차 처리와 동일
+- controlnet_packager.py, extract_clean_backgrounds.py 등 기존 호출자는
+  변경 없이 동작 (image_index 전달하지 않으면 fallback)
+
+
+7. Colab 실행 안내
+================================================================================
+변경된 코드로 v5 ROI 재추출:
+
+  python scripts/extract_rois.py \
+    --image_dir /content/drive/MyDrive/data/Severstal/train_images \
+    --train_csv /content/drive/MyDrive/data/Severstal/train.csv \
+    --output_dir /content/drive/MyDrive/data/Severstal/data/processed/roi_patches \
+    --roi_size 256
+
+기존과 동일한 명령이지만, 내부적으로 최적화가 자동 적용됨.
+완료 후 Step 2 (prepare_controlnet_data.py) 진행.

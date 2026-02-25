@@ -77,10 +77,11 @@ class SteelDefectControlNetDataset(Dataset):
     ControlNet 학습용 Steel Defect 데이터셋.
 
     train.jsonl에서 로드하며, 각 샘플은:
-    - source/target: 결함이 포함된 ROI 이미지 (학습 대상)
+    - target: 결함이 포함된 ROI 이미지 (학습 타겟, VAE encode → 노이즈 예측 대상)
     - hint: 3채널 conditioning 이미지 (R=mask, G=structure, B=texture)
     - prompt: 결함 + 배경 텍스트 설명
     - negative_prompt: 네거티브 프롬프트
+    - source: 레거시 필드 (학습에서 사용하지 않음, target과 동일값)
     """
 
     def __init__(

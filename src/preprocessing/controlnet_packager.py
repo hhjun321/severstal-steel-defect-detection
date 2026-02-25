@@ -42,7 +42,10 @@ class ControlNetDatasetPackager:
         self.prompt_generator = prompt_generator or PromptGenerator(style=prompt_style)
     
     def _edge_filter(self, df: pd.DataFrame,
-                     edge_margin: float = 0.1) -> pd.DataFrame:
+                     edge_margin_x: float = 0.1,
+                     edge_margin_y: float = 0.05,
+                     rare_class_margin: float = 0.02,
+                     rare_class_threshold: int = 50) -> pd.DataFrame:
         """
         ROI 경계에 너무 가까운 결함을 가진 샘플을 제외합니다.
 
@@ -54,9 +57,20 @@ class ControlNetDatasetPackager:
         v4에서는 512x512 ROI가 256px 높이 이미지에 맞지 않아
         roi_bbox == defect_bbox로 fallback되었습니다.
 
+        v5.1 개선사항:
+        - 좌우(x)/상하(y) 마진을 분리. Severstal 이미지(1600x256)에서
+          ROI 높이=이미지 높이=256이므로 상하 마진은 구조적으로 확보가 어려움.
+          좌우 10%, 상하 5%로 차등 적용하여 제외율을 67% → ~35%로 감소.
+        - 희소 클래스 보호: 전체 가용 샘플이 rare_class_threshold 이하인
+          클래스는 마진을 rare_class_margin(2%)으로 더 완화하여
+          학습 데이터 최소 확보를 보장 (v5에서 Class 2가 10개로 감소한 문제).
+
         Args:
             df: ROI metadata DataFrame (roi_bbox, defect_bbox 컬럼 필요)
-            edge_margin: ROI 크기 대비 최소 마진 비율 (기본 0.1 = 10%)
+            edge_margin_x: 좌우 마진 비율 (기본 0.1 = 10%, ROI 너비 기준)
+            edge_margin_y: 상하 마진 비율 (기본 0.05 = 5%, ROI 높이 기준)
+            rare_class_margin: 희소 클래스에 적용할 완화 마진 (기본 0.02 = 2%)
+            rare_class_threshold: 이 수 이하인 클래스를 희소로 간주 (기본 50)
 
         Returns:
             edge-flagged 샘플이 제거된 DataFrame
@@ -64,6 +78,18 @@ class ControlNetDatasetPackager:
         if 'roi_bbox' not in df.columns or 'defect_bbox' not in df.columns:
             print("Edge filter: roi_bbox/defect_bbox columns not found, skipping")
             return df
+
+        # 희소 클래스 식별
+        rare_classes = set()
+        if 'class_id' in df.columns:
+            class_counts = df['class_id'].value_counts()
+            rare_classes = set(
+                class_counts[class_counts <= rare_class_threshold].index
+            )
+            if rare_classes:
+                print(f"  Rare classes (n<={rare_class_threshold}): "
+                      f"{dict(class_counts[class_counts <= rare_class_threshold])} "
+                      f"-> edge margin relaxed to {rare_class_margin}")
 
         original_len = len(df)
         exclude_indices = []
@@ -97,27 +123,38 @@ class ControlNetDatasetPackager:
                 exclude_indices.append(idx)
                 continue
 
+            # 희소 클래스이면 마진 완화 적용
+            class_id = row.get('class_id', None)
+            if class_id in rare_classes:
+                mx = rare_class_margin
+                my = rare_class_margin
+            else:
+                mx = edge_margin_x
+                my = edge_margin_y
+
             edge_issues = []
-            if (def_x1 - roi_x1) < roi_width * edge_margin:
+            if (def_x1 - roi_x1) < roi_width * mx:
                 edge_issues.append("left")
-            if (roi_x2 - def_x2) < roi_width * edge_margin:
+            if (roi_x2 - def_x2) < roi_width * mx:
                 edge_issues.append("right")
-            if (def_y1 - roi_y1) < roi_height * edge_margin:
+            if (def_y1 - roi_y1) < roi_height * my:
                 edge_issues.append("top")
-            if (roi_y2 - def_y2) < roi_height * edge_margin:
+            if (roi_y2 - def_y2) < roi_height * my:
                 edge_issues.append("bottom")
 
             if edge_issues:
                 exclude_indices.append(idx)
                 image_id = row.get('image_id', 'unknown')
-                class_id = row.get('class_id', '?')
-                print(f"  Edge filter excluded: {image_id} (Class {class_id}) "
+                cls_id = row.get('class_id', '?')
+                print(f"  Edge filter excluded: {image_id} (Class {cls_id}) "
                       f"- too close to {', '.join(edge_issues)} edge")
 
         df = df.drop(index=exclude_indices).reset_index(drop=True)
         removed = original_len - len(df)
         print(f"Edge filter: {original_len} -> {len(df)} "
               f"({removed} removed, {removed/max(original_len,1)*100:.1f}%)")
+        print(f"  Margins: x={edge_margin_x}, y={edge_margin_y}, "
+              f"rare={rare_class_margin}")
         if skipped_identical > 0:
             print(f"  ({skipped_identical} samples with roi_bbox==defect_bbox, "
                   f"edge check skipped)")
@@ -390,12 +427,21 @@ class ControlNetDatasetPackager:
         """
         Create train.jsonl file for ControlNet training.
         
+        필드 역할 (train_controlnet.py 기준):
+        - target: 학습 타겟 이미지 (VAE encode → 노이즈 예측 대상).
+                  결함이 포함된 ROI 패치 이미지.
+        - hint:   ControlNet 조건부 입력 (conditioning_pixel_values).
+                  3채널 합성 이미지 (R=마스크, G=구조선, B=텍스처).
+        - prompt: 텍스트 설명 (결함 특성 + 배경 유형).
+        - source: 레거시 필드. 학습/추론 코드에서 사용하지 않음.
+                  target과 동일값으로 설정 (하위 호환용).
+        
         Format per line:
         {
-            "source": "path/to/roi_image.png",
-            "target": "path/to/roi_image.png",  # Same as source for this task
-            "prompt": "a linear scratch on vertical striped metal surface...",
-            "hint": "path/to/hint_image.png",
+            "source": "path/to/roi_image.png",    (미사용, 레거시 호환)
+            "target": "path/to/roi_image.png",     (학습 타겟)
+            "prompt": "a linear scratch on ...",
+            "hint": "path/to/hint_image.png",      (ControlNet 조건부 입력)
             "negative_prompt": "blurry, low quality..."
         }
         
@@ -408,22 +454,23 @@ class ControlNetDatasetPackager:
         jsonl_lines = []
         
         for roi_data in roi_metadata:
-            # Get paths
-            source_path = roi_data.get('roi_image_path', '')
+            # target = 결함 포함 ROI 이미지 (학습 대상)
+            target_path = roi_data.get('roi_image_path', '')
+            # hint = 3채널 conditioning 이미지 (ControlNet 입력)
             hint_path = roi_data.get('hint_path', '')
             
             if relative_paths and base_dir:
                 try:
-                    source_path = Path(source_path).relative_to(base_dir)
+                    target_path = Path(target_path).relative_to(base_dir)
                     hint_path = Path(hint_path).relative_to(base_dir)
                 except ValueError:
                     pass  # Keep absolute if relative conversion fails
             
             entry = {
-                "source": str(source_path),
-                "target": str(source_path),  # For defect generation, target = source
+                "source": str(target_path),   # 레거시 호환 — 학습/추론에서 미사용
+                "target": str(target_path),    # 학습 타겟 (VAE encode 대상)
                 "prompt": roi_data.get('prompt', ''),
-                "hint": str(hint_path),
+                "hint": str(hint_path),        # ControlNet conditioning 입력
                 "negative_prompt": roi_data.get('negative_prompt', '')
             }
             

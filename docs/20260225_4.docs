@@ -1,0 +1,595 @@
+20260225 작업 일지 #4 - ControlNet v4 실험 데이터 사후 분석
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+outputs/v4/ 디렉터리에 저장된 v4 파이프라인의 실제 실험 산출물(ROI 추출,
+데이터셋 패키징, 학습 로그, 검증 결과)을 체계적으로 분석하여,
+20260225.docs(#1)에서 진단한 5가지 근본 원인을 실험 데이터로 교차 검증한다.
+
+
+2. 분석 대상 파일
+================================================================================
+
+  | 파일                                             | 내용                     | 크기        |
+  |--------------------------------------------------|--------------------------|-------------|
+  | outputs/v4/roi-patch-v4/roi_metadata.csv          | ROI 추출 결과            | 16,012행    |
+  | outputs/v4/roi-patch-v4/statistics.txt             | ROI 통계 요약            | 32행        |
+  | outputs/v4/control-dataset-v4/metadata.json        | 패키징된 샘플 메타데이터 | 25,013행    |
+  | outputs/v4/control-dataset-v4/packaging_summary.txt| 패키징 요약              | 8행         |
+  | outputs/v4/control-dataset-v4/train.jsonl           | 학습 데이터 목록         | ~967행      |
+  | outputs/v4/control-dataset-v4/packaged_roi_metadata.csv | 패키징 ROI 메타      | ~1,001행    |
+  | outputs/v4/training-v4/training_config.json         | 학습 설정               | 39행        |
+  | outputs/v4/training-v4/training_log.json            | 학습 step별 loss/lr     | 3,470행     |
+  | outputs/v4/training-v4/pipeline_reference.json      | 모델 경로 참조          | 6행         |
+  | outputs/v4/result-v4/training_stats.json            | 학습 통계 요약          | 13행        |
+  | outputs/v4/result-v4/validation_report_phase4.txt   | 검증 보고서 (Phase1-3)  | 52행        |
+  | outputs/v4/result-v4/validation_results.json        | Phase 통과 여부         | 6행         |
+  | outputs/v4/result-v4/phase2_summary.json            | Phase2 파라미터 탐색     | 191행       |
+
+
+3. ROI 추출 단계 분석 (roi-patch-v4)
+================================================================================
+
+  3-1. 전체 ROI 분포
+  ──────────────────
+
+    | 클래스  | ROI 수  | 비율   | 비고                             |
+    |---------|---------|--------|----------------------------------|
+    | Class 1 | 2,891   | 18.1%  | compact_blob, general 혼재       |
+    | Class 2 | 146     | 0.9%   | 극소량 — 데이터 부족              |
+    | Class 3 | 11,129  | 69.5%  | 최다수 — linear_scratch 포함      |
+    | Class 4 | 1,845   | 11.5%  | irregular, general 혼재          |
+    | 합계    | 16,011  | 100%   |                                  |
+
+    결함 하위유형 분포:
+      general: 6,585 (41.1%)  |  compact_blob: 4,756 (29.7%)
+      linear_scratch: 4,273 (26.7%)  |  irregular: 397 (2.5%)
+
+    배경 유형 분포:
+      complex_pattern: 9,776 (61.1%)  |  vertical_stripe: 2,514 (15.7%)
+      smooth: 2,229 (13.9%)  |  horizontal_stripe: 1,385 (8.7%)
+      textured: 107 (0.7%)
+
+    평균 품질 점수:
+      suitability=0.679, matching=0.709, continuity=0.702
+
+    추천 분포:
+      acceptable: 10,879 (67.9%)  |  suitable: 5,132 (32.1%)
+
+  3-2. 핵심 발견: roi_bbox == defect_bbox (100% 일치)
+  ─────────────────────────────────────────────────────
+  roi_metadata.csv의 모든 16,011행에서 roi_bbox 컬럼과 defect_bbox 컬럼의 값이
+  동일하다. 이는 optimize_roi_position()이 단 한 번도 성공하지 못했음을 의미한다.
+
+    검증 데이터 (roi_metadata.csv 상위 4행):
+      0002cc93b.jpg class1 region0: roi_bbox="(350, 63, 369, 103)"  defect_bbox="(350, 63, 369, 103)"  ← 동일
+      0002cc93b.jpg class1 region1: roi_bbox="(741, 74, 756, 102)"  defect_bbox="(741, 74, 756, 102)"  ← 동일
+      0002cc93b.jpg class1 region2: roi_bbox="(304, 88, 332, 194)"  defect_bbox="(304, 88, 332, 194)"  ← 동일
+      0002cc93b.jpg class1 region3: roi_bbox="(113, 161, 128, 185)" defect_bbox="(113, 161, 128, 185)" ← 동일
+
+    패키징된 데이터에서도 동일 (metadata.json 상위 2샘플):
+      d84ad849e.jpg class1 region1: roi_bbox="(1412, 89, 1438, 125)" defect_bbox="(1412, 89, 1438, 125)"
+      e2b3cf9a4.jpg class1 region0: roi_bbox="(665, 148, 728, 208)"  defect_bbox="(665, 148, 728, 208)"
+
+    원인 (20260225.docs #1 진단 확인):
+      기존 optimize_roi_position()은 512×512 정사각 윈도우만 탐색.
+      Severstal 이미지 높이가 256px이므로 512×512 윈도우는 이미지 경계를 초과.
+      → 항상 None 반환 → fallback으로 defect_bbox 그대로 사용.
+      → ROI 패치 = 결함 bounding box 그 자체 (배경 컨텍스트 없음).
+
+  3-3. ROI 패치 크기 분석
+  ──────────────────────
+  roi_bbox == defect_bbox이므로, 패치 크기 = 결함 bounding box 크기.
+
+    대표 예시 (Class 1, compact_blob):
+      (350,63,369,103)   → 19×40px
+      (741,74,756,102)   → 15×28px
+      (1412,89,1438,125) → 26×36px
+      (113,161,128,185)  → 15×24px
+
+    대표 예시 (Class 1, general):
+      (665,148,728,208)  → 63×60px  ← 비교적 큰 편
+
+    512×512 학습 해상도 대비 업스케일 배율:
+      19×40px → 512×512 = 최소 변 기준 27배
+      15×24px → 512×512 = 최소 변 기준 21배
+      63×60px → 512×512 = 최소 변 기준 8.1배
+
+    결론: 대다수 패치가 15~45px 범위이며, 512×512로 10~34배 업스케일됨.
+    Bilinear 보간으로 이 배율을 적용하면 거대한 픽셀 블록 아티팩트가 발생하며,
+    SD 1.5 VAE가 이를 "원본 텍스처"로 학습하게 됨.
+
+    v5 대응: optimize_roi_position() adaptive sizing 재작성 (20260225_2.docs #1 P0)
+             → 256×256 패치 추출, 512×512로 2배 업스케일만 발생.
+
+
+4. 학습 데이터셋 단계 분석 (control-dataset-v4)
+================================================================================
+
+  4-1. 데이터셋 구성
+  ──────────────────
+
+    | 항목                 | 값                                           |
+    |----------------------|----------------------------------------------|
+    | 총 패키징 샘플       | 1,000                                        |
+    | train.jsonl 유효 행  | 967 (edge_filter로 33개 제외)                 |
+    | 클래스 분포          | Class 1: 1,000 / Class 2: 0 / Class 3: 0 / Class 4: 0 |
+    | 힌트 채널 구성       | R=결함마스크, G=배경구조선, B=배경미세텍스처   |
+
+  4-2. 단일 클래스 편향
+  ─────────────────────
+  전체 ROI 풀에서 Class 3이 69.5%(11,129개)로 가장 많지만,
+  패키징된 1,000개 샘플은 전부 Class 1만 포함한다.
+
+    가능한 원인:
+      - prepare_controlnet_data.py 실행 시 class_id 필터 적용 가능성
+      - 또는 suitability_score 기준으로 정렬 시 Class 1이 우선 선택
+      - 또는 max_samples=1000 설정 시 Class 1만으로 채워짐
+
+    문제점:
+      - 추론 시 Class 1~4 모든 클래스에 대해 생성 시도 (test_results_v4)
+      - Class 2/3/4 결함은 학습한 적 없는 out-of-distribution 입력
+      - 특히 Class 3 (linear_scratch)은 형태적으로 Class 1과 크게 다름
+
+    v5 대응: ROI 크기 256×256로 변경하면 대부분의 클래스가 유효 패치 생성 가능.
+             다중 클래스 균형 샘플링 적용 예정 (20260225_2.docs P4).
+
+  4-3. 힌트-타겟 해상도 문제
+  ──────────────────────────
+  metadata.json에 기록된 각 샘플의 roi_image_path가 가리키는 패치의 크기는
+  위 3-3에서 분석한 것처럼 15~63px 범위.
+
+    힌트 이미지 (hint_generator.py 생성):
+      - 동일한 극소 ROI에서 생성된 힌트 → 15~63px 크기
+      - 학습 시: transforms.Resize(512) + CenterCrop(512)로 512×512
+      - 추론 시: --resolution 미지정이면 힌트 원본 크기에서 자동 계산
+        → 15×24px 힌트 → 24×24px 생성 해상도 (8의 배수 올림)
+        → 학습 512×512 vs 추론 24×24 = 완전한 분포 불일치
+
+    v5 대응: test_controlnet.py --resolution 기본값 512로 고정 (20260225_2.docs P3).
+
+  4-4. 프롬프트 품질 (양호)
+  ────────────────────────
+  metadata.json의 prompt 필드는 결함 특성과 배경 유형을 반영하여 생성되어 있다.
+
+    예시:
+      "a solid compact defect spot on complex patterned metal surface
+       with multi-directional texture (normal condition), steel defect class 1"
+
+      "a solid compact defect spot on horizontal striped metal surface
+       with directional texture (standard condition), steel defect class 1"
+
+    negative_prompt도 일관되게 적용:
+      "blurry, low quality, artifacts, noise, distorted, warped, unrealistic,
+       oversaturated, cartoon, painting, text, watermark, logo"
+
+    평가: 프롬프트 자체는 적절하게 구성되어 있어, 생성 품질 저하의 원인이 아님.
+
+
+5. 학습 과정 분석 (training-v4)
+================================================================================
+
+  5-1. 학습 설정
+  ──────────────
+
+    | 하이퍼파라미터               | v4 값                  | 문제 여부       | v5 변경     |
+    |-----------------------------|------------------------|----------------|-------------|
+    | base_model                  | runwayml/sd-v1-5       | -              | 동일        |
+    | controlnet_init             | sd-controlnet-canny    | -              | 동일        |
+    | resolution                  | 512                    | -              | 동일        |
+    | batch_size                  | 1                      | -              | 4 (권장)    |
+    | gradient_accumulation       | 4                      | -              | 동일        |
+    | effective_batch_size        | 4                      | -              | 16 (권장)   |
+    | num_train_epochs            | 30                     | -              | 100         |
+    | learning_rate               | 5e-6                   | -              | 1e-5        |
+    | lr_scheduler                | cosine                 | -              | 동일        |
+    | lr_warmup_steps             | 100                    | -              | 동일        |
+    | mixed_precision             | fp16                   | -              | 동일        |
+    | snr_gamma                   | 5.0                    | -              | 동일        |
+    | max_grad_norm               | 0.5                    | -              | 동일        |
+    | early_stopping_patience     | 5                      | -              | 동일        |
+    | conditioning_scale          | 0.7                    | 문제 (이중감쇠) | 1.0 (P2)   |
+    | gray_loss_lambda            | 0.1                    | 문제 (잘못된 가정)| 0.0 (P1)  |
+    | validation_steps            | 0                      | 문제 (모니터링 없음)| 200 (P5) |
+    | force_grayscale_target      | true                   | -              | 동일        |
+    | augment                     | false                  | -              | 검토 필요   |
+    | seed                        | 42                     | -              | 동일        |
+
+  5-2. Loss 궤적 분석
+  ───────────────────
+  training_log.json: 578 logging entries (10 step 간격), 총 5,780 steps, 24 epochs.
+
+    Epoch별 대표 loss (10-step 이동평균 기준):
+      Epoch  0: 0.436 → 0.267  (급격한 하강, warmup 구간)
+      Epoch  1: 0.228 ~ 0.277  (큰 폭의 진동)
+      Epoch  4: 0.217 ~ 0.237  (안정화 시작)
+      Epoch  5: 0.232 ~ 0.235  (0.23 근처 정체)
+      Epoch 10: 0.220 ~ 0.250  (동일 범위 유지)
+      Epoch 20: 0.220 ~ 0.262  (여전히 동일)
+      Epoch 23: 0.221 ~ 0.263  (최종, 변화 없음)
+
+    요약 통계 (training_stats.json):
+      loss_mean  = 0.2371
+      loss_median = 0.2342
+      loss_std   = 0.0278
+      loss_min   = 0.1768 (step 4280, epoch ~17)
+      loss_max   = 0.4363 (step 20, epoch 0 warmup)
+      final_loss = 0.2245
+      nan_count  = 0
+
+  5-3. Loss 궤적 해석
+  ───────────────────
+  (a) 빠른 수렴과 조기 정체:
+      Loss가 epoch 0에서 0.43→0.27로 급하강한 후, epoch 1부터 0.22~0.27
+      범위에서 정체. 이후 23 epoch 동안 실질적 개선 없음.
+      → 모델이 "극소 업스케일 보간 패턴"을 빠르게 기억하고, 그 이상 학습할
+        의미 있는 패턴이 없었음을 시사.
+
+  (b) 높은 기저 loss (0.22~0.24):
+      정상적인 ControlNet fine-tuning에서 loss는 0.05~0.15 범위까지 하강 가능.
+      0.22 수준에서 정체한 것은 학습 데이터 자체의 품질 문제를 반영.
+      → 극도로 업스케일된 보간 이미지는 SD VAE가 정확히 재구성하기 어려움.
+      → gray_loss (0.1 가중치)가 추가 loss를 발생시켜 기저를 높이는 효과.
+
+  (c) step 수 불일치 문제:
+      training_stats.json의 total_steps=578, loss_min_step=4280.
+      training_log.json에는 5,780 step까지 기록.
+      → total_steps=578은 "로깅 횟수" (578 × logging_steps=10 = 5,780 실제 step)
+      → loss_min_step=4280은 실제 step 번호 (올바름)
+      → 혼동의 소지가 있으나 데이터 자체는 정합적.
+
+  (d) Learning rate 소진:
+      cosine scheduler로 LR이 5e-6 → 5.09e-7로 감쇠 (epoch 23 종료 시).
+      초기값의 10%까지 떨어졌으나, loss 개선에 기여하지 못함.
+
+  (e) Early stopping:
+      patience=5로 설정되어 있으나 24 epoch에서 중단 (30 예정 중).
+      epoch 19~24 사이에 best loss 갱신 없이 5 epoch 경과하여 조기 종료 추정.
+
+  (f) Validation 부재:
+      validation_steps=0 → 학습 중 생성 이미지를 시각적으로 확인할 수 없었음.
+      만약 200 step마다 validation을 했다면, 초기에 "흑백 블롭만 생성됨"을
+      발견하고 실험을 중단할 수 있었을 것.
+
+    v5 대응:
+      - conditioning_scale=1.0 (P2): 이중 감쇠 제거
+      - gray_loss_lambda=0.0 (P1): latent 표현력 복원
+      - validation_steps=200 (P5): 시각적 모니터링 활성화
+      - 데이터 품질 개선(P0)이 loss 기저를 근본적으로 낮출 것으로 예상
+
+
+6. 검증 결과 분석 (result-v4)
+================================================================================
+
+  6-1. Phase 1 — 기본 생성 (967 샘플)
+  ────────────────────────────────────
+
+    | 지표                | 값      | 해석                               |
+    |---------------------|---------|-------------------------------------|
+    | Quality Score       | 0.6254  | 복합 점수 (color+artifact+blur)     |
+    | Color Consistency   | 0.6541  | 중간 — 그레이스케일 범위 내 일관성   |
+    | Artifact Score      | 0.9258  | 높음 — 아티팩트 감지 지표는 양호     |
+    | Sharpness Score     | 0.8830  | 높음 — 블러 없음 (오히려 노이즈)     |
+    | SSIM                | 0.0269  | 극히 낮음 — 원본과 거의 무상관       |
+    | LPIPS               | 0.5774  | 높음 — 지각적 차이 큼                |
+    | Quality Status      | PASS    | ???                                 |
+
+    해석:
+      SSIM=0.027은 "완전히 다른 이미지"에 해당하는 수치.
+      참고로 무작위 노이즈 vs 원본의 SSIM은 약 0.01~0.05 범위.
+      v4 생성물의 SSIM(0.027)이 이 범위에 해당 → 사실상 랜덤 노이즈 수준.
+
+      LPIPS=0.577은 "상당히 다른 이미지" (LPIPS는 낮을수록 유사).
+      완전 무관한 이미지 쌍의 LPIPS는 보통 0.6~0.7.
+      v4 결과(0.577)는 "거의 무관" 수준.
+
+      반면 Artifact Score(0.93)와 Sharpness(0.88)는 높은데:
+      → 이는 생성물이 "깨끗한 노이즈/블롭 패턴"이기 때문
+      → 흐릿하거나 세밀한 아티팩트가 아닌, 선명한 블록 패턴을 출력
+      → 블러 감지기와 아티팩트 감지기는 "선명한 이미지"로 판단
+
+      Quality Score = f(color=0.65, artifact=0.93, sharpness=0.88)의 가중 합산.
+      SSIM과 LPIPS가 quality_score 계산에 충분히 반영되지 않아 0.625로 산출.
+      → quality_passed 판정의 임계값이 0.625 이하로 설정되어 PASS.
+
+  6-2. Phase 2 — 파라미터 탐색 (11 조합)
+  ────────────────────────────────────────
+
+    guidance_scale별 결과:
+      | guidance_scale | quality | SSIM   | LPIPS  |
+      |----------------|---------|--------|--------|
+      | 3.0            | 0.6301  | 0.0469 | 0.5560 |
+      | 5.0            | 0.6242  | 0.0490 | 0.5532 |
+      | 7.5            | 0.6151  | 0.0518 | 0.5484 |
+      | 10.0           | 0.6078  | 0.0551 | 0.5453 |
+
+      관찰:
+      - guidance_scale 증가 시 quality는 감소하지만, SSIM은 미세하게 증가
+      - 그러나 SSIM 전체 범위가 0.047~0.055로, 차이가 무의미 (오차 범위)
+      - guidance_scale 조정으로는 근본적 품질 개선 불가능함을 입증
+
+    inference_steps별 결과:
+      | steps | quality | SSIM   | LPIPS  |
+      |-------|---------|--------|--------|
+      | 20    | 0.6153  | 0.0517 | 0.5481 |
+      | 30    | 0.6151  | 0.0518 | 0.5484 |
+      | 50    | 0.6152  | 0.0519 | 0.5484 |
+
+      관찰:
+      - 20/30/50 step 간 차이가 소수점 4자리에서 발생 → 완전 동일
+      - diffusion step 수가 품질에 영향을 주지 않음
+      - 모델이 학습한 분포 자체가 문제이므로, 샘플링을 정교하게 해도 무효
+
+    seed별 결과:
+      | seed | quality | SSIM   | LPIPS  |
+      |------|---------|--------|--------|
+      | 42   | 0.6416  | 0.0666 | 0.5162 |
+      | 123  | 0.6320  | 0.0576 | 0.5741 |
+      | 456  | 0.6340  | 0.0200 | 0.5236 |
+      | 789  | 0.6370  | 0.1080 | 0.5554 |
+
+      관찰:
+      - seed=789에서 SSIM=0.108 (최대)이나 여전히 극히 낮음
+      - seed=456에서 SSIM=0.020 (최소) — 시드 간 분산이 큼
+      - 이는 생성물이 일관된 패턴을 갖지 않고 시드에 따라 다른 노이즈를 출력함을 의미
+
+    결론:
+      guidance_scale, inference_steps, seed 모든 축에서 SSIM < 0.11, LPIPS > 0.51.
+      하이퍼파라미터 탐색으로는 생성 품질을 개선할 수 없음.
+      → 문제의 근본은 학습 데이터와 학습 설정에 있음 (진단 재확인).
+
+  6-3. Phase 3 — 미학습 데이터 일반화 (12 샘플)
+  ──────────────────────────────────────────────
+
+    | 지표                | 값      |
+    |---------------------|---------|
+    | Quality Score       | 0.6316  |
+    | Color Consistency   | 0.6500  |
+    | Artifact Score      | 0.9269  |
+    | Sharpness Score     | 0.9103  |
+    | SSIM                | 0.0313  |
+    | LPIPS               | 0.5703  |
+    | Quality Status      | PASS    |
+
+    해석:
+      - Phase 1(학습 데이터)과 Phase 3(미학습 데이터) 결과가 거의 동일
+      - SSIM: 0.027 vs 0.031, LPIPS: 0.577 vs 0.570 — 차이 무의미
+      - 이는 모델이 "과적합도 안 되고, 일반화도 안 됨"을 의미
+      - 학습 데이터든 미학습 데이터든 동일한 품질의 노이즈/블롭을 출력
+
+  6-4. 검증 시스템의 과도한 PASS 판정 문제
+  ─────────────────────────────────────────
+  validation_results.json:
+    phase1: true, phase2: true, phase3: true, phase4: true
+
+  모든 Phase가 PASS로 판정되었으나, 실제 생성물은 사실상 랜덤 노이즈 수준.
+
+    원인 분석:
+      (a) quality_score 계산 가중치 편향:
+          quality_score = f(color, artifact, sharpness)에서
+          SSIM/LPIPS의 비중이 낮거나 미반영.
+          선명한 블롭/노이즈는 artifact(0.93)과 sharpness(0.88)에서 높은 점수를 받음.
+          → 구조적으로 완전히 다른 이미지도 quality_score=0.62로 "통과".
+
+      (b) 임계값 설정 문제:
+          quality_passed=true의 임계값이 0.6 이하로 추정.
+          랜덤 노이즈도 통과할 수 있는 지나치게 관대한 기준.
+
+      (c) SSIM/LPIPS의 역할:
+          Phase1 보고서에서 SSIM과 LPIPS가 기록은 되지만,
+          PASS/FAIL 판정에는 quality_score만 사용됨.
+          → SSIM=0.027(사실상 0)이어도 판정에 영향 없음.
+
+    권장 개선:
+      - quality_score 계산에 SSIM(최소 0.15 이상)과 LPIPS(최대 0.5 이하) 조건 추가
+      - 또는 SSIM/LPIPS에 별도 최소/최대 임계값 설정하여 hard-fail 도입
+      - 별도 Claude 세션 (work_log_2026-02-25_claude.md)에서 quality_score 전파 개선 진행 중
+
+
+7. v4 근본 원인 교차 검증 요약
+================================================================================
+
+  20260225.docs(#1)에서 진단한 5가지 원인을 실험 데이터와 대조한 결과:
+
+  | #  | 진단 원인                      | 실험 데이터 근거                                | 확인 |
+  |----|-------------------------------|-------------------------------------------------|------|
+  | 1  | 극소 ROI 업스케일 (P0)         | roi_bbox==defect_bbox (16,011행 전수 확인),      | ✅   |
+  |    |                               | 패치 크기 15~45px, 업스케일 10~34×                |      |
+  | 2  | 학습/추론 해상도 불일치 (P3)   | training_config: resolution=512,                 | ✅   |
+  |    |                               | 추론 시 hint 크기 기반 자동 계산 → 24~64px        |      |
+  | 3  | Gray Consistency Loss (P1)    | training_config: gray_loss_lambda=0.1,           | ✅   |
+  |    |                               | loss 기저가 0.22~0.24로 비정상적 높음             |      |
+  | 4  | conditioning_scale=0.7 (P2)   | training_config: conditioning_scale=0.7,         | ✅   |
+  |    |                               | 추론 시 추가 0.7 → 실효 0.49                     |      |
+  | 5  | 단일 클래스 데이터 (P4)       | metadata.json: 1,000개 전부 class_id=1,          | ✅   |
+  |    |                               | Class 2/3/4에 대한 생성은 OOD                     |      |
+
+  추가 발견:
+  | #  | 추가 발견                      | 근거                                            |
+  |----|-------------------------------|-------------------------------------------------|
+  | 6  | validation_steps=0 (P5)       | training_config.json 확인, 시각적 모니터링 없음  |
+  | 7  | 검증 PASS 기준 과도하게 관대   | SSIM=0.027에도 PASS, quality_score만으로 판정    |
+  | 8  | 하이퍼파라미터 탐색 무효       | Phase2에서 모든 조합이 SSIM<0.11, LPIPS>0.51     |
+  | 9  | 학습 loss 조기 정체           | epoch 1부터 0.22~0.27 범위 고착, 24 epoch 무개선 |
+  | 10 | early stopping 작동           | 30→24 epoch, patience=5로 조기 종료 추정         |
+
+
+8. v4→v5 대응 관계 종합표
+================================================================================
+
+  | v4 문제점                     | 실험 수치                    | v5 수정 (코드)                  | 수정 파일                      |
+  |-------------------------------|------------------------------|--------------------------------|-------------------------------|
+  | ROI=defect_bbox               | 100% 일치 (16,011행)        | adaptive sizing, 256×256 패치  | roi_suitability.py L165-294   |
+  |  → 15~45px 극소 패치          | 업스케일 10~34×              | min(roi_size, img_h, img_w)    | roi_extraction.py L29,99-134  |
+  |                               |                              |                                | extract_rois.py L51-59        |
+  | gray_loss_lambda=0.1          | loss 기저 0.22~0.24         | lambda=0.0                     | train_controlnet.py L1366     |
+  | conditioning_scale=0.7        | 실효 0.49 (이중 감쇠)       | 학습 시 1.0                    | train_controlnet.py L1337     |
+  | 해상도 불일치 (512 vs 24px)   | 추론 시 hint 크기 기반      | --resolution 기본값 512        | test_controlnet.py L574       |
+  | 단일 클래스 (Class 1 only)    | 1,000/1,000 = Class 1       | 다중 클래스 균형 샘플링        | 데이터 재추출로 해결          |
+  | validation_steps=0            | 시각적 모니터링 없음         | 기본값 200                     | train_controlnet.py L1409     |
+  | PASS 기준 관대                | SSIM=0.027에도 PASS          | (별도 세션에서 개선 진행 중)   | work_log_2026-02-25_claude.md |
+
+
+9. 결론
+================================================================================
+
+v4 실험 데이터를 전수 분석한 결과, 사전 진단한 5가지 근본 원인이 모두
+실험 기록으로 확인되었다.
+
+가장 결정적인 증거는 roi_metadata.csv의 16,011행 전부에서 roi_bbox와
+defect_bbox가 동일하다는 것이다. 이는 optimize_roi_position()의 512×512
+고정 윈도우가 256px 높이 이미지에서 단 한 번도 성공하지 못했음을 의미하며,
+결과적으로 15~45px 크기의 결함 bounding box가 그대로 학습 패치로 사용되어
+512×512로 10~34배 업스케일되었다.
+
+학습 loss가 epoch 1부터 0.22~0.24에서 정체한 것은 이 데이터 구조적 결함의
+직접적 결과다. Phase 2 파라미터 탐색에서 모든 조합이 SSIM<0.11을 기록한 것은
+하이퍼파라미터 조정으로는 데이터 품질 문제를 해결할 수 없음을 재확인한다.
+
+v5에서 구현한 adaptive ROI sizing(P0), gray_loss 비활성화(P1),
+conditioning_scale 정상화(P2), 해상도 고정(P3), 다중 클래스 지원(P4),
+validation 모니터링(P5)이 모두 실험 데이터에 의해 뒷받침되며,
+Colab에서의 v5 재실행이 필요한 상태이다.
+
+
+10. 부록: work_log_2026-02-25_claude.md 교차 검증
+================================================================================
+
+별도 Claude 세션(work_log_2026-02-25_claude.md)의 v4 분석과 본 문서의 분석을
+교차 검증한 결과를 정리한다.
+
+  10-1. 두 분석이 일치하는 항목
+  ────────────────────────────
+
+    | 항목                          | 본 문서 (#4)              | work_log                   |
+    |-------------------------------|---------------------------|----------------------------|
+    | ROI 극단 업스케일 (10~40×)    | Critical, 16,011행 전수   | Critical 2, metadata 확인  |
+    | SSIM=0.027, LPIPS=0.577       | Phase1 상세 분석          | 동일 수치 기록             |
+    | artifact/sharpness 높음+SSIM 극저 | 가중치 편향 분석      | quality_score 역산 수행    |
+    | guidance↑ → quality↓          | Phase2 표로 수치 확인     | conditioning 미활용 증거   |
+    | loss 정체 (0.22~0.24)         | epoch별 궤적 상세 분석    | epoch 17 이후 정체 확인    |
+    | total_steps=578은 로깅 횟수   | 해명                      | 오진 수정으로 해명         |
+    | validation_steps=0 문제       | P5로 분류                 | early stopping과 연결      |
+    | 검증 PASS 기준 관대           | 임계값 분석               | quality_score 역산         |
+
+  10-2. work_log에서만 제기된 항목 — 검증 결과
+  ──────────────────────────────────────────────
+
+    (a) "source == target 동일 파일 참조" (work_log Critical 1)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    판정: 오진 — 학습/추론에 실질적 영향 없음.
+
+    train.jsonl의 source와 target이 동일 파일을 가리키는 것은 사실이다.
+    그러나 학습 코드(train_controlnet.py)와 추론 코드(test_controlnet.py) 모두
+    source 필드를 사용하지 않는다.
+
+      학습 시:
+        sample["target"]  → pixel_values (VAE encode → 노이즈 예측 대상)
+        sample["hint"]    → conditioning_pixel_values (ControlNet 조건부 입력)
+        sample["source"]  → 사용하지 않음
+
+      추론 시:
+        sample["hint"]    → 생성 조건부 입력
+        sample["target"]  → 비교용 원본 이미지 로드 (SSIM/LPIPS 측정)
+        sample["source"]  → 사용하지 않음
+
+    work_log는 "학습 시 모델이 hint → 특정 ROI의 그레이스케일 복원만 학습"하고
+    "추론 시 source ROI의 잠재 벡터가 없어서 공간적 무관한 이미지 생성"이라고
+    해석했으나, 이는 ControlNet 학습 구조에 대한 오해에 기반한다.
+
+    표준 ControlNet 학습은:
+      1. target 이미지 → VAE encode → latents
+      2. latents + noise → noisy_latents
+      3. ControlNet(noisy_latents, hint) → residuals
+      4. UNet(noisy_latents, residuals) → noise_pred
+      5. Loss = MSE(noise_pred, noise)
+
+    즉, 모델은 "hint가 주어졌을 때, target 이미지의 latent에 추가된 노이즈를
+    예측"하도록 학습된다. source 필드는 이 과정에서 역할이 없다.
+
+    대응 조치:
+      controlnet_packager.py의 source 필드 docstring/주석을 정리하여
+      "레거시 호환용 — 학습/추론에서 미사용"임을 명시했다.
+      (controlnet_packager.py L386-437, train_controlnet.py L75-85)
+
+    (b) "force_grayscale_target=True + SSIM 측정 기준 불일치" (work_log Critical 3)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    판정: 부분적 타당 — 다만 SSIM 저하의 주된 원인이 아님.
+
+    work_log는 "생성=그레이스케일, 비교기준=원본 컬러 ROI → 사과-오렌지 비교"라고
+    지적했다. 이것은 검토할 가치가 있으나:
+
+      - force_grayscale_target=True로 학습했으므로, 모델은 그레이스케일 출력을 생성
+      - 추론 시 target(비교 기준)도 동일한 ROI 이미지이며,
+        test_controlnet.py에서 SSIM 계산 전에 양쪽을 어떻게 전처리하는지에 따라 다름
+      - 그레이스케일 vs 컬러 비교가 SSIM을 일부 낮출 수 있으나,
+        SSIM=0.027이라는 극단적 수치는 색상 차이만으로 설명 불가
+      - 완전히 다른 구조의 이미지(블롭 패턴 vs 금속 표면)간 비교이므로,
+        색상 불일치는 부차적 요인
+
+    결론: SSIM 비교 시 그레이스케일 정규화를 적용하면 수치가 소폭 개선될 수 있으나,
+    근본 문제(극소 ROI 업스케일)가 해결되지 않으면 의미 없음.
+
+    (c) "힌트 포맷 불일치 (sd-controlnet-canny vs 커스텀 그레이스케일)" (work_log Major)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    판정: 참고 사항 — 현재 구조에서 예상된 동작.
+
+    work_log는 guidance_scale 증가 시 quality 하락을 "conditioning 미활용 증거"로
+    해석했다. 이 관찰 자체는 Phase2 데이터와 일치한다 (§6-2 확인).
+
+    그러나:
+      - ControlNet은 canny 사전학습 가중치에서 fine-tune하므로,
+        커스텀 힌트 포맷으로의 적응이 학습 중 이루어져야 함
+      - 학습 데이터 품질(극소 업스케일 패치)이 극도로 열악한 상태에서
+        힌트 포맷 적응이 제대로 이루어질 수 없었을 가능성이 높음
+      - 힌트 포맷 자체의 문제인지, 학습 데이터 품질 문제의 파생 결과인지 구분 불가
+      - v5에서 데이터 품질 개선 후 동일 현상이 재현되면 힌트 포맷 재검토 필요
+
+    (d) "quality_score=0.0 패키징 미전파 버그" (work_log 별도 버그)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    판정: 확인됨 — 별도 세션에서 수정 완료.
+
+    work_log 분석 대상 지표에서 quality_score(전체)=0.0으로 기록.
+    이는 package_casda_data.py에서 quality_score가 전파되지 않는 별도 버그.
+    work_log_2026-02-25_claude.md 세션에서 이미 수정됨.
+
+  10-3. work_log의 v5 설계 제안 vs 현 v5 설계
+  ────────────────────────────────────────────
+
+    | 항목                    | 현 v5 (20260225_2.docs)         | work_log 제안                  | 비고            |
+    |-------------------------|---------------------------------|-------------------------------|-----------------|
+    | 힌트 포맷               | 기존 유지 (R=마스크,G=구조선)   | Canny 엣지로 변경              | 현행 유지       |
+    | force_grayscale_target  | True (유지)                     | False (컬러 유지)              | 현행 유지       |
+    | 추론 방식               | txt2img                         | img2img (배경 기반)            | 현행 유지       |
+    | source/target 관계      | source=target (레거시 호환)     | source=결함제거 배경, target=원본 | 불필요 (§10-2a) |
+    | augmentation            | 검토 필요                       | True                           | v5에서 검토     |
+
+    현 v5는 "데이터 품질 + 파라미터 정상화"로 최소 변경 접근.
+    work_log는 "파이프라인 근본 재설계" 접근.
+
+    판단:
+      v5의 최소 변경 접근을 먼저 실행하여 데이터 품질 개선의 효과를 측정한 후,
+      그래도 부족하면 work_log의 재설계 방안을 v6에서 검토하는 것이 합리적.
+      한 번에 너무 많은 변수를 바꾸면 어떤 변경이 효과를 낸 것인지 분리할 수 없다.
+
+  10-4. 본 문서(#4)에만 있는 분석
+  ───────────────────────────────
+
+    - roi_bbox==defect_bbox 전수 증명 (16,011행)
+    - 클래스별/하위유형별/배경유형별 ROI 분포 상세
+    - Phase2 수치 상세표 (guidance_scale, steps, seed 전조합)
+    - conditioning_scale=0.7 이중 감쇠 진단
+    - gray_loss_lambda=0.1 기저 loss 영향
+    - v4→v5 대응표 종합
+
+
+11. 코드 수정 사항 (source 필드 명확화)
+================================================================================
+
+  | 파일                                    | 변경 내용                              | 라인        |
+  |-----------------------------------------|----------------------------------------|-------------|
+  | src/preprocessing/controlnet_packager.py | source 필드 docstring/주석 정리:       | L386-437    |
+  |                                         | "레거시 호환 — 학습/추론에서 미사용"    |             |
+  |                                         | 변수명 source_path → target_path 정리  |             |
+  | scripts/train_controlnet.py             | Dataset docstring에 source 레거시 명시  | L75-85      |

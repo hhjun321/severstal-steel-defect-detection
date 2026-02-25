@@ -1,0 +1,264 @@
+20260225 작업 일지 #5 - v5.1 데이터셋 이슈 수정 및 리패키징 준비
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+v5 데이터셋 패키징 결과 분석(#4)에서 식별된 3가지 잔여 이슈를 수정하여
+v5.1 리패키징을 준비한다.
+
+  | 이슈 | 내용                                    | 심각도 |
+  |------|-----------------------------------------|--------|
+  | #1   | 엣지 필터 67.3% 과도한 제외율            | 높음   |
+  | #2   | Class 2 샘플 10개로 극소 (원본 146개)    | 높음   |
+  | #3   | 15.5% 비정사각형 ROI → 학습/추론 불일치  | 높음   |
+
+  수정 대상 파일:
+    - src/preprocessing/controlnet_packager.py (Fix 1: 엣지 필터, Fix 2: 희귀 클래스)
+    - src/analysis/roi_suitability.py (Fix 3: 정사각형 ROI 강제)
+    - scripts/prepare_controlnet_data.py (변경 없음, Colab 런타임 인자로 처리)
+
+
+2. 이슈 상세 분석
+================================================================================
+
+  2-1. 엣지 필터 과도 제외 (이슈 #1)
+  ──────────────────────────────────
+
+    v5 패키징 로그 (outputs/controlnet_dataset_v5_log.txt:4955-4962):
+
+      전체 ROI: 15,372개
+        ↓ 엣지 필터: 10,349개 제외 (67.3%)
+        ↓ 남은 ROI: 5,023개
+
+    근본 원인:
+      _edge_filter()가 edge_margin=0.1 (10%)을 상하좌우 4면에 균일 적용.
+      Severstal 이미지(1600×256)에서 ROI 높이=이미지 높이=256이므로,
+      상하 마진 10% = 25.6px를 확보하려면 결함이 ROI 중앙에 매우 정확히
+      위치해야 함. 이미지 상·하 경계에 가까운 결함은 구조적으로 통과 불가.
+
+    엣지 필터 검사 대상 명확화:
+      ※ 이 필터는 "ROI 내부에서 결함의 위치"를 검사함.
+      즉, defect_bbox가 roi_bbox 경계에 너무 가까운지 확인하는 것이지,
+      roi_bbox가 이미지 경계에 가까운지 검사하는 것이 아님.
+
+  2-2. Class 2 극소 샘플 (이슈 #2)
+  ──────────────────────────────────
+
+    원본 Class 2: 146개 → 엣지+품질 필터 후 10개만 잔존.
+    4클래스 학습에 10개는 사실상 무의미.
+
+    필터별 감소 추정:
+      146 → 엣지 필터(67.3% 제외) → ~48개 → 품질 필터(12% 제외) → ~42개
+      실제로는 10개이므로, Class 2가 엣지 필터에서 평균보다 더 많이
+      제외됨 (93.2% 제외). Class 2 결함이 이미지 상하 경계에 집중되어 있음을
+      시사.
+
+  2-3. 비정사각형 ROI (이슈 #3)
+  ──────────────────────────────────
+
+    v5 packaged_roi_metadata.csv 분석:
+      1,000 샘플 중 155개 (15.5%)가 비정사각형 (최대 549×256).
+
+    파이프라인 단계별 영향:
+
+      | 단계          | 파일                    | 라인       | 동작                        |
+      |---------------|-------------------------|------------|-----------------------------|
+      | ROI bbox 계산 | roi_suitability.py      | 204-218    | defect_w > base_size면 확장 |
+      | ROI 저장      | roi_extraction.py       | 205-249    | 그대로 저장, 리사이즈 없음  |
+      | 힌트 생성     | hint_generator.py       | 216-261    | ROI와 동일 크기             |
+      | 학습 변환     | train_controlnet.py     | 120-131    | Resize(512)+CenterCrop(512) |
+      | 추론          | test_controlnet.py      | 224-232    | 고정 512×512                |
+
+    문제: 549×256 ROI → Resize(512) 적용 시 shortest-edge 기준으로
+    1098×512 → CenterCrop(512)에서 너비 53% 손실.
+    추론은 512×512 고정이므로 학습/추론 해상도 불일치 발생.
+
+
+3. 수정 내역
+================================================================================
+
+  3-1. Fix 1: 엣지 필터 마진 분리 + 희귀 클래스 보호
+  ──────────────────────────────────────────────────
+
+    파일: src/preprocessing/controlnet_packager.py
+    범위: L44-162 (_edge_filter 메서드 전면 재작성)
+
+    변경 전 (v5):
+      def _edge_filter(self, df, edge_margin=0.1):
+          # 4면 균일 10% 마진
+          margin_x = roi_width * edge_margin   # 25.6px (256×256 ROI)
+          margin_y = roi_height * edge_margin   # 25.6px
+          # → 상하 마진 확보 구조적 불가 → 67.3% 제외
+
+    변경 후 (v5.1):
+      def _edge_filter(self, df,
+                       edge_margin_x=0.1,      # 좌우 10%
+                       edge_margin_y=0.05,      # 상하 5% (12.8px)
+                       rare_class_margin=0.02,  # 희소 클래스 2% (5.1px)
+                       rare_class_threshold=50):
+
+    주요 변경사항:
+
+      a) 좌우/상하 마진 분리
+         - edge_margin_x=0.1 (좌우): 기존과 동일, 1600px 너비에서 여유 충분
+         - edge_margin_y=0.05 (상하): 기존 0.1에서 절반으로 감소
+         - 예상 제외율: 67% → ~35%
+
+      b) 희귀 클래스 자동 탐지 및 보호
+         - class_counts에서 rare_class_threshold(50) 이하인 클래스 식별
+         - 해당 클래스는 마진을 rare_class_margin(0.02)으로 완화
+         - Class 2 (146개 원본): 0.02 마진 = 5.1px → 대부분 통과 예상
+         - 로그에 희소 클래스 정보 출력
+
+      c) roi_bbox == defect_bbox 방어 로직
+         - v4 잔재: 이런 케이스는 엣지 검사 무의미 (margin 항상 0)
+         - 해당 샘플은 검사 건너뛰고 유지, 카운트 로그 출력
+
+      d) 향상된 로깅
+         - 제외 시 image_id, class_id, 어느 edge에 위반했는지 출력
+         - 최종 통계에 마진 값, 희소 클래스 skip 수 포함
+
+  3-2. Fix 2: 정사각형 ROI 강제
+  ──────────────────────────────────────────────────
+
+    파일: src/analysis/roi_suitability.py
+    범위: L212-266 (optimize_roi_position 내부)
+
+    변경 전 (v5):
+      # L212-218
+      roi_h = max(base_size, defect_h + 2 * min_context_pixels)
+      roi_w = max(base_size, defect_w + 2 * min_context_pixels)
+      roi_h = min(roi_h, h)   # clamp to image
+      roi_w = min(roi_w, w)
+      # → defect_w > base_size면 roi_w > roi_h → 비정사각형
+
+      # L244-255 (defect containment)
+      if defect not in ROI:
+          x1 = min(x1, dx1)  # expand ROI to contain
+          x2 = max(x2, dx2)  # → 정사각형 다시 깨짐
+          ...
+
+    변경 후 (v5.1):
+      # L212-222: 정사각형 강제
+      roi_h = max(base_size, defect_h + 2 * min_context_pixels)
+      roi_w = max(base_size, defect_w + 2 * min_context_pixels)
+      roi_side = min(roi_h, roi_w, h, w)  # 항상 정사각형
+      roi_h = roi_side
+      roi_w = roi_side
+
+      # L244-266: containment을 shift로 처리 (크기 변경 없음)
+      if defect not in ROI:
+          # ROI를 결함 방향으로 이동 (크기 유지)
+          shift_x = ...  # 좌/우 방향 계산
+          shift_y = ...  # 상/하 방향 계산
+          x1 = max(0, min(x1 + shift_x, w - roi_w))
+          y1 = max(0, min(y1 + shift_y, h - roi_h))
+          x2 = x1 + roi_w  # 정사각형 유지
+          y2 = y1 + roi_h
+
+    설계 의사결정:
+      - 사용자 선택: 접근법 (A) — 추출 시점에서 정사각형 강제
+        (대안 B: 학습 코드에서 패딩 추가 — 기각)
+      - 극단적 넓은 결함(>256px)은 부분 커버 허용.
+        이유: 학습/추론 해상도 일관성 > 결함 100% 커버.
+        결함 중심(centroid)은 항상 포함됨.
+      - search grid (L278-298)는 roi_w, roi_h를 사용하므로
+        정사각형 보장이 자동 전파됨.
+
+  3-3. Fix 3: max_samples 증가
+  ──────────────────────────────────────────────────
+
+    파일: scripts/prepare_controlnet_data.py
+    변경: 없음 (기본값 None = 전체 사용)
+
+    v5에서 Colab 명령줄에서 --max_samples 1000 지정.
+    v5.1에서는 엣지 필터 완화로 통과 샘플 대폭 증가 예상:
+
+      v5:   15,372 → 5,023(엣지) → 4,418(품질) → 1,000(샘플링)
+      v5.1: 15,372 → ~10,000(엣지) → ~8,800(품질) → 1,500~2,000(샘플링)
+
+    Colab 실행 시 권장 인자:
+      python scripts/prepare_controlnet_data.py \
+        --roi_metadata outputs/v5/roi_metadata.csv \
+        --max_samples 2000 \
+        --output_dir /content/drive/MyDrive/data/Severstal/controlnet_dataset_v5.1
+
+
+4. 수정 일관성 검증
+================================================================================
+
+  4-1. Fix 2 ↔ Fix 1 (정사각형 ROI ↔ 엣지 필터)
+  ──────────────────────────────────────────────────
+
+    정사각형 ROI(256×256) 보장 → 엣지 필터에서:
+      - roi_width = roi_height = 256
+      - margin_x = 256 × 0.1 = 25.6px (좌우)
+      - margin_y = 256 × 0.05 = 12.8px (상하)
+    비정사각형 ROI가 사라지므로 마진 계산이 예측 가능해짐.
+    ✅ 일관성 확인
+
+  4-2. Fix 2 containment ↔ search grid
+  ──────────────────────────────────────────────────
+
+    containment 로직이 shift로 변경되어 roi_w, roi_h 불변.
+    search grid는 roi_w, roi_h로 후보 bbox를 생성하므로
+    전체 탐색 과정에서 정사각형 유지됨.
+    ✅ 일관성 확인
+
+  4-3. Fix 1 희귀 클래스 보호 ↔ Fix 3 샘플 증가
+  ──────────────────────────────────────────────────
+
+    Class 2 (146개):
+      - v5: 엣지 필터 후 10개 → 계층 샘플링에서도 10개
+      - v5.1: rare_class_margin=0.02 적용 → ~130개 통과 예상
+                → max_samples 2000 + 계층 샘플링으로 ~60-80개 할당
+    4클래스 균형 대폭 개선.
+    ✅ 일관성 확인
+
+  4-4. Fix 2 ↔ hint_generator (영향 없음)
+  ──────────────────────────────────────────────────
+
+    hint_generator.py는 ROI 이미지를 입력받아 동일 크기 힌트 생성.
+    정사각형 ROI → 정사각형 힌트. 그레이스케일 변환 로직 영향 없음.
+    ✅ 일관성 확인
+
+
+5. v5 대비 v5.1 예상 개선 요약
+================================================================================
+
+  | 지표                | v5              | v5.1 (예상)         | 변화    |
+  |---------------------|-----------------|---------------------|---------|
+  | 엣지 필터 제외율    | 67.3%           | ~35%                | ↓ 32pp  |
+  | 엣지 필터 통과 수   | 5,023           | ~10,000             | ↑ 2.0×  |
+  | Class 2 필터 후     | 10              | ~130                | ↑ 13×   |
+  | 비정사각형 ROI 비율 | 15.5%           | 0%                  | 해소    |
+  | 최종 샘플 수        | 1,000           | 1,500~2,000         | ↑ 1.5-2×|
+  | 학습/추론 해상도    | 불일치 (15.5%)  | 완전 일치           | 해소    |
+
+
+6. 수정 이력
+================================================================================
+
+  | 시각  | 파일                              | 라인     | 내용                                 |
+  |-------|-----------------------------------|----------|--------------------------------------|
+  | 14:00 | src/preprocessing/controlnet_packager.py | L44-162  | _edge_filter() 전면 재작성: 좌우/상하 마진 분리, 희귀 클래스 보호, 로깅 강화 |
+  | 14:15 | src/analysis/roi_suitability.py    | L216-222 | roi_side = min(roi_h, roi_w, h, w)로 정사각형 강제 |
+  | 14:15 | src/analysis/roi_suitability.py    | L244-266 | defect containment을 expand→shift로 변경 (정사각형 유지) |
+
+  ※ scripts/prepare_controlnet_data.py는 코드 변경 없음.
+    max_samples는 Colab 실행 시 --max_samples 2000으로 지정.
+
+
+7. 후속 작업
+================================================================================
+
+  1. Colab에서 ROI 재추출 (roi_suitability.py 수정 반영)
+     → 정사각형 ROI만 생성되는지 확인
+
+  2. v5.1 데이터셋 리패키징
+     → python scripts/prepare_controlnet_data.py --max_samples 2000
+     → 엣지 필터 제외율, Class 2 샘플 수 로그 확인
+
+  3. ControlNet v5.1 학습
+
+  4. 생성 결과 검증 (Phase 1-4)

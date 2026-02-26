@@ -598,104 +598,146 @@ Phase 1~4 정량 검증을 통해 개선 효과가 확인되었다.
     v5.1은 실측 품질 점수가 정상 범위에 분포하여 pruning이 유의미해졌다.
 
 
-13. prepare_benchmark_data.py 스크립트 설계
+13. prepare_benchmark_data.py 스크립트 재작성
 ================================================================================
 
-  13-1. 스크립트 역할
+  13-1. 재작성 배경
   ──────────────────────────────────
 
-    ControlNet 생성 결과를 벤치마크 학습용 데이터셋으로 구성하는 통합 스크립트.
+    초기 버전 (624줄):
+      - Step 1 (패키징) + Step 2 (YOLO merge) 통합 스크립트
+      - package_casda_data.py의 package_data() import 호출
+      - 자체 mask→bbox 변환 코드 (cv2 lazy import)
+      - shutil.copytree()로 baseline 전체 복사 (Google Drive에서 느림)
 
-    기존 문제: 패키징(package_casda_data.py)과 YOLO 병합(prepare_yolo_datasets.py)이
-    별도 스크립트로 분리되어 있어 수동 조합 필요했음.
+    문제:
+      - Colab에서 package_casda_data.py를 이미 별도 실행하여 패키징 완료
+        → augmented_dataset_v5.1/{casda_full, casda_pruning}/ 생성됨
+      - Step 1 코드가 더 이상 불필요
+      - mask→bbox 변환이 dataset_yolo.py의 _add_casda_to_training()과 중복
+      - baseline 전체 복사가 비효율적
 
-    해결: 2단계를 하나의 스크립트에 통합.
+    해결: Step 2 전용으로 재작성 (469줄)
 
-  13-2. 2단계 동작 구조
+  13-2. 재작성 핵심 변경사항
   ──────────────────────────────────
 
-    Step 1 — CASDA 패키징:
-      입력: generated/*.png + generation_summary.json + hints/
-      출력: augmented_dir/{casda_full, casda_pruning}/
-             ├── images/
-             ├── masks/
-             ├── metadata.json
-             └── packaging_report.json
+    | 항목                | 이전 (v1)                     | 재작성 (v2)                    |
+    |---------------------|-------------------------------|--------------------------------|
+    | 스코프              | Step 1 (패키징) + Step 2      | Step 2 (YOLO merge) 전용       |
+    | 코드 라인 수        | 624줄                         | 469줄                          |
+    | baseline 복사       | shutil.copytree() 전체 복사   | os.symlink() 심볼릭 링크       |
+    | CASDA 추가          | 자체 구현 (generate_yolo_*)   | _add_casda_to_training() 재사용|
+    | mask→bbox 변환      | 자체 cv2 코드 (중복)          | dataset_yolo.py에 위임         |
+    | 패키징 관련 인자     | 10개 (--generated-dir 등)     | 0개 (전부 제거)                |
+    | CLI 인자             | 15개                          | 5개                            |
+    | 외부 의존성          | cv2 (lazy), package_casda_data| dataset_yolo (기존 모듈)       |
 
-      동작: package_casda_data.py의 package_data() 함수를 import하여 호출.
-            suitability_threshold=0.60, pruning_top_k=2000 적용.
-
-    Step 2 — YOLO 데이터셋 Merge:
-      입력: baseline_raw/ YOLO 데이터셋 + Step 1 출력
-      출력: yolo_dir/{casda_full, casda_pruning}/
-             ├── images/{train, val, test}/
-             ├── labels/{train, val, test}/
-             └── dataset.yaml
-
-      동작:
-        (a) baseline_raw/ 전체를 group_dir로 복사 (val/test 동일 보장)
-        (b) CASDA 이미지를 train/에만 추가
-        (c) 마스크 → contour → bbox 변환으로 YOLO 라벨 생성
-        (d) dataset.yaml의 path를 새 경로로 갱신
-
-  13-3. 마스크 → YOLO 라벨 변환
+  13-3. 동작 구조
   ──────────────────────────────────
 
-    변환 방식: cv2.findContours() → cv2.boundingRect() → YOLO 정규화 좌표
+    입력:
+      --augmented-dir  패키징 완료된 CASDA 디렉토리
+                       {casda_full, casda_pruning}/metadata.json + images/ + masks/
+      --baseline-dir   baseline_raw YOLO 데이터셋
+                       images/{train,val,test}/ + labels/{train,val,test}/ + dataset.yaml
+      --yolo-dir       출력 상위 디렉토리
 
-    generate_yolo_label_from_mask(mask_path, class_id, min_area=16):
-      1. 마스크를 그레이스케일로 로드
-      2. cv2.findContours(mask, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE)
-      3. 각 contour에 대해 boundingRect → (bx, by, bw, bh)
-      4. min_area 이상만 유지
-      5. 중심/크기를 이미지 크기로 정규화 → "class_id cx cy nw nh" 포맷
+    처리 (각 그룹별):
+      (1) symlink_baseline_to_group()
+          - images/{train,val,test}/, labels/{train,val,test}/ 디렉토리 생성
+          - baseline_raw의 모든 파일을 os.symlink()으로 연결
+          - dataset.yaml만 실제 복사 (path 필드 수정 필요)
+          - symlink 실패 시 shutil.copy2() fallback
 
-    마스크 없는 경우: generate_yolo_label_fullimage()로 전체 이미지 bbox 사용
+      (2) _add_casda_to_training() (dataset_yolo.py에서 import)
+          - metadata.json 읽기 (3가지 fallback: json → csv → 파일 스캔)
+          - 라벨 생성 경로:
+            a) bboxes + labels 키 → 직접 좌표 변환
+            b) mask_path → cv2.findContours() → cv2.boundingRect() → YOLO bbox
+            c) fallback → 전체 이미지 bbox
+          - CASDA 이미지 심볼릭 링크 + 라벨 파일 생성
+          - casda_mode="full" 사용 (추가 필터링 없음)
+            ※ casda_pruning은 패키징 단계에서 이미 threshold=0.60 필터링 완료
 
-  13-4. CLI 인터페이스
+      (3) update_dataset_yaml()
+          - dataset.yaml의 path 필드를 새 group_dir 절대경로로 갱신
+
+      (4) validate_yolo_dataset() (dataset_yolo.py에서 import)
+          - 생성된 데이터셋 유효성 검증
+
+    출력:
+      yolo_dir/casda_full/        baseline symlink + CASDA 2,000장 추가
+      yolo_dir/casda_pruning/     baseline symlink + CASDA ~1,200장 추가
+      yolo_dir/prepare_benchmark_report.json  통계 리포트
+
+  13-4. 심볼릭 링크 방식의 이점
   ──────────────────────────────────
 
-    Step 1 관련:
-      --generated-dir        ControlNet 생성 이미지 디렉토리
-      --summary-json         generation_summary.json 경로
-      --hint-dir             hint 이미지 디렉토리
-      --augmented-dir        패키징 출력 디렉토리
-      --quality-json         별도 quality score JSON (옵션)
-      --default-score        기본 quality score (기본: 1.0)
-      --suitability-threshold  pruning 임계값 (기본: 0.60)
-      --pruning-top-k        pruning 최대 수 (기본: 2000)
-      --mask-threshold        hint R채널 이진화 임계값 (기본: 127)
+    | 항목            | copytree (이전)                 | symlink (재작성)            |
+    |-----------------|---------------------------------|-----------------------------|
+    | 속도            | Google Drive에서 수분 소요      | 수초 이내                   |
+    | 디스크 사용량   | baseline × 2 (full + pruning)  | 거의 0 (심볼릭 링크)       |
+    | val/test 동일성 | 파일 복사 → 내용은 동일         | 동일 파일 참조 (보장)      |
+    | 제약            | 없음                            | 원본 삭제 시 깨짐          |
 
-    Step 2 관련:
-      --baseline-dir         baseline_raw YOLO 데이터셋 경로
-      --yolo-dir             YOLO 출력 상위 디렉토리
-
-    공통 옵션:
-      --force                기존 출력 삭제 후 재생성
-      --skip-packaging       Step 1 건너뛰기
-      --skip-yolo            Step 2 건너뛰기
-
-  13-5. YOLO 데이터셋 파일 명명 규칙
+  13-5. CLI 인터페이스 (간소화)
   ──────────────────────────────────
 
-    CASDA 이미지: casda_NNNNN_{원본파일명}.png
-    CASDA 라벨:   casda_NNNNN_{원본파일명}.txt
+    | 인자             | 설명                                      | 필수 |
+    |------------------|-------------------------------------------|------|
+    | --augmented-dir  | CASDA 패키징 출력 (casda_full/, casda_pruning/) | ✅   |
+    | --baseline-dir   | baseline_raw YOLO 데이터셋                | ✅   |
+    | --yolo-dir       | YOLO 출력 상위 디렉토리                   | ✅   |
+    | --num-classes    | 클래스 수 (기본: 4)                       | ❌   |
+    | --force          | 기존 출력 삭제 후 재생성                  | ❌   |
 
-    예: casda_00042_sample_class3_0127.png
-        casda_00042_sample_class3_0127.txt
+    제거된 인자 (패키징 관련 — 더 이상 불필요):
+      --generated-dir, --summary-json, --hint-dir, --quality-json,
+      --default-score, --suitability-threshold, --pruning-top-k,
+      --mask-threshold, --skip-packaging, --skip-yolo
 
-    이 명명 규칙으로 baseline 이미지와 CASDA 이미지가 충돌하지 않으며,
-    추후 분석 시 CASDA 합성 이미지를 쉽게 식별할 수 있다.
+  13-6. 함수 구조
+  ──────────────────────────────────
 
-  13-6. DeepLabV3+ 경로 (YOLO 미사용)
+    symlink_baseline_to_group(baseline_dir, group_dir) -> dict
+      baseline 파일을 심볼릭 링크로 복제, split별 통계 반환
+
+    update_dataset_yaml(group_dir) -> None
+      dataset.yaml path 필드 갱신
+
+    merge_single_group(baseline_dir, casda_data_dir, group_dir, ...) -> dict
+      (1)~(4) 통합 오케스트레이터, 그룹별 통계 반환
+
+    validate_baseline_dir(baseline_dir) -> None
+      baseline 디렉토리 구조 검증
+
+    validate_augmented_dir(augmented_dir) -> None
+      패키징 출력 디렉토리 검증
+
+    main()
+      CLI 파싱 → 입력 검증 → 2그룹 순차 처리 → 리포트 저장 → 요약 출력
+
+  13-7. run_benchmark.py와의 호환성
+  ──────────────────────────────────
+
+    run_benchmark.py --yolo-dir 는 내부적으로:
+      1. validate_yolo_dataset(yolo_dir, dataset_group) 호출
+      2. {yolo_dir}/{group}/dataset.yaml 이 유효하면 변환 건너뜀
+      3. 바로 ultralytics .train() 실행
+
+    prepare_benchmark_data.py가 생성하는 디렉토리 구조가
+    이 검증을 정확히 통과하도록 설계됨.
+
+  13-8. DeepLabV3+ 경로 (YOLO 미사용)
   ──────────────────────────────────
 
     DeepLabV3+는 세그멘테이션 모델로 YOLO 포맷을 사용하지 않는다.
-    대신 CASDASyntheticDataset (src/training/dataset.py)이 직접
+    CASDASyntheticDataset (src/training/dataset.py)이 직접
     augmented_dir/casda_{full,pruning}/metadata.json을 읽어서
     ConcatDataset으로 원본 데이터와 병합한다.
 
-    따라서 Step 1 (패키징)만 완료되면 DeepLabV3+ 학습이 가능하며,
+    따라서 패키징만 완료되면 DeepLabV3+ 학습이 가능하며,
     run_benchmark.py --casda-dir 옵션으로 경로를 지정한다.
 
 
@@ -778,31 +820,32 @@ Phase 1~4 정량 검증을 통해 개선 효과가 확인되었다.
     PROJECT=/content/severstal-steel-defect-detection
     DRIVE=/content/drive/MyDrive/data/Severstal
 
-  15-2. Step 1+2: 데이터셋 구성 (prepare_benchmark_data.py)
+  15-2. CASDA 패키징 (이미 완료)
+  ──────────────────────────────────
+
+    package_casda_data.py로 Colab에서 실행 완료:
+      → ${DRIVE}/augmented_dataset_v5.1/casda_full/      (2,000장)
+      → ${DRIVE}/augmented_dataset_v5.1/casda_pruning/   (threshold=0.60 필터링)
+
+  15-3. YOLO 데이터셋 구성 (prepare_benchmark_data.py)
   ──────────────────────────────────
 
     python ${PROJECT}/scripts/prepare_benchmark_data.py \
-        --generated-dir ${DRIVE}/test_results_v5.1/phase1_basic/generated \
-        --summary-json ${DRIVE}/test_results_v5.1/phase1_basic/generation_summary.json \
-        --hint-dir ${DRIVE}/controlnet_dataset_v5.1/hints \
-        --augmented-dir ${DRIVE}/augmented_v5.1 \
+        --augmented-dir ${DRIVE}/augmented_dataset_v5.1 \
         --baseline-dir ${DRIVE}/yolo_datasets/baseline_raw \
         --yolo-dir ${DRIVE}/yolo_datasets \
-        --suitability-threshold 0.60 \
-        --pruning-top-k 2000 \
         --force
 
-    ※ --force: 기존 casda_full/, casda_pruning/ 삭제 후 재생성
-    ※ 이미 패키징 완료 시: --skip-packaging 추가
-    ※ YOLO 병합만 건너뛸 때: --skip-yolo 추가
+    ※ --force: 기존 casda_full/, casda_pruning/ YOLO 데이터셋 삭제 후 재생성
+    ※ 소요 시간: 수초 ~ 수분 (심볼릭 링크 기반)
 
-  15-3. Step 3: 벤치마크 실행 (run_benchmark.py)
+  15-4. 벤치마크 실행 (run_benchmark.py)
   ──────────────────────────────────
 
     python ${PROJECT}/scripts/run_benchmark.py \
         --config ${PROJECT}/configs/benchmark_experiment.yaml \
         --yolo-dir ${DRIVE}/yolo_datasets \
-        --casda-dir ${DRIVE}/augmented_v5.1 \
+        --casda-dir ${DRIVE}/augmented_dataset_v5.1 \
         --data-dir ${DRIVE}/train_images \
         --csv ${DRIVE}/train.csv \
         --split-csv ${DRIVE}/casda/splits/split_70_15_15_seed42.csv \
@@ -811,17 +854,19 @@ Phase 1~4 정량 검증을 통해 개선 효과가 확인되었다.
 
     예상 소요 시간: T4 GPU 기준 약 12~24시간 (12회 학습)
 
-  15-4. 실행 순서 요약
+  15-5. 실행 순서 요약
   ──────────────────────────────────
 
-    1. prepare_benchmark_data.py 실행 (데이터셋 구성, ~10분)
-       → augmented_v5.1/{casda_full, casda_pruning}/ (패키징)
-       → yolo_datasets/{casda_full, casda_pruning}/ (YOLO merge)
+    1. [완료] package_casda_data.py 실행 (CASDA 패키징)
+       → augmented_dataset_v5.1/{casda_full, casda_pruning}/
 
-    2. run_benchmark.py 실행 (모델 학습+평가, ~12~24시간)
-       → benchmark_results_v5.1/ (결과 리포트)
+    2. [다음] prepare_benchmark_data.py 실행 (YOLO merge, 수초~수분)
+       → yolo_datasets/{casda_full, casda_pruning}/
 
-    3. 결과 분석 및 가설 검증 (H1~H5)
+    3. [이후] run_benchmark.py 실행 (모델 학습+평가, ~12~24시간)
+       → benchmark_results_v5.1/
+
+    4. 결과 분석 및 가설 검증 (H1~H5)
 
 
 16. 현재 진행 상태 요약
@@ -834,15 +879,18 @@ Phase 1~4 정량 검증을 통해 개선 효과가 확인되었다.
     ✅ v4 → v5.1 정량 비교 완료
     ✅ 패키징 결과 분석 및 pruning 임계값 0.60 결정
     ✅ configs/benchmark_experiment.yaml 업데이트 (threshold 0.63→0.60, v5.1 주석)
-    ✅ scripts/prepare_benchmark_data.py 작성 완료 (624줄)
-       - Step 1: package_data() import 호출
-       - Step 2: baseline 복사 + CASDA train merge + mask→bbox YOLO 라벨 생성
-       - lazy import 적용 (cv2, package_data — Colab 환경 호환)
+    ✅ Colab에서 package_casda_data.py 실행 완료
+       → augmented_dataset_v5.1/{casda_full, casda_pruning}/ 생성
+    ✅ scripts/prepare_benchmark_data.py 재작성 완료 (469줄)
+       - Step 2 (YOLO merge) 전용으로 간소화
+       - 심볼릭 링크 기반 baseline 복제 (copytree 대체)
+       - _add_casda_to_training() 재사용 (코드 중복 제거)
+       - CLI 인자 15개 → 5개로 간소화
 
   16-2. 다음 단계
   ──────────────────────────────────
 
-    1. Colab에서 prepare_benchmark_data.py 실행 (threshold=0.60으로 재패키징)
-    2. 패키징 결과 확인 (casda_pruning 이미지 수 ~1,200장 예상)
+    1. Colab에서 prepare_benchmark_data.py 실행
+    2. YOLO 데이터셋 생성 결과 확인
     3. run_benchmark.py 실행 (3 모델 × 4 그룹 = 12회)
     4. 벤치마크 결과 분석 및 가설 H1~H5 검증

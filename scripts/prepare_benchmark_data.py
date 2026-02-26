@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
 """
-벤치마크 학습용 YOLO 데이터셋 구성 스크립트.
+[DEPRECATED] 벤치마크 학습용 YOLO 데이터셋 구성 스크립트.
 
-이미 패키징 완료된 CASDA 합성 이미지(augmented_dataset_v5.1/)를
+** 이 스크립트는 더 이상 사용되지 않습니다. **
+run_benchmark.py가 inject/clean 방식으로 CASDA 이미지를 baseline_raw에
+직접 주입/삭제하므로, 별도의 YOLO 데이터셋 생성이 불필요합니다.
+
+대신 사용:
+  python scripts/run_benchmark.py \\
+      --config configs/benchmark_experiment.yaml \\
+      --yolo-dir ${DRIVE}/yolo_datasets \\
+      --casda-dir ${DRIVE}/augmented_dataset_v5.1 \\
+      ...
+
+이전 동작 (참고용):
+  이미 패키징 완료된 CASDA 합성 이미지(augmented_dataset_v5.1/)를
 baseline_raw YOLO 데이터셋에 merge하여 벤치마크 학습용 데이터셋을 생성한다.
 
 동작:

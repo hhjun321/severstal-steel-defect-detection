@@ -301,6 +301,14 @@ def _add_casda_to_training(
       - annotations.csv
       - Fallback: scan images/ for .png files, infer class from filename
     
+    Bbox format support:
+      - bbox_format="yolo": bboxes are [cx, cy, w, h] normalized (0~1).
+        Written directly — no cv2.imread needed. (v5.1+ metadata)
+      - bbox_format="xyxy" (or absent): bboxes are [x1, y1, x2, y2] pixel coords.
+        Requires cv2.imread once per image for normalization.
+      - mask_path fallback: derive bbox from mask contours via cv2.
+      - No bbox, no mask: full-image bbox fallback.
+    
     Returns:
         Number of synthetic images added
     """
@@ -379,22 +387,26 @@ def _add_casda_to_training(
         cls_id = sample.get('class_id', 0)
         bboxes = sample.get('bboxes', [])
         labels = sample.get('labels', [])
+        bbox_format = sample.get('bbox_format', 'xyxy')
 
         with open(dst_lbl, 'w') as f:
-            if bboxes and labels:
-                # Use provided bboxes (assumed xyxy pixel coords)
+            if bboxes and labels and bbox_format == 'yolo':
+                # v5.1+: pre-computed YOLO normalized bboxes — write directly
                 for bbox, lbl in zip(bboxes, labels):
-                    # Read image dimensions for normalization
-                    img = cv2.imread(img_path)
-                    if img is None:
-                        continue
-                    h, w = img.shape[:2]
-                    x1, y1, x2, y2 = bbox
-                    cx = ((x1 + x2) / 2.0) / w
-                    cy = ((y1 + y2) / 2.0) / h
-                    bw = (x2 - x1) / w
-                    bh = (y2 - y1) / h
+                    cx, cy, bw, bh = bbox
                     f.write(f"{lbl} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+            elif bboxes and labels:
+                # Legacy: xyxy pixel coords — read image once for normalization
+                img = cv2.imread(img_path)
+                if img is not None:
+                    h, w = img.shape[:2]
+                    for bbox, lbl in zip(bboxes, labels):
+                        x1, y1, x2, y2 = bbox
+                        cx = ((x1 + x2) / 2.0) / w
+                        cy = ((y1 + y2) / 2.0) / h
+                        bw = (x2 - x1) / w
+                        bh = (y2 - y1) / h
+                        f.write(f"{lbl} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
             elif 'mask_path' in sample:
                 # Derive bbox from mask
                 mask_path = sample['mask_path']

@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 """
-Package ControlNet v4 output into CASDA benchmark format.
+Package ControlNet v4/v5.1 output into CASDA benchmark format.
 
 Converts:
-  - augmented_images_v4/generated/*.png  (generated images)
-  - augmented_images_v4/generation_summary.json  (metadata + quality scores)
-  - controlnet_dataset_v4/hints/*_hint.png  (hint images → Red channel = mask)
+  - augmented_images/generated/*.png  (generated images)
+  - augmented_images/generation_summary.json  (metadata + quality scores)
+  - controlnet_dataset/hints/*_hint.png  (hint images → Red channel = mask)
 
 Into:
   - casda_full/images/*.png
   - casda_full/masks/*.png
-  - casda_full/metadata.json
+  - casda_full/metadata.json   (includes pre-computed YOLO bboxes)
   - casda_pruning/images/*.png   (filtered by suitability threshold + top_k)
   - casda_pruning/masks/*.png
-  - casda_pruning/metadata.json
+  - casda_pruning/metadata.json  (includes pre-computed YOLO bboxes)
+
+metadata.json bbox fields (v5.1+):
+  - bboxes: [[cx, cy, w, h], ...]  (normalized YOLO format, 0~1)
+  - labels: [class_id, ...]        (0-indexed, per-bbox)
+  - bbox_format: "yolo"            (format indicator)
+  - image_width, image_height      (mask/image pixel dimensions)
 
 Usage (Colab example):
   python scripts/package_casda_data.py \
@@ -321,6 +327,29 @@ def package_data(
             if defect_pixels == 0:
                 skipped_no_mask += 1
         
+        # Pre-compute YOLO-format bboxes from mask contours
+        # This eliminates cv2.imread at inject/training time
+        yolo_bboxes = []
+        yolo_labels = []
+        if mask is not None and np.count_nonzero(mask) > 0:
+            h_mask, w_mask = mask.shape[:2]
+            contours, _ = cv2.findContours(
+                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            for cnt in contours:
+                bx, by, bw, bh = cv2.boundingRect(cnt)
+                if bw * bh >= 16:  # same threshold as downstream consumers
+                    # Normalized YOLO format: cx, cy, w, h (0~1)
+                    cx = (bx + bw / 2.0) / w_mask
+                    cy = (by + bh / 2.0) / h_mask
+                    nw = bw / w_mask
+                    nh = bh / h_mask
+                    yolo_bboxes.append([
+                        round(cx, 6), round(cy, 6),
+                        round(nw, 6), round(nh, 6),
+                    ])
+                    yolo_labels.append(class_id)
+        
         entry = {
             "image_path": f"images/{filename}",
             "class_id": class_id,
@@ -328,6 +357,14 @@ def package_data(
         }
         if mask_rel_path_str:
             entry["mask_path"] = mask_rel_path_str
+        if yolo_bboxes:
+            entry["bboxes"] = yolo_bboxes
+            entry["labels"] = yolo_labels
+            entry["bbox_format"] = "yolo"
+        if mask is not None:
+            h_mask, w_mask = mask.shape[:2]
+            entry["image_width"] = w_mask
+            entry["image_height"] = h_mask
         
         all_metadata.append(entry)
     
@@ -344,6 +381,8 @@ def package_data(
     print(f"  Skipped (class parse error): {skipped_class_parse}")
     print(f"  Skipped (no hint found): {skipped_no_hint}")
     print(f"  Masks with zero defect pixels: {skipped_no_mask}")
+    print(f"  With YOLO bboxes: {sum(1 for m in all_metadata if 'bboxes' in m)}")
+    print(f"  Total bboxes: {sum(len(m.get('bboxes', [])) for m in all_metadata)}")
     print(f"  Output: {full_dir}")
     
     # Class distribution

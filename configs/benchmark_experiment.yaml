@@ -30,11 +30,12 @@ dataset:
     stratify: true  # stratify by class distribution
     seed: 42
 
-  # CASDA synthetic data paths
+  # CASDA synthetic data paths (v5.1)
+  # CLI --casda-dir 로 override 가능 (prepare_benchmark_data.py, run_benchmark.py)
   casda:
-    full_dir: "data/augmented/casda_full"        # ~2,901 synthetic images (ControlNet v4, 3 gens/sample)
-    pruning_dir: "data/augmented/casda_pruning"    # top-K by suitability (threshold >= 0.63, ~P50)
-    suitability_threshold: 0.63
+    full_dir: "data/augmented/casda_full"         # ControlNet v5.1: 2,000 synthetic images (4-class)
+    pruning_dir: "data/augmented/casda_pruning"    # top-K by suitability (threshold >= 0.60)
+    suitability_threshold: 0.60
     pruning_top_k: 2000
 
 # ----------------------------------------------------------------------------
@@ -64,14 +65,14 @@ dataset_groups:
 
   casda_full:
     name: "CASDA-Full"
-    description: "Original + all ~2,901 CASDA synthetic images (3 gens × 967 samples)"
+    description: "Original + all CASDA v5.1 synthetic images (2,000 images, 4-class)"
     use_original: true
     augmentation: "none"
     casda_data: "full"
 
   casda_pruning:
     name: "CASDA-Pruning"
-    description: "Original + top CASDA images by suitability score (threshold >= 0.63, ~P50)"
+    description: "Original + top CASDA images by suitability score (threshold >= 0.60)"
     use_original: true
     augmentation: "none"
     casda_data: "pruning"

@@ -249,6 +249,77 @@ v5.1 리패키징을 준비한다.
     max_samples는 Colab 실행 시 --max_samples 2000으로 지정.
 
 
+v5.1 Colab 실행 스크립트 샘플은 다음과 같습니다:
+Step 1: ROI 재추출 (roi_suitability.py 수정 반영)
+# v5.1 ROI 재추출 — 정사각형 ROI 강제 적용 확인
+python scripts/extract_rois.py \
+  --image_dir /content/drive/MyDrive/data/Severstal/train_images \
+  --train_csv /content/drive/MyDrive/data/Severstal/train.csv \
+  --output_dir /content/drive/MyDrive/data/Severstal/roi_patches_v5.1 \
+  --roi_size 256 \
+  --grid_size 64 \
+  --min_suitability 0.5 \
+  --num_workers 0
+Step 2: 데이터셋 패키징 (엣지 필터 완화 + 희귀 클래스 보호 반영)
+# v5.1 ControlNet 데이터셋 패키징
+python scripts/prepare_controlnet_data.py \
+  --roi_metadata /content/drive/MyDrive/data/Severstal/roi_patches_v5.1/roi_metadata.csv \
+  --train_images /content/drive/MyDrive/data/Severstal/train_images \
+  --train_csv /content/drive/MyDrive/data/Severstal/train.csv \
+  --output_dir /content/drive/MyDrive/data/Severstal/controlnet_dataset_v5.1 \
+  --prompt_style detailed \
+  --max_samples 2000 \
+  --validation_samples 16
+Step 3: ControlNet 학습
+# v5.1 ControlNet 학습
+python scripts/train_controlnet.py \
+  --data_dir /content/drive/MyDrive/data/Severstal/controlnet_dataset_v5.1 \
+  --output_dir /content/drive/MyDrive/data/Severstal/controlnet_training_v5.1 \
+  --pretrained_model_name_or_path runwayml/stable-diffusion-v1-5 \
+  --controlnet_model_name_or_path lllyasviel/sd-controlnet-canny \
+  --resolution 512 \
+  --train_batch_size 1 \
+  --gradient_accumulation_steps 4 \
+  --gradient_checkpointing \
+  --mixed_precision fp16 \
+  --num_train_epochs 100 \
+  --learning_rate 1e-5 \
+  --lr_scheduler cosine \
+  --lr_warmup_steps 50 \
+  --controlnet_conditioning_scale 1.0 \
+  --snr_gamma 5.0 \
+  --early_stopping_patience 20 \
+  --validation_steps 200 \
+  --logging_steps 10 \
+  --checkpointing_steps 500 \
+  --checkpoints_total_limit 3 \
+  --save_fp16 \
+  --skip_save_pipeline \
+  --seed 42
+Step 4: 생성 테스트 (추론)
+# v5.1 생성 테스트 — 학습 데이터에서 batch 추론
+python scripts/test_controlnet.py \
+  --model_path /content/drive/MyDrive/data/Severstal/controlnet_training_v5.1/best_model \
+  --jsonl_path /content/drive/MyDrive/data/Severstal/controlnet_dataset_v5.1/train.jsonl \
+  --output_dir /content/drive/MyDrive/data/Severstal/test_results_v5.1 \
+  --resolution 512 \
+  --controlnet_conditioning_scale 0.7 \
+  --guidance_scale 7.5 \
+  --num_inference_steps 30 \
+  --num_images_per_sample 1 \
+  --seed 42
+주요 포인트
+| 단계 | v5 → v5.1 변경 | 비고 |
+|------|----------------|------|
+| Step 1 | 코드 내부 변경 (정사각형 강제) | 인자 동일, 출력 경로만 변경 |
+| Step 2 | --max_samples 1000 → 2000 | 엣지 필터 완화는 코드 내부 반영 |
+| Step 3 | 인자 변경 없음 | v5에서 이미 수정 완료 |
+| Step 4 | --model_path 경로만 변경 | 추론 설정 동일 |
+Step 3에서 --skip_save_pipeline은 Colab 디스크 절약 (~4.2GB), --save_fp16은 모델 크기 절반으로 감소합니다. 필요시 제거 가능합니다.
+
+
+
+
 7. 후속 작업
 ================================================================================
 

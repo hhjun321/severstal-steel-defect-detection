@@ -452,6 +452,11 @@ class CASDASyntheticDataset(Dataset):
                 mask_path = str(self.data_dir / mask_path)
             m = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
             if m is not None:
+                # Defensive resize: CASDA masks may be 256×256 (ROI patch size)
+                # while generated images are 512×512 (ControlNet resolution)
+                if m.shape[:2] != (orig_h, orig_w):
+                    m = cv2.resize(m, (orig_w, orig_h),
+                                   interpolation=cv2.INTER_NEAREST)
                 cls_id = sample.get('class_id', 0)
                 mask[cls_id] = (m > 127).astype(np.uint8)
 

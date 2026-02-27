@@ -398,13 +398,78 @@ def package_data(
         print(f"  Quality scores: min={min(scores):.4f}, max={max(scores):.4f}, "
               f"mean={sum(scores)/len(scores):.4f}")
     
-    # Build casda_pruning: filter by threshold, sort descending, take top_k
-    pruned = [
+    # Build casda_pruning: filter by threshold, then stratified top_k selection
+    # v5.2: class-aware multi-generation으로 인해 단순 score 정렬 시
+    # 동일 sample의 multi-gen 이미지가 같은 score를 공유하여
+    # 특정 클래스(예: Class2 10x)가 pruning set을 지배할 수 있음.
+    # → 클래스별 비례 할당으로 균형 유지.
+    
+    # Step 1: threshold 필터
+    above_threshold = [
         e for e in all_metadata
         if e.get("suitability_score", 0) >= suitability_threshold
     ]
-    pruned.sort(key=lambda x: x["suitability_score"], reverse=True)
-    pruned = pruned[:pruning_top_k]
+    above_threshold_count = len(above_threshold)
+    
+    # Step 2: 클래스별 비례 할당 (stratified pruning)
+    class_quotas = {}  # populated only when stratified pruning is triggered
+    if above_threshold and pruning_top_k < len(above_threshold):
+        # 클래스별 그룹화
+        class_groups = {}
+        for e in above_threshold:
+            cid = e["class_id"]
+            class_groups.setdefault(cid, []).append(e)
+        
+        # 각 그룹을 score 내림차순 정렬
+        for cid in class_groups:
+            class_groups[cid].sort(
+                key=lambda x: x["suitability_score"], reverse=True
+            )
+        
+        # casda_full의 클래스 비율에 맞춰 pruning 할당량 계산
+        total_above = len(above_threshold)
+        pruned = []
+        class_quotas = {}
+        
+        for cid in sorted(class_groups.keys()):
+            # 비례 할당: (클래스 비율 × top_k), 최소 1개 보장
+            ratio = len(class_groups[cid]) / total_above
+            quota = max(1, round(ratio * pruning_top_k))
+            # 실제 가용량 초과 방지
+            quota = min(quota, len(class_groups[cid]))
+            class_quotas[cid] = quota
+        
+        # 할당량 합이 top_k를 초과하면 비례 조정
+        total_quota = sum(class_quotas.values())
+        if total_quota > pruning_top_k:
+            # 가장 큰 클래스부터 축소
+            excess = total_quota - pruning_top_k
+            for cid in sorted(class_quotas, key=lambda c: class_quotas[c], reverse=True):
+                reduce = min(excess, class_quotas[cid] - 1)
+                class_quotas[cid] -= reduce
+                excess -= reduce
+                if excess <= 0:
+                    break
+        
+        # 클래스별로 상위 quota개 선택
+        for cid in sorted(class_groups.keys()):
+            quota = class_quotas[cid]
+            pruned.extend(class_groups[cid][:quota])
+        
+        # 잔여 슬롯이 있으면 남은 이미지에서 score 순으로 채움
+        current_count = len(pruned)
+        if current_count < pruning_top_k:
+            already_selected = set(id(e) for e in pruned)
+            remaining = [
+                e for e in above_threshold if id(e) not in already_selected
+            ]
+            remaining.sort(key=lambda x: x["suitability_score"], reverse=True)
+            pruned.extend(remaining[:pruning_top_k - current_count])
+        
+        print(f"  Stratified pruning quotas: {dict(sorted(class_quotas.items()))}")
+    else:
+        # threshold 후 top_k 이하이면 전부 포함
+        pruned = above_threshold
     
     # Copy pruned images and masks
     for entry in pruned:
@@ -429,7 +494,7 @@ def package_data(
     print(f"CASDA-Pruning packaging complete:")
     print(f"  Threshold: >= {suitability_threshold}")
     print(f"  Top-K: {pruning_top_k}")
-    print(f"  After threshold filter: {len([e for e in all_metadata if e.get('suitability_score', 0) >= suitability_threshold])}")
+    print(f"  After threshold filter: {above_threshold_count}")
     print(f"  Final count (after top_k): {len(pruned)}")
     
     if pruned:
@@ -466,7 +531,9 @@ def package_data(
         "casda_pruning": {
             "suitability_threshold": suitability_threshold,
             "pruning_top_k": pruning_top_k,
+            "above_threshold_count": above_threshold_count,
             "total_images": len(pruned),
+            "stratified_quotas": dict(sorted(class_quotas.items())) if class_quotas else None,
             "class_distribution": dict(sorted(
                 {e["class_id"]: 0 for e in pruned}.items()
             )),  # will be overwritten below

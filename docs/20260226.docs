@@ -1158,3 +1158,333 @@ Phase 1~4 정량 검증을 통해 개선 효과가 확인되었다.
     | CASDA + deeplabv3plus             | 수정됨 | 256→512 리사이즈로 정상 동작          |
 
     기존에 정상 완료된 YOLO 학습 결과에 일절 영향 없음.
+
+
+================================================================================
+21. 벤치마크 결과 분석 (v5.1, 3개 실험 세트)
+================================================================================
+
+  분석 대상: outputs/v5.1/benchmark_results_v5.1/ 의 3개 실험 세트
+  분석 시점: 2026-02-27
+
+  21-1. 실험 세트 개요
+  ──────────────────────────────────
+
+    | 세트                      | 날짜       | Epochs | 모델                        | 데이터셋                   | 비고                                |
+    | standard/yolo             | 2026-02-23 | 300    | YOLO-MFD, EB-YOLOv8, DLv3+ | baseline_raw~casda_pruning | 커스텀 BenchmarkTrainer, mAP~0 문제 |
+    | standard/deeplabv3plus    | 2026-02-24 | 300    | DeepLabV3+                  | baseline_raw만             | 정상 학습 완료                      |
+    | aug/yolo                  | 2026-02-26 | 10     | YOLO-MFD, EB-YOLOv8        | casda_full, casda_pruning  | 스모크 테스트 (의도적 10 epochs)    |
+
+  21-2. standard/deeplabv3plus — baseline_raw (300 epochs)
+  ──────────────────────────────────
+
+    유일하게 정상 학습이 완료된 300 epochs 결과.
+
+    | Metric | Class1 | Class2 | Class3 | Class4 | Mean  |
+    | Dice   | 0.493  | 0.517  | 0.730  | 0.777  | 0.629 |
+    | IoU    | 0.327  | 0.349  | 0.574  | 0.635  | 0.471 |
+
+    관찰:
+    - Class3/4가 Class1/2보다 월등히 높음 (Dice 0.73-0.78 vs 0.49-0.52)
+    - Class2는 희소(117 ROI) 대비 Dice 0.517로 예상보다 양호
+    - Mean Dice 0.629는 Severstal 대회 상위권(~0.88)과 차이 있으나,
+      단일 baseline으로서 합리적인 수준
+
+  21-3. standard/yolo — 300 epochs (커스텀 트레이너 문제)
+  ──────────────────────────────────
+
+    문제 요약:
+    - Train Loss는 정상 하락 (1307 → 0.3~0.5)
+    - Val mAP가 전 epoch에 걸쳐 ~0.0007 유지 (사실상 0)
+    - FID = Infinity (CASDA 이미지 경로를 찾지 못함)
+
+    원인 추정:
+    1. 커스텀 BenchmarkTrainer의 mAP 계산 로직 버그 가능성
+       - Ultralytics 내부 validator를 직접 호출하는 방식이 아닌
+         커스텀 evaluation 코드가 정확하지 않았을 수 있음
+    2. aug/yolo에서 UltralyticsTrainer를 사용하니 10 epochs에서도
+       mAP 0.50까지 달성 → 트레이너 차이가 핵심 원인
+
+    결론: standard/yolo 300 epochs 결과는 신뢰할 수 없음.
+    향후 모든 YOLO 학습은 UltralyticsTrainer 사용.
+
+  21-4. aug/yolo — 10 epochs 스모크 테스트
+  ──────────────────────────────────
+
+    UltralyticsTrainer 사용, v5.1 CASDA (threshold=0.60)
+    casda_full (원본 4,666 + CASDA 2,000 = 6,666)
+    casda_pruning (원본 4,666 + pruned CASDA 41 = 4,707)
+
+    | Model    | Dataset       | mAP@0.5 | Class1 | Class2 | Class3 | Class4 |
+    | YOLO-MFD | CASDA-Full    | 0.063   | 0.000  | 0.000  | 0.253  | 0.000  |
+    | YOLO-MFD | CASDA-Pruning | 0.296   | 0.253  | 0.000  | 0.497  | 0.434  |
+    | EB-YOLOv8| CASDA-Full    | 0.199   | 0.000  | 0.000  | 0.295  | 0.503  |
+    | EB-YOLOv8| CASDA-Pruning | 0.505   | 0.491  | 0.311  | 0.630  | 0.587  |
+
+  21-5. FID Score
+  ──────────────────────────────────
+
+    v5.1 FID = 165.38 (12,568 real vs 2,000 synthetic)
+    - 높은 FID는 합성 이미지의 분포 차이를 반영
+    - v5.2에서 학습 데이터 품질 개선 후 재측정 필요
+
+  21-6. 가설 검증 상태
+  ──────────────────────────────────
+
+    | 가설 | 비교                     | 상태       | 근거                                          |
+    | H1   | CASDA > Trad Augment     | NO DATA    | baseline_trad가 aug 세트에 없음               |
+    | H2   | Pruning > Full           | SUPPORTED  | Pruning mean 0.400 vs Full mean 0.131 (+0.269)|
+    | H3   | Architecture-independent | NO DATA    | baseline_raw가 aug 세트에 없음                |
+    | H4   | CASDA improves minority  | NO DATA    | baseline_raw 비교 불가                        |
+    | H5   | Physical plausibility    | PARTIAL    | FID 165.38 (높음, 개선 필요)                   |
+
+  21-7. 핵심 관찰 패턴
+  ──────────────────────────────────
+
+    1. H2 (Pruning > Full) 강력 지지
+       - Pruning mean mAP 0.400 vs Full mean 0.131
+       - delta +0.269 (4배 가까운 차이)
+       - 10 epochs 스모크 테스트에서도 일관된 패턴
+       → 저품질 합성 이미지가 학습을 방해하는 것은 명확
+
+    2. CASDA-Full의 문제점
+       - Class1, 2가 대부분 0.000 (YOLO-MFD에서 Full은 C1=0, C2=0, C4=0)
+       - 저품질 합성 이미지 2,000장이 원본 4,666장의 학습을 오염
+       - 특히 Class2는 원본 19장의 합성 이미지가 매우 낮은 품질일 가능성
+
+    3. EB-YOLOv8 > YOLO-MFD
+       - 모든 조건에서 EB-YOLOv8이 우수
+       - BiFPN의 multi-scale 특성 융합이 Severstal 데이터에 유리
+
+    4. Class2 지속적 약점
+       - CASDA-Pruning에서도 YOLO-MFD는 Class2=0.000
+       - EB-YOLOv8만 Class2=0.311 달성
+       - 원인: v5.1 CASDA에서 Class2 생성 19장뿐 (ROI 117개 중 극소 생성)
+
+    5. 10 epochs 한계
+       - 스모크 테스트이므로 절대 수치보다 상대 패턴이 중요
+       - 300 epochs에서 패턴이 유지/강화될 것으로 예상
+       - 단, absolute mAP는 크게 상승할 것
+
+
+================================================================================
+22. v5.2 파이프라인 개선 설계
+================================================================================
+
+  목표: ControlNet 학습 효율화 + CASDA-Full 데이터량 대폭 증가 + 희소 클래스 보상
+
+  22-1. 문제점 3가지
+  ──────────────────────────────────
+
+    문제 1: ControlNet 학습에 모든 결함 데이터(15,380 ROI) 사용이 불필요
+      - Class3 10,539개를 모두 학습시키는 것은 비효율적
+      - ControlNet은 결함 패턴 재현법을 학습 → 대표 샘플이면 충분
+
+    문제 2: Class2 같은 희소 클래스는 전부 활용해야 함
+      - Class2 ROI 117개, v5.1에서 생성 19장뿐
+      - 117개가 이미 적으므로 전수 학습 + multi-generation 필요
+
+    문제 3: CASDA-Full이 2,000개뿐
+      - 원본 4,666 대비 합성 비율 ~43%
+      - 선행 연구에서 합성 비율 50~100%가 효과적
+      - 목표: ~7,000개로 증가 (원본의 ~150%)
+
+  22-2. 개선 전략 A: Class-aware Capping (ControlNet 학습 데이터)
+  ──────────────────────────────────
+
+    원칙:
+      - 희소 클래스 (N ≤ 200): 전수 포함 — 모든 ROI를 ControlNet 학습에 사용
+      - 풍부한 클래스: per_class_cap까지만 다양성 기반 샘플링
+
+    | 클래스  | 전체 ROI | Cap 적용    | 학습 사용 |
+    | Class1  | 2,881    | cap=1,200   | 1,200     |
+    | Class2  | 117      | 희소→전수   | 117       |
+    | Class3  | 10,539   | cap=1,200   | 1,200     |
+    | Class4  | 1,843    | cap=1,200   | 1,200     |
+    | 합계    | 15,380   |             | 3,717     |
+
+    구현:
+      controlnet_packager.py — _stratified_sample() 개선
+        - 새 파라미터: per_class_cap, rare_class_threshold_count
+        - per_class_cap 지정 시 class-aware capping 모드 활성화
+        - 기존 균등 분배 모드 (v3~v5.1) 완전 호환
+
+      prepare_controlnet_data.py — 새 CLI 인자
+        --per_class_cap 1200
+        --rare_class_threshold 200
+
+  22-3. 개선 전략 B: Class-aware Multi-generation (합성 이미지 생성)
+  ──────────────────────────────────
+
+    원칙:
+      - 희소 클래스: 높은 배수(10x)로 multi-generation
+      - 풍부한 클래스: 낮은 배수(1-2x)
+
+    | 클래스  | 학습 ROI | × 배수  | 생성량  | 목표                |
+    | Class1  | 1,200    | ×2      | 2,400   | 충분한 양           |
+    | Class2  | 117      | ×10     | 1,170   | 희소 보상 (핵심)    |
+    | Class3  | 1,200    | ×1      | 1,200   | 이미 풍부           |
+    | Class4  | 1,200    | ×2      | 2,400   | 충분한 양           |
+    | 합계    | 3,717    |         | 7,170   |                     |
+
+    구현:
+      test_controlnet.py — class-aware multi-generation
+        새 CLI 인자: --num_images_per_class '{"1":2,"2":10,"3":1,"4":2}'
+        - prompt에서 "class N" 패턴을 정규식으로 추출
+        - 클래스별 num_images 차등 적용
+        - --num_images_per_sample은 fallback으로 유지
+
+  22-4. v5.1 → v5.2 비교
+  ──────────────────────────────────
+
+    | 항목                    | v5.1              | v5.2                              |
+    | ControlNet 학습 데이터  | 2,000 (균등 배분) | ~3,717 (class-aware cap)          |
+    | 희소 클래스 처리        | 균등 ~500/클래스  | Class2 전수 117개                 |
+    | 생성 이미지 수          | 2,000 (1x)        | ~7,170 (class-aware multi-gen)    |
+    | Class2 생성량           | 19장              | ~1,170장 (10x)                    |
+    | CASDA-Full 합성 비율    | ~43% (2K/4.6K)    | ~154% (7.2K/4.6K)                |
+    | ControlNet 모델         | v5.1              | v5.2 (재학습)                     |
+
+  22-5. 수정된 파일 목록
+  ──────────────────────────────────
+
+    | 파일                                       | 변경 내용                                      |
+    | src/preprocessing/controlnet_packager.py    | _stratified_sample() class-aware capping 모드   |
+    | scripts/prepare_controlnet_data.py          | --per_class_cap, --rare_class_threshold CLI     |
+    | scripts/test_controlnet.py                  | --num_images_per_class, prompt class_id 파싱    |
+    | configs/benchmark_experiment.yaml           | v5.2 경로/설명 업데이트                         |
+
+  22-6. 실행 순서 (Colab + 로컬)
+  ──────────────────────────────────
+
+    [로컬] 코드 수정 (완료)
+      ↓
+    [Colab] Step 1: ControlNet 학습 데이터 재패키징
+      python scripts/prepare_controlnet_data.py \
+        --roi_metadata roi_patches_v5.1/roi_metadata.csv \
+        --train_images train_images \
+        --train_csv train.csv \
+        --output_dir controlnet_dataset_v5.2 \
+        --per_class_cap 1200 \
+        --rare_class_threshold 200 \
+        --skip_validation
+      ↓
+    [Colab] Step 2: ControlNet 재학습 (~3,717 샘플, 20 epochs)
+      python scripts/train_controlnet.py \
+        --train_data controlnet_dataset_v5.2/train.jsonl \
+        --output_dir controlnet_training_v5.2 \
+        --num_train_epochs 20 \
+        --resolution 512
+      ↓
+    [Colab] Step 3: 합성 이미지 생성 (class-aware multi-gen)
+      python scripts/test_controlnet.py \
+        --model_path controlnet_training_v5.2/final_model \
+        --jsonl_path controlnet_dataset_v5.2/train.jsonl \
+        --output_dir augmented_v5.2 \
+        --num_images_per_class '{"1":2,"2":10,"3":1,"4":2}' \
+        --resolution 512
+      ↓
+    [Colab] Step 4: CASDA 데이터셋 패키징
+      python scripts/package_casda_data.py \
+        --generated-dir augmented_v5.2/generated \
+        --controlnet-dataset controlnet_dataset_v5.2 \
+        --output-dir augmented_dataset_v5.2 \
+        --suitability-threshold 0.60
+      ↓
+    [Colab] Step 5: 벤치마크 실행 (300 epochs, 4 groups × 3 models)
+      python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --casda-dir augmented_dataset_v5.2
+
+
+23. v5.2 Pruning 클래스 불균형 문제 분석 및 수정
+================================================================================
+
+  23-1. 문제 식별
+  ──────────────────────────────────
+
+    v5.2에서 class-aware multi-generation을 도입하면, 동일 ROI sample에서
+    여러 장을 생성한다 (예: Class2 × 10). 이때 suitability_score는 원본
+    ROI의 hint 품질에 의존하므로, 동일 sample의 multi-gen 이미지들은
+    동일한 score를 공유한다.
+
+    기존 pruning 로직 (v5.1):
+      1) threshold(0.60) 이상 필터
+      2) score 내림차순 정렬
+      3) 상위 top_k개 선택 (단순 절단)
+
+    문제 시나리오:
+      - Class2: 117 ROI × 10 = 1,170장 생성, 대부분 동일 score
+      - Class3: 1,200 ROI × 1 = 1,200장, 다양한 score 분포
+      - 단순 정렬 시, 높은 score를 가진 Class2의 1,170장이 pruning set을
+        지배하여 다른 클래스의 고품질 이미지가 배제될 수 있음
+
+    v5.1 벤치마크에서 pruning이 full보다 +0.269 mAP 우수했으므로,
+    pruning set의 품질이 매우 중요 → 불균형 방치 시 v5.2 성능 저하 위험
+
+  23-2. 영향 범위 분석
+  ──────────────────────────────────
+
+    | 파일/로직                      | 영향 | 사유                              |
+    | run_benchmark.py inject/clean  | 없음 | prefix 기반 삭제, 수량 무관       |
+    | dataset_yolo.py _add_casda     | 없음 | idx 기반 고유 파일명              |
+    | package_casda_data.py filename | 없음 | _gen\d+.png$ 이미 처리            |
+    | package_casda_data.py pruning  | 있음 | 단순 score top-k → 클래스 편향    |
+
+    영향 수준: MEDIUM — pruning set의 클래스 비율이 왜곡되어
+    downstream 모델 학습에 영향 줄 수 있음
+
+  23-3. 수정 내용: Stratified Pruning
+  ──────────────────────────────────
+
+    수정 파일: scripts/package_casda_data.py (L401-474)
+
+    알고리즘:
+
+      Step 1: threshold 필터
+        above_threshold = [e for e in all_metadata
+                           if suitability_score >= threshold]
+
+      Step 2: 클래스별 비례 할당
+        (a) above_threshold를 class_id로 그룹화
+        (b) 각 그룹을 score 내림차순 정렬
+        (c) 비례 할당: quota(c) = max(1, round(ratio(c) × top_k))
+            - ratio(c) = |class_c_above_threshold| / |total_above_threshold|
+            - 최소 1개 보장 (희소 클래스 보호)
+            - 가용량 초과 방지: quota ≤ |class_c|
+        (d) 총 할당 > top_k 시, 가장 큰 클래스부터 1씩 축소
+        (e) 각 클래스에서 상위 quota개 선택
+
+      Step 3: 잔여 슬롯 충전
+        할당 후 sum(quota) < top_k이면, 미선택 이미지 중
+        score 내림차순으로 잔여 슬롯 충전
+
+    특성:
+      - casda_full의 실제 클래스 비율을 pruning set에서도 유지
+      - 희소 클래스(Class2)가 최소 1개 보장됨
+      - 각 클래스 내에서는 여전히 score 기반 품질 선택
+      - class_quotas가 packaging_report.json에 기록되어 추적 가능
+
+  23-4. 추가 정리 사항
+  ──────────────────────────────────
+
+    - above_threshold_count 변수: L412에서 계산, L497 출력에서 재활용
+      (기존에는 인라인 재계산이었으나 변수 참조로 통일)
+    - class_quotas 초기화: L415에서 빈 dict로 초기화하여
+      stratified 미적용 시에도 report에서 None 반환 (unbound 방지)
+    - remainder_budget 미사용 변수 제거
+    - packaging_report.json에 above_threshold_count, stratified_quotas 필드 추가
+
+  23-5. 예상 효과 (v5.2 기준)
+  ──────────────────────────────────
+
+    v5.2 예상 생성량: C1=2,400 | C2=1,170 | C3=1,200 | C4=2,400 (총 7,170)
+
+    pruning_top_k=2000, threshold=0.60 가정 시:
+
+    | 시나리오      | C1    | C2    | C3    | C4    | 편향도          |
+    | 단순 top-k    | ???   | ~1170 | ???   | ???   | C2 지배 가능    |
+    | stratified    | ~670  | ~326  | ~335  | ~670  | 비례 유지       |
+
+    ※ 실제 quota는 threshold 통과 비율에 따라 변동.
+       stratified_quotas가 report에 기록되므로 사후 검증 가능.

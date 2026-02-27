@@ -218,24 +218,28 @@ class ControlNetDatasetPackager:
 
         return df.reset_index(drop=True)
 
-    def _stratified_sample(self, df: pd.DataFrame, n_samples: int) -> pd.DataFrame:
+    def _stratified_sample(self, df: pd.DataFrame, n_samples: int,
+                           per_class_cap: Optional[int] = None,
+                           rare_class_threshold_count: int = 200) -> pd.DataFrame:
         """
-        클래스별 균등 분포로 샘플링합니다 (품질 우선 + 다양성 고려).
+        클래스별 샘플링 (품질 우선 + 다양성 고려).
         
-        v2에서는 random sampling을 사용했으나, v3에서는:
-        - suitability_score 기준으로 상위 샘플 우선 선택
-        - defect_subtype, background_type의 다양성을 보장
-        
-        각 클래스에서 동일한 수의 샘플을 추출하되,
-        샘플 수가 부족한 클래스는 가용한 전체 샘플을 사용하고
-        남은 할당량은 다른 클래스에 재분배합니다.
+        v5.2 개선: class-aware capping 모드 추가.
+        - per_class_cap이 지정되면 class-aware capping 모드 사용:
+          * 희소 클래스 (count <= rare_class_threshold_count): 전수 포함
+          * 풍부한 클래스: min(count, per_class_cap) 만큼 다양성 샘플링
+          * n_samples 파라미터는 무시됨 (cap 기반으로 자동 결정)
+        - per_class_cap이 None이면 기존 균등 분배 로직 사용 (v3~v5.1 호환)
         
         Args:
             df: ROI metadata DataFrame (class_id 컬럼 필요)
-            n_samples: 추출할 총 샘플 수
+            n_samples: 추출할 총 샘플 수 (균등 분배 모드에서만 사용)
+            per_class_cap: 풍부한 클래스의 최대 샘플 수 (v5.2 class-aware capping)
+            rare_class_threshold_count: 이 수 이하인 클래스를 희소로 간주하여
+                전수 포함 (기본 200)
             
         Returns:
-            균등 분포로 샘플링된 DataFrame
+            샘플링된 DataFrame
         """
         if 'class_id' not in df.columns:
             # class_id가 없으면 suitability_score 기반 상위 선택
@@ -244,51 +248,80 @@ class ControlNetDatasetPackager:
             return df.sample(n=min(n_samples, len(df)), random_state=42)
         
         classes = sorted(df['class_id'].unique())
-        n_classes = len(classes)
-        
-        # 각 클래스별 균등 할당
-        per_class = n_samples // n_classes
-        remainder = n_samples % n_classes
-        
-        sampled_parts = []
-        deficit = 0  # 부족한 클래스에서 채우지 못한 수
-        
         has_suitability = 'suitability_score' in df.columns
         has_subtype = 'defect_subtype' in df.columns
         has_bg = 'background_type' in df.columns
         
-        for i, cls in enumerate(classes):
-            cls_df = df[df['class_id'] == cls].copy()
-            # 나머지는 앞쪽 클래스에 1개씩 추가 할당
-            target = per_class + (1 if i < remainder else 0)
+        if per_class_cap is not None:
+            # ===== v5.2 Class-aware capping 모드 =====
+            # 희소 클래스는 전수 포함, 풍부한 클래스는 cap 적용
+            sampled_parts = []
             
-            if len(cls_df) <= target:
-                # 부족한 클래스: 전체 사용
-                sampled_parts.append(cls_df)
-                deficit += target - len(cls_df)
-            else:
-                # 다양성 보장 샘플링
-                selected = self._diverse_select(cls_df, target,
-                                                has_suitability, has_subtype, has_bg)
-                sampled_parts.append(selected)
-        
-        # 부족분 재분배: 여유가 있는 클래스에서 추가 샘플링
-        if deficit > 0:
-            already_sampled_idx = pd.concat(sampled_parts).index
-            remaining_df = df[~df.index.isin(already_sampled_idx)]
+            print(f"  Class-aware capping mode: per_class_cap={per_class_cap}, "
+                  f"rare_threshold={rare_class_threshold_count}")
             
-            if len(remaining_df) > 0:
-                if has_suitability:
-                    additional = remaining_df.nlargest(
-                        min(deficit, len(remaining_df)), 'suitability_score'
-                    )
+            for cls in classes:
+                cls_df = df[df['class_id'] == cls].copy()
+                cls_count = len(cls_df)
+                
+                if cls_count <= rare_class_threshold_count:
+                    # 희소 클래스: 전수 포함
+                    sampled_parts.append(cls_df)
+                    print(f"  Class {cls}: {cls_count} samples (RARE -> all included)")
+                elif cls_count <= per_class_cap:
+                    # cap 미만: 전수 포함
+                    sampled_parts.append(cls_df)
+                    print(f"  Class {cls}: {cls_count} samples (under cap -> all included)")
                 else:
-                    additional = remaining_df.sample(
-                        n=min(deficit, len(remaining_df)), random_state=42
+                    # 풍부한 클래스: cap까지 다양성 샘플링
+                    selected = self._diverse_select(
+                        cls_df, per_class_cap,
+                        has_suitability, has_subtype, has_bg
                     )
-                sampled_parts.append(additional)
-        
-        result = pd.concat(sampled_parts).reset_index(drop=True)
+                    sampled_parts.append(selected)
+                    print(f"  Class {cls}: {cls_count} -> {per_class_cap} samples "
+                          f"(capped, diversity-selected)")
+            
+            result = pd.concat(sampled_parts).reset_index(drop=True)
+            print(f"  Total after capping: {len(result)} samples")
+        else:
+            # ===== 기존 균등 분배 모드 (v3~v5.1 호환) =====
+            n_classes = len(classes)
+            per_class = n_samples // n_classes
+            remainder = n_samples % n_classes
+            
+            sampled_parts = []
+            deficit = 0
+            
+            for i, cls in enumerate(classes):
+                cls_df = df[df['class_id'] == cls].copy()
+                target = per_class + (1 if i < remainder else 0)
+                
+                if len(cls_df) <= target:
+                    sampled_parts.append(cls_df)
+                    deficit += target - len(cls_df)
+                else:
+                    selected = self._diverse_select(cls_df, target,
+                                                    has_suitability, has_subtype, has_bg)
+                    sampled_parts.append(selected)
+            
+            # 부족분 재분배
+            if deficit > 0:
+                already_sampled_idx = pd.concat(sampled_parts).index
+                remaining_df = df[~df.index.isin(already_sampled_idx)]
+                
+                if len(remaining_df) > 0:
+                    if has_suitability:
+                        additional = remaining_df.nlargest(
+                            min(deficit, len(remaining_df)), 'suitability_score'
+                        )
+                    else:
+                        additional = remaining_df.sample(
+                            n=min(deficit, len(remaining_df)), random_state=42
+                        )
+                    sampled_parts.append(additional)
+            
+            result = pd.concat(sampled_parts).reset_index(drop=True)
         
         # 다양성 통계 출력
         if has_subtype:
@@ -297,6 +330,10 @@ class ControlNetDatasetPackager:
         if has_bg:
             bg_counts = result['background_type'].value_counts()
             print(f"  Background type diversity: {len(bg_counts)} types")
+        
+        # 클래스 분포 출력
+        class_dist = result['class_id'].value_counts().sort_index()
+        print(f"  Final class distribution: {dict(class_dist)}")
         
         return result
     
@@ -519,7 +556,9 @@ class ControlNetDatasetPackager:
                        quality_filter: bool = True,
                        min_area: int = 100,
                        min_stability: float = 0.3,
-                       min_matching: float = 0.5) -> Path:
+                       min_matching: float = 0.5,
+                       per_class_cap: Optional[int] = None,
+                       rare_class_threshold_count: int = 200) -> Path:
         """
         Package complete dataset for ControlNet training.
         
@@ -529,12 +568,17 @@ class ControlNetDatasetPackager:
             train_csv: Path to train.csv with RLE annotations
             output_dir: Output directory for packaged dataset
             create_hints: Whether to generate hint images
-            max_samples: Maximum number of samples to package.
+            max_samples: Maximum number of samples to package (균등 분배 모드).
                 v2에서 50개로 overfitting이 발생했으므로, v3에서는 500 권장.
+                per_class_cap이 지정되면 무시됨.
             quality_filter: 품질 필터 적용 여부 (기본: True)
             min_area: 최소 결함 영역 (px, 기본: 100)
             min_stability: 최소 stability_score (기본: 0.3)
             min_matching: 최소 matching_score (기본: 0.5)
+            per_class_cap: v5.2 class-aware capping. 풍부한 클래스의 최대 샘플 수.
+                지정 시 희소 클래스는 전수 포함, 풍부한 클래스는 cap까지만 선택.
+            rare_class_threshold_count: 이 수 이하인 클래스를 희소로 간주 (기본 200).
+                per_class_cap 모드에서만 사용.
             
         Returns:
             Path to output directory
@@ -565,8 +609,19 @@ class ControlNetDatasetPackager:
                 min_matching=min_matching,
             )
         
-        # Limit samples if specified (stratified sampling by class)
-        if max_samples and max_samples < len(roi_metadata_df):
+        # Limit samples: class-aware capping (v5.2) 또는 균등 분배 (v3~v5.1)
+        if per_class_cap is not None:
+            # v5.2 class-aware capping: 희소 클래스 전수 + 풍부한 클래스 cap
+            roi_metadata_df = self._stratified_sample(
+                roi_metadata_df, n_samples=0,  # n_samples는 capping 모드에서 무시
+                per_class_cap=per_class_cap,
+                rare_class_threshold_count=rare_class_threshold_count
+            )
+            print(f"Class-aware capping: {len(roi_metadata_df)} samples selected")
+            if 'class_id' in roi_metadata_df.columns:
+                class_dist = roi_metadata_df['class_id'].value_counts().sort_index()
+                print(f"  Class distribution: {dict(class_dist)}")
+        elif max_samples and max_samples < len(roi_metadata_df):
             roi_metadata_df = self._stratified_sample(roi_metadata_df, max_samples)
             print(f"Stratified sampling: {max_samples} samples selected")
             if 'class_id' in roi_metadata_df.columns:

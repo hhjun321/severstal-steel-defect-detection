@@ -49,6 +49,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# class_id를 prompt에서 추출하는 정규식
+import re
+_CLASS_PATTERN = re.compile(r'class\s*(\d+)', re.IGNORECASE)
+
 
 # =============================================================================
 # Path Resolution (학습 스크립트와 동일)
@@ -338,7 +342,13 @@ def create_comparison_grid(
 # =============================================================================
 
 def generate_from_jsonl(pipeline, args, device):
-    """train.jsonl의 모든 샘플에 대해 결함 이미지를 생성합니다."""
+    """train.jsonl의 모든 샘플에 대해 결함 이미지를 생성합니다.
+    
+    v5.2 개선: --num_images_per_class로 클래스별 생성 수 차등 적용.
+    예: --num_images_per_class '{"1":2,"2":10,"3":1,"4":2}'
+    클래스별 생성 수가 지정되면 prompt에서 class_id를 추출하여
+    해당 클래스의 생성 수를 적용합니다.
+    """
 
     jsonl_path = Path(args.jsonl_path)
     output_dir = Path(args.output_dir)
@@ -360,6 +370,34 @@ def generate_from_jsonl(pipeline, args, device):
 
     logger.info(f"Loaded {len(samples)} samples from {jsonl_path}")
 
+    # v5.2: 클래스별 생성 수 파싱
+    class_num_images = None
+    if args.num_images_per_class:
+        try:
+            class_num_images = json.loads(args.num_images_per_class)
+            # 키를 문자열로 통일
+            class_num_images = {str(k): int(v) for k, v in class_num_images.items()}
+            logger.info(f"Class-aware multi-generation: {class_num_images}")
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"Invalid --num_images_per_class format: {e}")
+            logger.error("Expected JSON: '{\"1\":2,\"2\":10,\"3\":1,\"4\":2}'")
+            class_num_images = None
+
+    # 총 생성 수 예측 (로깅용)
+    if class_num_images:
+        total_expected = 0
+        class_sample_counts = {}
+        for sample in samples:
+            prompt = sample.get("prompt", "")
+            match = _CLASS_PATTERN.search(prompt)
+            cls_id = match.group(1) if match else "unknown"
+            class_sample_counts[cls_id] = class_sample_counts.get(cls_id, 0) + 1
+        for cls_id, count in sorted(class_sample_counts.items()):
+            n_imgs = class_num_images.get(cls_id, args.num_images_per_sample)
+            total_expected += count * n_imgs
+            logger.info(f"  Class {cls_id}: {count} samples x {n_imgs} images = {count * n_imgs}")
+        logger.info(f"  Total expected: {total_expected} images")
+
     # 경로 탐색 디렉토리 목록
     project_root = Path(__file__).parent.parent
     data_dir = jsonl_path.parent
@@ -380,6 +418,14 @@ def generate_from_jsonl(pipeline, args, device):
         )
         hint_path_str = sample.get("hint", "")
         target_path_str = sample.get("target", "")
+
+        # v5.2: 클래스별 생성 수 결정
+        num_images = args.num_images_per_sample
+        if class_num_images:
+            match = _CLASS_PATTERN.search(prompt)
+            if match:
+                cls_id = match.group(1)
+                num_images = class_num_images.get(cls_id, args.num_images_per_sample)
 
         # Hint 이미지 로드
         try:
@@ -407,7 +453,7 @@ def generate_from_jsonl(pipeline, args, device):
             guidance_scale=args.guidance_scale,
             seed=args.seed + idx,
             device=device,
-            num_images=args.num_images_per_sample,
+            num_images=num_images,
             controlnet_conditioning_scale=args.controlnet_conditioning_scale,
             grayscale_postprocess=args.grayscale_postprocess,
             resolution=args.resolution,
@@ -444,14 +490,18 @@ def generate_from_jsonl(pipeline, args, device):
         json.dump({
             "total_samples": len(samples),
             "generated": len(results_summary),
+            "total_images": sum(r["num_generated"] for r in results_summary),
             "model_path": args.model_path or args.pipeline_path,
             "num_inference_steps": args.num_inference_steps,
             "guidance_scale": args.guidance_scale,
             "seed": args.seed,
+            "class_num_images": class_num_images,
             "results": results_summary,
         }, f, indent=2)
 
-    logger.info(f"Generation complete: {len(results_summary)}/{len(samples)} samples")
+    total_imgs = sum(r["num_generated"] for r in results_summary)
+    logger.info(f"Generation complete: {len(results_summary)}/{len(samples)} samples, "
+                f"{total_imgs} total images")
     logger.info(f"Generated images: {generated_dir}")
     logger.info(f"Comparison grids: {comparison_dir}")
     logger.info(f"Summary: {summary_path}")
@@ -570,6 +620,13 @@ def parse_args():
              "v3부터 기본값 0.7 적용 (v2의 1.0에서 neon/rainbow 패턴 발생).",
     )
     parser.add_argument("--num_images_per_sample", type=int, default=1)
+    parser.add_argument(
+        "--num_images_per_class", type=str, default=None,
+        help='v5.2 class-aware multi-generation: 클래스별 생성 수를 JSON으로 지정. '
+             'prompt에서 class_id를 파싱하여 해당 클래스의 생성 수를 적용합니다. '
+             '--num_images_per_sample은 fallback으로 사용. '
+             '예: --num_images_per_class \'{"1":2,"2":10,"3":1,"4":2}\'',
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--resolution", type=int, default=512,

@@ -74,7 +74,23 @@ def main():
         '--max_samples',
         type=int,
         default=None,
-        help='Maximum number of samples to process (for testing)'
+        help='Maximum number of samples to process (균등 분배 모드, v3~v5.1 호환). '
+             '--per_class_cap이 지정되면 무시됨.'
+    )
+    parser.add_argument(
+        '--per_class_cap',
+        type=int,
+        default=None,
+        help='v5.2 class-aware capping: 풍부한 클래스의 최대 샘플 수. '
+             '희소 클래스(--rare_class_threshold 이하)는 전수 포함. '
+             '예: --per_class_cap 1200'
+    )
+    parser.add_argument(
+        '--rare_class_threshold',
+        type=int,
+        default=200,
+        help='이 수 이하인 클래스를 희소로 간주하여 전수 포함 (기본 200). '
+             '--per_class_cap과 함께 사용.'
     )
     parser.add_argument(
         '--validation_samples',
@@ -116,6 +132,8 @@ def main():
     print(f"Run validation: {not args.skip_validation}")
     if args.max_samples:
         print(f"Max samples: {args.max_samples}")
+    if args.per_class_cap:
+        print(f"Per-class cap: {args.per_class_cap} (rare threshold: {args.rare_class_threshold})")
     print("="*80)
     
     # Load ROI metadata
@@ -169,7 +187,9 @@ def main():
         train_csv=train_csv,
         output_dir=output_dir,
         create_hints=not args.skip_hints,
-        max_samples=args.max_samples
+        max_samples=args.max_samples,
+        per_class_cap=args.per_class_cap,
+        rare_class_threshold_count=args.rare_class_threshold
     )
     
     # Print final summary

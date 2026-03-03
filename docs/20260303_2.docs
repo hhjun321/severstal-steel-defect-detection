@@ -1,0 +1,236 @@
+20260303 작업 일지 #3 - v5.4 후속 실험 준비 (코드 수정 및 실행 스크립트)
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+v5.3 통합 분석(20260303_1.docs)에서 도출된 후속 실험 계획을 구현한다.
+코드 수정은 로컬에서, 실험 실행은 Colab에서 수행하는 구조.
+
+  핵심 목표:
+    (1) CASDA 합성 데이터 주입 비율(ratio) 실험을 위한 CLI 인터페이스 구현
+    (2) Bbox 라벨 품질 검증 스크립트 작성
+    (3) Colab 실행 스크립트 작성 (Phase 0~3)
+
+  배경:
+    v5.3에서 CASDA 50:50 비율이 Detection 성능을 -12.4%~-45.0% 하락시킴.
+    소량 고품질 합성 데이터(10~30%)가 더 효과적일 수 있다는 가설 검증 필요.
+
+
+2. 수정 파일 목록
+================================================================================
+
+  | 파일                              | 변경 유형 | 내용                          |
+  |-----------------------------------|-----------|-------------------------------|
+  | scripts/run_benchmark.py          | 수정      | --casda-ratio CLI, inject 확장 |
+  | src/training/dataset.py           | 수정      | ratio 그룹 segmentation 지원   |
+  | scripts/run_v54_experiments.sh    | 신규      | Colab 실행 스크립트             |
+  | scripts/verify_bbox_quality.py    | 신규      | Bbox 라벨 품질 분석             |
+
+
+3. 코드 변경 상세
+================================================================================
+
+  3-1. scripts/run_benchmark.py — --casda-ratio CLI 인수 추가
+  ──────────────────────────────────────────────────────────
+
+    위치: L735-740 (argparse 정의)
+
+    parser.add_argument('--casda-ratio', type=float, nargs='+',
+        help='CASDA 합성 데이터 주입 비율 (0.0~1.0). 복수 지정 가능.')
+
+    사용 예:
+      --casda-ratio 0.1 0.2 0.3
+
+    동작:
+      - 각 비율에 대해 casda_ratio_10, casda_ratio_20, casda_ratio_30 그룹 자동 생성
+      - max_samples = num_train_original * ratio / (1 - ratio) 로 자동 계산
+        예: ratio=0.1, 원본 4666장 → max_samples = 4666 * 0.1 / 0.9 ≈ 518장
+      - --groups 미지정 시: ratio 그룹만 실행
+      - --groups 지정 시: 기존 그룹 + ratio 그룹 병행 실행
+
+
+  3-2. scripts/run_benchmark.py — 동적 ratio 그룹 등록
+  ──────────────────────────────────────────────────────────
+
+    위치: L866-908 (main 함수 내)
+
+    핵심 로직:
+      casda_ratio_map = {}
+      for ratio in args.casda_ratio:
+          max_samples = int(num_train * ratio / (1 - ratio))
+          ratio_key = f"casda_ratio_{int(ratio*100)}"
+          config['dataset_groups'][ratio_key] = {
+              'name': f"CASDA-Ratio-{pct}%",
+              'casda_data': 'full',
+              '_casda_max_samples': max_samples,
+              '_casda_ratio': ratio,
+          }
+          casda_ratio_map[ratio_key] = (ratio, max_samples)
+
+    설계 의도:
+      - casda_full 디렉토리의 데이터를 그대로 사용하되, max_samples로 수량 제한
+      - suitability 점수 순 정렬 → 상위 N개 선택 (기존 pruning 로직 재활용)
+      - 기존 config YAML 수정 없이 CLI만으로 비율 실험 가능
+
+
+  3-3. scripts/run_benchmark.py — inject_casda_to_baseline() 확장
+  ──────────────────────────────────────────────────────────
+
+    위치: L237-293
+
+    변경 전: inject_casda_to_baseline(baseline_dir, casda_dir, prefix)
+    변경 후: inject_casda_to_baseline(baseline_dir, casda_dir, prefix,
+                                      max_samples=None, suitability_threshold=None)
+
+    동작:
+      - max_samples 또는 suitability_threshold 지정 시 → casda_mode="pruning"
+      - _add_casda_to_training()에 pruning_top_k / suitability_threshold 전달
+      - 기존 full/pruning 호출은 영향 없음 (기본값 None → 기존 동작)
+
+
+  3-4. scripts/run_benchmark.py — 실험 루프 ratio 그룹 처리
+  ──────────────────────────────────────────────────────────
+
+    위치: L948-1009
+
+    변경 사항:
+      - CASDA_GROUPS 집합에 ratio 그룹 키 추가
+      - CASDA_GROUP_TO_SUBDIR에 ratio_key → "casda_full" 매핑
+      - inject 호출 시 ratio_max_samples 전달
+      - FID 평가에 ratio 그룹 포함
+
+
+  3-5. src/training/dataset.py — create_data_loaders() ratio 지원
+  ──────────────────────────────────────────────────────────
+
+    위치: L702-713
+
+    변경 사항:
+      group_max_samples = group_config.get('_casda_max_samples', None)
+      → CASDASyntheticDataset(max_samples=group_max_samples)
+
+    목적:
+      Segmentation(DeepLabV3+) 경로에서도 ratio 제한 적용.
+      Detection(YOLO)은 inject_casda_to_baseline에서 처리되므로 별도 경로.
+
+
+4. 신규 스크립트
+================================================================================
+
+  4-1. scripts/run_v54_experiments.sh — Colab 실행 스크립트
+  ──────────────────────────────────────────────────────────
+
+    Phase 구성:
+      | Phase | 내용                     | 실험 수 | GPU 필요 |
+      |-------|--------------------------|---------|----------|
+      | 0     | Bbox 품질 검증           | 분석    | 아니오   |
+      | 1     | baseline_trad (H1 가설)  | 3       | 예       |
+      | 2     | CASDA ratio 10/20/30%    | 9       | 예       |
+      | 3     | YOLO-MFD Pruning 재실행  | 1       | 예       |
+      |       | 합계                     | 13      |          |
+
+    사용법:
+      # 환경 변수 설정 후
+      bash scripts/run_v54_experiments.sh all      # 전체 실행
+      bash scripts/run_v54_experiments.sh phase1   # Phase 1만
+      bash scripts/run_v54_experiments.sh phase2   # Phase 2만
+      bash scripts/run_v54_experiments.sh phase3   # Phase 3만
+
+    특징:
+      - 환경 변수로 경로 override 가능 (DATA_DIR, CSV_PATH 등)
+      - set -e로 실패 시 즉시 중단
+      - Phase별/전체 선택 실행
+
+
+  4-2. scripts/verify_bbox_quality.py — Bbox 라벨 품질 분석
+  ──────────────────────────────────────────────────────────
+
+    목적:
+      v5.3 Detection 실패 원인 (A) bbox 라벨 부정확성 검증.
+      mask→contour→boundingRect 변환 과정에서 발생할 수 있는 문제 정량화.
+
+    분석 항목:
+      (1) 원본 vs 합성 bbox 크기(width, height) 분포 비교
+      (2) Aspect ratio 분포 차이
+      (3) Full-image fallback 비율 (bbox가 이미지 95% 이상 차지)
+      (4) 이상치: >80% 면적 또는 <0.1% 면적
+      (5) 클래스별 비교
+
+    출력:
+      - bbox_quality_report.txt (텍스트 리포트)
+      - bbox_quality_summary.json (구조화 데이터)
+      - casda_metadata_stats.json (메타데이터 통계)
+
+
+5. Ratio 실험 설계 근거
+================================================================================
+
+  v5.3 비율:
+    CASDA-Full: 4,744 / (4,666 + 4,744) = 50.4% → Detection -12.4%~-45.0%
+    CASDA-Pruning: ~2,000 / (4,666 + 2,000) = 30.0% → Detection -89.1%
+
+  v5.4 비율 설계:
+    | Ratio | Synthetic | Total    | 비율 계산              |
+    |-------|-----------|----------|------------------------|
+    | 10%   | ~518      | ~5,184   | 4666 * 0.1 / 0.9      |
+    | 20%   | ~1,167    | ~5,833   | 4666 * 0.2 / 0.8      |
+    | 30%   | ~2,000    | ~6,666   | 4666 * 0.3 / 0.7      |
+
+  가설:
+    - 소량 합성(10~20%)이 50%보다 성능 하락 폭이 적을 것
+    - suitability 점수 상위 선택으로 품질 보장
+    - 최적 비율 도출 후 Grid Search (ratio x threshold)로 정밀 탐색
+
+  차별점 (vs v5.3 CASDA-Pruning):
+    - Pruning은 suitability ≥ 0.60 필터 → 2,000장 (top_k 제한)
+    - Ratio 실험은 casda_full에서 suitability 순 상위 N개 선택
+    - 즉, 동일 2,000장이라도 선택 기준이 다를 수 있음
+      (Pruning: threshold 기반, Ratio 30%: top-k 기반)
+
+
+6. 하위 호환성
+================================================================================
+
+  모든 변경은 기존 동작에 영향 없음:
+    - --casda-ratio 미지정 시: 기존과 100% 동일 동작
+    - inject_casda_to_baseline: max_samples=None 기본 → 기존 full inject
+    - create_data_loaders: group_max_samples=None → 기존 CASDASyntheticDataset 전체 로드
+    - config YAML 수정 없음
+
+
+7. 남은 작업 (Colab 실행 필요)
+================================================================================
+
+  P0 (즉시):
+    [ ] Phase 0: Bbox 품질 검증 실행 → 결과 확인 후 Phase 2 진행 여부 결정
+    [ ] Phase 1: baseline_trad 실행 (H1 가설 검증)
+    [ ] Phase 2: CASDA ratio 10/20/30% 실행
+
+  P1 (Phase 2 완료 후):
+    [ ] Phase 3: YOLO-MFD Pruning 재실행
+    [ ] 결과 분석 (ratio별 성능 곡선, 최적 비율 도출)
+
+  P2 (후속):
+    [ ] Grid Search: (ratio x suitability_threshold)
+    [ ] FID < 100 품질 개선 (ControlNet 재학습 검토)
+
+  P3 (논문):
+    [ ] 전체 결과 통합 분석 및 시각화
+    [ ] CASDA 벤치마크 논문 작성
+
+
+8. 기술 메모
+================================================================================
+
+  Ratio 그룹의 데이터 선택 방식:
+    1. casda_full/metadata.json 로드
+    2. suitability_threshold ≥ 0.0 (실질적으로 전체 통과)
+    3. suitability 점수 내림차순 정렬
+    4. 상위 max_samples개 선택
+    → _add_casda_to_training()의 기존 pruning 로직을 재활용
+    → pruning_top_k = max_samples, suitability_threshold = 0.0
+
+  주의사항:
+    - casda_full에 suitability 점수가 없으면 전체에서 랜덤 또는 순서대로 선택됨
+    - 이 경우 "고품질 선택" 효과 없음 → Phase 0에서 metadata 확인 필요
+    - inject 후 clean이 그룹 전환 시 자동 수행됨 (casda_ prefix 기반)

@@ -582,6 +582,15 @@ def build_transforms(
                 p=0.5,
             ),
         ])
+        # Scale augmentation (if scale_range defined in YAML)
+        scale_range = trad_config.get('scale_range', None)
+        if scale_range and isinstance(scale_range, (list, tuple)) and len(scale_range) == 2:
+            transforms_list.append(
+                A.RandomScale(
+                    scale_limit=(scale_range[0] - 1.0, scale_range[1] - 1.0),
+                    p=0.5,
+                )
+            )
 
     # Normalize and convert to tensor
     transforms_list.extend([
@@ -699,6 +708,9 @@ def create_data_loaders(
     casda_data = group_config.get('casda_data', None)
     if casda_data is not None:
         casda_config = ds_config.get('casda', {})
+        # ratio 그룹의 _casda_max_samples 지원
+        group_max_samples = group_config.get('_casda_max_samples', None)
+
         if casda_data == "full":
             raw_casda = casda_config.get('full_dir', 'data/augmented/casda_full')
             casda_dir = raw_casda if os.path.isabs(raw_casda) else str(project_root / raw_casda)
@@ -707,6 +719,7 @@ def create_data_loaders(
                 mode=model_type,
                 input_size=input_size,
                 num_classes=ds_config.get('num_classes', 4),
+                max_samples=group_max_samples,  # ratio 제한 (None이면 전체)
                 transform=train_transform,
             )
         elif casda_data == "pruning":
@@ -718,7 +731,7 @@ def create_data_loaders(
                 input_size=input_size,
                 num_classes=ds_config.get('num_classes', 4),
                 suitability_threshold=casda_config.get('suitability_threshold', 0.63),
-                max_samples=casda_config.get('pruning_top_k', 2000),
+                max_samples=group_max_samples or casda_config.get('pruning_top_k', 2000),
                 transform=train_transform,
             )
         else:

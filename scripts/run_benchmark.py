@@ -238,6 +238,8 @@ def inject_casda_to_baseline(
     baseline_dir: str,
     casda_dir: str,
     prefix: str = CASDA_PREFIX,
+    max_samples: Optional[int] = None,
+    suitability_threshold: Optional[float] = None,
 ) -> int:
     """
     CASDA 합성 이미지/라벨을 baseline_raw YOLO 데이터셋의 train/에 주입한다.
@@ -252,6 +254,8 @@ def inject_casda_to_baseline(
         baseline_dir: baseline_raw YOLO 데이터셋 경로 (images/train/, labels/train/ 포함)
         casda_dir: CASDA 패키징 디렉토리 (images/, masks/, metadata.json)
         prefix: 주입 파일 접두사 (clean 시 이 prefix로 삭제)
+        max_samples: 주입할 최대 합성 이미지 수 (None이면 전체)
+        suitability_threshold: 최소 suitability 점수 (None이면 필터링 없음)
 
     Returns:
         주입된 이미지 수
@@ -266,10 +270,20 @@ def inject_casda_to_baseline(
         logging.error(f"baseline train dirs not found: {images_train}, {labels_train}")
         return 0
 
+    # max_samples 또는 suitability_threshold가 있으면 pruning 모드로 필터링
+    casda_mode = "full"
+    casda_config = {}
+    if max_samples is not None or suitability_threshold is not None:
+        casda_mode = "pruning"
+        casda_config = {
+            'pruning_top_k': max_samples or 99999,
+            'suitability_threshold': suitability_threshold or 0.0,
+        }
+
     count = _add_casda_to_training(
         casda_dir=casda_dir,
-        casda_mode="full",       # 필터링 없음 — 패키징 단계에서 이미 처리됨
-        casda_config={},
+        casda_mode=casda_mode,
+        casda_config=casda_config,
         images_train_dir=images_train,
         labels_train_dir=labels_train,
         num_classes=4,
@@ -718,6 +732,12 @@ Examples:
                              '그룹별 하위 디렉토리(예: baseline_raw/)에 '
                              'images/, labels/, dataset.yaml이 있으면 변환을 건너뜀. '
                              '없으면 이 디렉토리에 변환 결과를 저장하여 다음 실행 시 재사용')
+    parser.add_argument('--casda-ratio', type=float, nargs='+', default=None,
+                        help='CASDA 합성 데이터 주입 비율 (0.0~1.0). '
+                             '지정 시 casda_full 데이터에서 비율에 맞는 수량만 선택. '
+                             '복수 비율 지정 가능: --casda-ratio 0.1 0.2 0.3. '
+                             '원본 train 수 대비 비율로 max_samples 자동 계산. '
+                             '예: 0.1 → 원본 4666장의 10% ≈ 518장 합성 추가')
     args = parser.parse_args()
 
     # Load config
@@ -843,10 +863,56 @@ Examples:
     available_groups = list(config['dataset_groups'].keys())
     group_keys = resolve_groups(args.groups, available_groups)
 
+    # ====== --casda-ratio: 동적 ratio 그룹 생성 ======
+    # --casda-ratio 0.1 0.2 0.3 → casda_ratio_10, casda_ratio_20, casda_ratio_30 그룹 자동 생성
+    # --groups 미지정 + --casda-ratio 지정 시: ratio 그룹만 실행
+    # --groups 지정 + --casda-ratio 지정 시: 기존 그룹 + ratio 그룹 병행
+    casda_ratio_map = {}  # group_key → (ratio, max_samples)
+    if args.casda_ratio:
+        # --groups가 없으면 ratio 그룹만 실행하도록 기존 그룹 비우기
+        if args.groups is None:
+            group_keys = []
+
+        # 원본 train 수 계산 (split IDs로부터)
+        train_ids_for_ratio, _, _ = get_split_ids(config)
+        num_train_original = len(train_ids_for_ratio)
+        logging.info(f"Original training set size: {num_train_original}")
+
+        for ratio in args.casda_ratio:
+            if not (0.0 < ratio < 1.0):
+                logging.error(f"Invalid casda-ratio: {ratio} (must be 0.0 < ratio < 1.0)")
+                continue
+
+            # ratio = synthetic / (original + synthetic)
+            # synthetic = original * ratio / (1 - ratio)
+            max_samples = int(num_train_original * ratio / (1.0 - ratio))
+            ratio_pct = int(ratio * 100)
+            ratio_key = f"casda_ratio_{ratio_pct}"
+
+            # 동적 dataset group 등록
+            config['dataset_groups'][ratio_key] = {
+                'name': f"CASDA-Ratio-{ratio_pct}%",
+                'description': f"Original + {max_samples} CASDA images ({ratio_pct}% synthetic ratio)",
+                'use_original': True,
+                'augmentation': 'none',
+                'casda_data': 'full',  # casda_full 디렉토리에서 상위 N개 선택
+                '_casda_max_samples': max_samples,
+                '_casda_ratio': ratio,
+            }
+            casda_ratio_map[ratio_key] = (ratio, max_samples)
+
+            if ratio_key not in group_keys:
+                group_keys.append(ratio_key)
+
+            logging.info(f"  Created ratio group: {ratio_key} "
+                         f"(ratio={ratio:.0%}, max_samples={max_samples})")
+
     logging.info(f"Models: {model_keys}")
     logging.info(f"Dataset groups: {group_keys}")
     if args.groups:
         logging.info(f"  (resolved from CLI: {args.groups})")
+    if args.casda_ratio:
+        logging.info(f"  (casda-ratio groups added: {list(casda_ratio_map.keys())})")
     logging.info(f"Total experiments: {len(model_keys) * len(group_keys)}")
 
     # Log training pipeline info
@@ -858,8 +924,9 @@ Examples:
     reporter = BenchmarkReporter(str(experiment_dir))
 
     # ====== FID Evaluation ======
-    casda_groups = {'casda_full', 'casda_pruning'}
-    has_casda = any(g in casda_groups for g in group_keys)
+    casda_groups_for_fid = {'casda_full', 'casda_pruning'}
+    casda_groups_for_fid.update(casda_ratio_map.keys())
+    has_casda = any(g in casda_groups_for_fid for g in group_keys)
 
     if args.fid_only or (has_casda and config.get('evaluation', {}).get('fid', {}).get('compute', True)):
         fid_results = run_fid_evaluation(config, experiment_dir, device)
@@ -884,6 +951,11 @@ Examples:
         "casda_pruning": "casda_pruning",
     }
 
+    # ratio 그룹도 CASDA 그룹으로 취급 (casda_full 디렉토리 사용)
+    for rk in casda_ratio_map:
+        CASDA_GROUPS.add(rk)
+        CASDA_GROUP_TO_SUBDIR[rk] = "casda_full"  # ratio 그룹은 casda_full에서 선택
+
     # Resolve baseline_raw YOLO directory
     baseline_yolo_dir = None
     if args.yolo_dir:
@@ -907,21 +979,31 @@ Examples:
                 casda_data_dir = os.path.join(args.casda_dir, casda_subdir)
             else:
                 casda_cfg = config.get('dataset', {}).get('casda', {})
-                if group_key == "casda_full":
+                if casda_subdir == "casda_full":
                     casda_data_dir = casda_cfg.get('full_dir', '')
-                else:
+                elif casda_subdir == "casda_pruning":
                     casda_data_dir = casda_cfg.get('pruning_dir', '')
+                else:
+                    casda_data_dir = casda_cfg.get('full_dir', '')
 
             if casda_data_dir and os.path.exists(casda_data_dir):
+                # ratio 그룹이면 max_samples 제한 적용
+                ratio_max_samples = None
+                if group_key in casda_ratio_map:
+                    _, ratio_max_samples = casda_ratio_map[group_key]
+
                 logging.info(f"\n{'='*70}")
                 logging.info(f"INJECT: {group_key} → baseline_raw")
                 logging.info(f"  Source: {casda_data_dir}")
                 logging.info(f"  Target: {baseline_yolo_dir}")
+                if ratio_max_samples is not None:
+                    logging.info(f"  Max samples: {ratio_max_samples} (ratio-limited)")
                 logging.info(f"{'='*70}")
 
                 inject_count = inject_casda_to_baseline(
                     baseline_dir=baseline_yolo_dir,
                     casda_dir=casda_data_dir,
+                    max_samples=ratio_max_samples,
                 )
                 casda_injected = True
                 logging.info(f"  → {inject_count} images injected")

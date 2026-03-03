@@ -1,0 +1,1155 @@
+20260303 작업 일지 #4 - CASDA 코드베이스 전체 분석 및 연구 성과 도출 방법론
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+CASDA 프로젝트의 전체 코드베이스를 체계적으로 분석하여:
+  (1) 7단계 파이프라인의 상세 데이터 흐름과 품질 게이트를 문서화
+  (2) 현재 병목과 한계를 코드 수준에서 식별
+  (3) 연구 성과(논문) 도출을 위한 구체적 방법론과 실험 계획 수립
+  (4) 우선순위별 액션 플랜 제시
+
+  배경:
+    v5.3에서 CASDA 합성 데이터가 Detection 성능을 -12.4%~-45.0% 하락시킴.
+    코드 수준 분석을 통해 근본 원인을 정확히 진단하고,
+    연구 성과를 도출할 수 있는 실행 가능한 경로를 식별해야 함.
+
+
+2. 코드베이스 전체 구조
+================================================================================
+
+  2-1. 디렉토리 구조
+  ──────────────────────────────────
+
+    severstal_project/
+    ├── src/                          # 핵심 소스 코드 (24개 파일)
+    │   ├── preprocessing/            # ROI 추출 및 ControlNet 데이터 준비
+    │   │   ├── roi_extraction.py         (340줄)  ROIExtractor
+    │   │   ├── background_extraction.py  (523줄)  BackgroundExtractor
+    │   │   ├── background_library.py     (410줄)  BackgroundLibrary
+    │   │   ├── augmentation_generator.py (471줄)  AugmentationGenerator
+    │   │   ├── hint_generator.py         (297줄)  HintImageGenerator
+    │   │   ├── prompt_generator.py       (330줄)  PromptGenerator
+    │   │   └── controlnet_packager.py    (726줄)  ControlNetDatasetPackager
+    │   ├── analysis/                 # 결함/배경 분석
+    │   │   ├── background_characterization.py (313줄) BackgroundAnalyzer
+    │   │   ├── defect_characterization.py     (230줄) DefectCharacterizer
+    │   │   └── roi_suitability.py             (342줄) ROISuitabilityEvaluator
+    │   ├── training/                 # 데이터셋, 학습, 평가
+    │   │   ├── dataset.py                (778줄) SeverstalDatasets + CASDA
+    │   │   ├── dataset_yolo.py           (435줄) YOLO 형식 변환
+    │   │   ├── trainer.py                (501줄) BenchmarkTrainer (seg)
+    │   │   ├── ultralytics_trainer.py    (409줄) UltralyticsTrainer (det)
+    │   │   └── metrics.py                (564줄) Evaluators + FID
+    │   ├── models/                   # 모델 정의
+    │   │   ├── yolo_mfd.py               (295줄) MEFE + YOLO-MFD
+    │   │   ├── eb_yolov8.py              (141줄) BiFPN + EB-YOLOv8
+    │   │   └── deeplabv3plus.py          (266줄) ASPP + Decoder
+    │   └── utils/                    # 유틸리티
+    │       ├── rle_utils.py              (153줄) RLE 인코딩/디코딩
+    │       └── dataset_validator.py      (432줄) DatasetValidator
+    │
+    ├── scripts/                      # 실행 스크립트 (30개+)
+    │   ├── train_controlnet.py           (1481줄) ControlNet 학습
+    │   ├── test_controlnet.py            (695줄)  이미지 생성
+    │   ├── prepare_controlnet_data.py    (220줄)  데이터 오케스트레이터
+    │   ├── package_casda_data.py         (639줄)  CASDA 패키징
+    │   ├── run_benchmark.py              (1091줄) 벤치마크 실행
+    │   ├── run_validation_phases.py      (2201줄) 4단계 검증
+    │   ├── run_v54_experiments.sh         (190줄) Colab 실행 [v5.4]
+    │   └── verify_bbox_quality.py        (319줄) Bbox 분석 [v5.4]
+    │
+    └── configs/
+        └── benchmark_experiment.yaml     (202줄)  실험 설정
+
+  총 소스 코드: 약 10,400줄 (src 5,700줄 + scripts 4,700줄)
+
+
+  2-2. 소스 파일 요약표
+  ──────────────────────────────────
+
+    | 파일                          | 줄수 | 핵심 클래스/함수               | 역할                    |
+    |-------------------------------|------|-------------------------------|-------------------------|
+    | roi_extraction.py             | 340  | ROIExtractor                  | 결함 ROI 패치 추출       |
+    | background_extraction.py      | 523  | BackgroundExtractor           | 무결함 배경 ROI 추출     |
+    | background_library.py         | 410  | BackgroundLibrary             | 배경 호환성 매트릭스     |
+    | augmentation_generator.py     | 471  | AugmentationGenerator         | 결함 템플릿 합성 (비생성) |
+    | hint_generator.py             | 297  | HintImageGenerator            | 3ch→그레이 힌트 생성     |
+    | prompt_generator.py           | 330  | PromptGenerator               | 텍스트 프롬프트 생성     |
+    | controlnet_packager.py        | 726  | ControlNetDatasetPackager     | 학습 데이터 패키징       |
+    | roi_suitability.py            | 342  | ROISuitabilityEvaluator       | ROI 적합성 점수          |
+    | defect_characterization.py    | 230  | DefectCharacterizer           | 결함 서브타입 분류       |
+    | background_characterization.py| 313  | BackgroundAnalyzer            | 배경 유형 분류           |
+    | dataset.py                    | 778  | CASDA/Severstal Datasets      | PyTorch 데이터셋         |
+    | dataset_yolo.py               | 435  | prepare_yolo_dataset()        | YOLO 형식 변환           |
+    | trainer.py                    | 501  | BenchmarkTrainer              | Segmentation 학습        |
+    | ultralytics_trainer.py        | 409  | UltralyticsTrainer            | Detection 학습           |
+    | metrics.py                    | 564  | FIDCalculator, Evaluators     | 평가 메트릭              |
+    | yolo_mfd.py                   | 295  | MEFE, SobelEdgeExtractor      | 엣지 강화 YOLOv8         |
+    | eb_yolov8.py                  | 141  | BiFPNFuse                     | BiFPN 퓨전 YOLOv8        |
+    | deeplabv3plus.py              | 266  | ASPP, Decoder, DeepLabV3Plus  | 시맨틱 세그멘테이션      |
+    | train_controlnet.py           | 1481 | train(), SteelDefectDataset   | ControlNet 파인튜닝      |
+    | test_controlnet.py            | 695  | generate_single()             | 이미지 생성/추론         |
+    | package_casda_data.py         | 639  | package_data()                | CASDA 포맷 패키징        |
+    | run_benchmark.py              | 1091 | main()                        | 벤치마크 오케스트레이터  |
+    | run_validation_phases.py      | 2201 | 4-phase validation            | 품질 검증 파이프라인     |
+
+
+3. 파이프라인 7단계 상세 맵
+================================================================================
+
+  전체 데이터 흐름:
+
+    Severstal 원본(1600x256)
+      → [1단계] ROI 추출
+      → [2단계] 배경 추출
+      → [3단계] ControlNet 데이터 패키징
+      → [4단계] ControlNet 학습
+      → [5단계] 이미지 생성
+      → [6단계] CASDA 패키징
+      → [7단계] 벤치마크
+
+  ※ 각 단계별 입출력, 핵심 로직, 품질 게이트를 상세 기술
+
+
+  3-1. [1단계] ROI 추출
+  ──────────────────────────────────
+
+    파일: src/preprocessing/roi_extraction.py (340줄)
+    클래스: ROIExtractor
+
+    입력:
+      - Severstal 이미지 (1600x256)
+      - train.csv (RLE 인코딩 마스크)
+
+    처리:
+      1. Pre-indexed DataFrame 구축 → 이미지당 O(1) 조회
+      2. RLE → 이진 마스크 디코딩
+      3. 결함 영역 분석 (DefectCharacterizer)
+      4. 배경 유형 분석 (BackgroundAnalyzer)
+      5. ROI 위치 최적화 (grid search, step=search_radius//4)
+      6. ROI 적합성 평가 (ROISuitabilityEvaluator)
+
+    출력:
+      - ROI 패치 이미지 (256x256 PNG)
+      - ROI 메타데이터 DataFrame
+      - 마스크 패치
+
+    핵심 파라미터:
+      | 파라미터              | 값        | 소스                     |
+      |-----------------------|-----------|--------------------------|
+      | roi_size              | 256       | v5: 512→256 (이미지 높이) |
+      | min_suitability       | 0.5       | roi_extraction.py 기본값 |
+      | search_radius         | 32        | 그리드 탐색 반경          |
+      | min_context_pixels    | 64        | 최소 컨텍스트 영역       |
+      | variance_threshold    | 100.0     | 배경 다양성 임계값       |
+      | edge_threshold        | 0.3       | 엣지 강도 임계값         |
+
+    v5 최적화:
+      - 이미지당 1회 로드 (기존: ROI별 로드)
+      - pre-built index로 O(1) 조회
+      - adaptive ROI sizing: min(roi_size, image_h, image_w)
+
+
+  3-2. [2단계] 배경 추출
+  ──────────────────────────────────
+
+    파일: src/preprocessing/background_extraction.py (523줄)
+    클래스: BackgroundExtractor
+
+    입력:
+      - Severstal 이미지 전체
+      - train.csv (무결함 이미지 식별용)
+
+    처리:
+      1. 무결함 이미지 필터링 (4개 클래스 모두 NaN)
+      2. 배경 다양성 분석 (텍스처, 밝기, 패턴)
+      3. 배경 ROI 선택 (다양성 극대화)
+      4. 호환성 매트릭스 구축 (BackgroundLibrary)
+
+    출력:
+      - 배경 ROI 이미지
+      - 배경 유형별 분류 (5가지: smooth, textured, scratched, stained, mixed)
+
+    관련 파일:
+      - background_library.py (410줄): 배경 호환성 매트릭스
+      - background_characterization.py (313줄): BackgroundType enum, 5유형 분류
+
+
+  3-3. [3단계] ControlNet 데이터 패키징
+  ──────────────────────────────────
+
+    파일: src/preprocessing/controlnet_packager.py (726줄)
+    클래스: ControlNetDatasetPackager
+
+    입력:
+      - ROI 메타데이터 DataFrame (1단계 출력)
+      - ROI 이미지 + 마스크
+
+    처리:
+      1. 엣지 필터 → 이미지 경계 근처 ROI 제거
+      2. 품질 필터 → 저품질 ROI 제거
+      3. 계층화 샘플링 → 클래스별 균형 조정
+      4. 힌트 이미지 생성 (HintImageGenerator)
+      5. 텍스트 프롬프트 생성 (PromptGenerator)
+      6. train.jsonl + metadata.json 출력
+
+    출력:
+      - target/ (ROI 이미지 → VAE 인코딩 대상)
+      - hint/ (3ch 그레이스케일 조건 이미지)
+      - train.jsonl (target, hint, prompt, negative_prompt)
+      - metadata.json (통계)
+
+    ※ 품질 게이트 3개 (이 단계에서 가장 많은 필터링 수행):
+
+      | 게이트         | 필터              | 임계값                         |
+      |----------------|-------------------|-------------------------------|
+      | 엣지 필터      | 경계 거리 검사    | x=10%, y=5% 마진              |
+      |                | 희소 클래스 예외  | 잔여수<50 → 마진 2%로 완화     |
+      | 품질 필터      | 최소 결함 면적    | min_area ≥ 100px              |
+      |                | 안정성 점수      | stability ≥ 0.3               |
+      |                | 매칭 점수        | matching ≥ 0.5                |
+      |                | 추천 등급        | suitable 또는 acceptable      |
+      | 계층화 샘플링  | 클래스별 상한    | per_class_cap (v5.2)          |
+      |                | 희소 클래스 보호  | 잔여수<200 → cap 면제          |
+
+
+  3-4. [3-보조] 힌트 이미지 생성
+  ──────────────────────────────────
+
+    파일: src/preprocessing/hint_generator.py (297줄)
+    클래스: HintImageGenerator
+
+    3채널 힌트 설계:
+      | 채널 | 내용                    | 가중치 |
+      |------|------------------------|--------|
+      | Red  | 결함 마스크 + 4지표 강화 | 0.5    |
+      | Green| Sobel 배경 구조선       | 0.3    |
+      | Blue | 로컬 분산 텍스처       | 0.2    |
+
+    최종 변환: 3ch → 가중 그레이스케일 (R*0.5 + G*0.3 + B*0.2)
+    출력: 동일 값의 3채널 그레이스케일 이미지
+
+    설계 의도:
+      - RGB 컬러 신호 제거 → ControlNet의 색상 단축 학습 방지
+      - 결함 위치(R)에 가장 높은 가중치 → 위치 정보 보존
+      - 배경 구조(G) + 텍스처(B) → 자연스러운 생성 유도
+
+    Red 채널 4지표 강화:
+      - 스켈레톤 강화 (linearity > 0.7 → 중심선 강조)
+      - 채워진 마스크 (solidity > 0.8 → 전체 영역)
+      - 기본 강도: 200
+      - 면적, 종횡비, 밀도 기반 적응적 처리
+
+
+  3-5. [3-보조] 적합성 점수 체계
+  ──────────────────────────────────
+
+    파일: src/analysis/roi_suitability.py (342줄)
+    클래스: ROISuitabilityEvaluator
+
+    적합성 점수 공식:
+      suitability = 0.5 * matching + 0.3 * continuity + 0.2 * stability
+
+      | 요소       | 가중치 | 의미                                    |
+      |------------|--------|-----------------------------------------|
+      | matching   | 0.5    | 결함 서브타입-배경 유형 호환성 (0.3~1.0) |
+      | continuity | 0.3    | ROI 경계에서의 배경 연속성               |
+      | stability  | 0.2    | 결함 마스크의 형태 안정성                |
+
+    추천 등급:
+      | 등급         | 점수 범위 |
+      |-------------|-----------|
+      | suitable    | ≥ 0.70    |
+      | acceptable  | ≥ 0.50    |
+      | unsuitable  | < 0.50    |
+
+    매칭 규칙:
+      - 5개 결함 서브타입 x 5개 배경 유형 = 25개 조합
+      - 각 조합에 0.3~1.0 사이 점수 사전 정의
+
+
+  3-6. [4단계] ControlNet 학습
+  ──────────────────────────────────
+
+    파일: scripts/train_controlnet.py (1481줄)
+    데이터셋: SteelDefectControlNetDataset
+
+    아키텍처:
+      - 기반: Stable Diffusion v1.5 (runwayml/stable-diffusion-v1-5)
+      - ControlNet: lllyasviel/sd-controlnet-canny 초기화
+      - 학습 대상: ControlNet만 (SD UNet/VAE 동결)
+
+    핵심 하이퍼파라미터:
+      | 파라미터                  | 값            | 비고                     |
+      |--------------------------|---------------|--------------------------|
+      | resolution               | 512           | 고정                     |
+      | batch_size               | 1             | GPU 메모리 제약          |
+      | gradient_accumulation    | 4             | 실효 배치=4              |
+      | learning_rate            | 1e-5          |                          |
+      | lr_scheduler             | cosine        |                          |
+      | warmup_steps             | 50 (or 5%)   | auto-clamp: 총 스텝의 5% |
+      | max_grad_norm            | 1.0           |                          |
+      | snr_gamma                | 5.0           | Min-SNR 가중치           |
+      | conditioning_scale       | 1.0           | 학습 시 (추론과 다름!)   |
+      | early_stopping_patience  | 20            |                          |
+      | force_grayscale_target   | True          | B1 그레이 강제           |
+      | max_nan_tolerance        | 10            |                          |
+
+    학습 루프:
+      1. train.jsonl → target(VAE) + hint(ControlNet) + prompt(CLIP)
+      2. VAE 인코딩 → latent
+      3. 랜덤 노이즈 추가 (diffusion timestep)
+      4. ControlNet forward (fp32, autocast 밖) → down_blocks + mid_block
+      5. UNet forward (fp16 autocast) → 노이즈 예측
+      6. MSE loss + Min-SNR 가중치 (+ optional gray_loss)
+      7. GradScaler backward → optimizer step
+
+    8가지 안정성 패치 (코드 내 문서화):
+      (1) 동결 모델(UNet, VAE)만 mixed precision
+      (2) ControlNet 항상 fp32
+      (3) 데이터 정상성 검사 (NaN/Inf 감지)
+      (4) Warmup 자동 클램핑 (총 스텝의 5%)
+      (5) GradScaler fp16 지원
+      (6) NaN loss 탐지 → 3회 발생마다 LR 절반
+      (7) 그래디언트 NaN 검사 → skip step
+      (8) ControlNet forward를 autocast 밖에서 실행
+
+    v5.3 학습 결과:
+      - 14,480 steps, 20 epochs, 2,880 학습 샘플
+      - 최종 loss: 0.075 (v5.1의 0.088 대비 -14.7%)
+      - 수렴: epoch 3 이후 0.076~0.088 범위 진동
+
+
+  3-7. [5단계] 이미지 생성
+  ──────────────────────────────────
+
+    파일: scripts/test_controlnet.py (695줄)
+
+    추론 파라미터:
+      | 파라미터                       | 값    | 비고                     |
+      |-------------------------------|-------|--------------------------|
+      | num_inference_steps            | 30    | UniPCMultistep 스케줄러  |
+      | guidance_scale                 | 7.5   |                          |
+      | controlnet_conditioning_scale  | 0.7   | 학습(1.0)보다 약화       |
+      | resolution                     | 512   | 고정                     |
+      | grayscale_postprocess          | True  |                          |
+      | seed                           | 42    |                          |
+
+    기능:
+      - 단일 이미지 생성 / JSONL 배치 생성
+      - v5.2 클래스별 다중 생성: {"1":2, "2":10, "3":1, "4":2}
+      - 비교 그리드 생성 (원본 vs 힌트 vs 생성)
+      - fp16/reference JSON 자동 감지
+
+    데이터 흐름:
+      모델 로드 → 힌트 이미지 + 프롬프트
+        → SD ControlNet 파이프라인 추론 (30 스텝)
+        → 그레이스케일 후처리
+        → 생성 이미지 저장 + 비교 그리드 + summary.json
+
+
+  3-8. [6단계] CASDA 패키징
+  ──────────────────────────────────
+
+    파일: scripts/package_casda_data.py (639줄)
+
+    입력:
+      - 생성된 이미지 (5단계 출력)
+      - 힌트 이미지 (마스크 추출용)
+      - 품질 맵 (suitability 점수)
+
+    처리:
+      1. 생성 이미지를 벤치마크 형식으로 복사
+      2. 힌트 Red 채널에서 마스크 추출 (threshold=127)
+      3. 마스크 → contour → boundingRect로 YOLO bbox 생성
+      4. metadata.json 생성 (경로, 클래스, 점수, bbox)
+      5. casda_full/ (전체) + casda_pruning/ (필터링) 2벌 출력
+
+    출력:
+      casda_full/
+      ├── images/         # 생성 이미지 전체
+      ├── masks/          # 추출된 마스크
+      └── metadata.json   # 메타데이터
+      casda_pruning/
+      ├── images/         # suitability 필터링된 이미지
+      ├── masks/
+      └── metadata.json
+
+    metadata.json 레코드:
+      {
+        "image_path": "images/xxx.png",
+        "class_id": 0,              // 0-indexed
+        "suitability_score": 0.72,
+        "mask_path": "masks/xxx.png",
+        "bboxes": [[cx, cy, w, h]], // YOLO 정규화
+        "labels": [0],
+        "bbox_format": "yolo",
+        "image_width": 512,
+        "image_height": 512
+      }
+
+    핵심 품질 게이트:
+      | 게이트              | 임계값                       |
+      |--------------------|------------------------------|
+      | 마스크 이진화       | pixel > 127                  |
+      | 최소 bbox 면적      | bw * bh ≥ 16px              |
+      | Pruning 적합성      | suitability ≥ 0.63 (P50)    |
+      | Pruning top-k       | 2,000                        |
+      | 계층화 Pruning      | 클래스 비례 할당 (v5.2)      |
+
+    ※ 핵심 병목:
+      bbox가 mask→contour→boundingRect로 자동 생성됨.
+      힌트 Red 채널에서 추출한 마스크는 원본 결함 마스크의 근사치이며,
+      생성 과정에서 왜곡될 수 있음 → Detection bbox 부정확의 원인.
+
+
+  3-9. [7단계] 벤치마크
+  ──────────────────────────────────
+
+    파일: scripts/run_benchmark.py (1091줄)
+
+    실험 매트릭스:
+      3 모델 x 4 데이터셋 그룹 = 12회 (+ v5.4 ratio 그룹)
+
+    데이터셋 그룹:
+      | 그룹            | 원본  | 합성      | 전통 증강 | 설명                       |
+      |-----------------|-------|-----------|-----------|----------------------------|
+      | baseline_raw    | O     | X         | X         | 원본만                     |
+      | baseline_trad   | O     | X         | O         | 원본 + Albumentations      |
+      | casda_full      | O     | 전체      | X         | 원본 + CASDA 전체          |
+      | casda_pruning   | O     | 필터링    | X         | 원본 + CASDA Pruning       |
+      | casda_ratio_N   | O     | N%        | X         | 원본 + CASDA N% [v5.4]    |
+
+    모델별 학습 경로:
+
+      Detection (EB-YOLOv8, YOLO-MFD):
+        1. prepare_yolo_dataset() → YOLO 디렉토리 구조
+        2. inject_casda_to_baseline() → CASDA 이미지/라벨 주입
+        3. UltralyticsTrainer → ultralytics .train()/.val()
+        4. clean → casda_ prefix 파일 제거 → 다음 그룹 전환
+
+      Segmentation (DeepLabV3+):
+        1. create_data_loaders() → PyTorch DataLoader
+        2. CASDA: ConcatDataset(원본, CASDASyntheticDataset)
+        3. BenchmarkTrainer → 커스텀 학습 루프 (AMP, warmup, early stopping)
+
+    FID 평가:
+      - InceptionV3 (2048-dim features)
+      - 이미지 299x299 리사이즈, ImageNet 정규화
+      - 최대 1,000장 캡 (per set)
+      - 클래스별 FID 지원
+
+    CASDA 주입 로직 (inject_casda_to_baseline):
+      - CASDA 이미지를 "casda_" prefix로 train/ 디렉토리에 복사
+      - 라벨도 동일하게 복사
+      - v5.4: max_samples, suitability_threshold 파라미터 추가
+      - 그룹 전환 시 "casda_" prefix 파일 자동 제거 (clean)
+
+
+  3-10. [7-보조] 데이터셋 구현 상세
+  ──────────────────────────────────
+
+    CASDASyntheticDataset (dataset.py L352~):
+      - metadata.json 또는 annotations.csv 또는 파일명 스캔
+      - suitability_threshold 필터링 (config: ≥ 0.60)
+      - suitability 내림차순 정렬 → top_k 선택 (config: 2,000)
+      - Detection/Segmentation 모드 지원
+      - 방어적 마스크 리사이즈 (256x256 ↔ 512x512 불일치 대응)
+      - bbox 없으면 full-image bbox 폴백
+      - 최소 bbox 면적: 16px²
+
+    YOLO 데이터셋 (_add_casda_to_training, dataset_yolo.py):
+      - 3가지 bbox 포맷 지원:
+        (1) yolo: 정규화 [cx, cy, w, h] → 직접 기록 (v5.1+, cv2 불필요)
+        (2) xyxy: 픽셀 좌표 → cv2.imread로 정규화
+        (3) mask_path 폴백: contour 추출, full-image 최후 수단
+      - tiny bbox 필터: bw * bh < 16 → skip
+
+
+4. 품질 게이트 전체 맵
+================================================================================
+
+  전체 파이프라인에 걸친 품질 게이트를 한눈에 정리:
+
+  | # | 단계           | 게이트              | 위치                        | 임계값                      |
+  |---|----------------|---------------------|-----------------------------|-----------------------------|
+  | 1 | ROI 추출       | 최소 적합성         | roi_extraction.py           | suitability ≥ 0.50          |
+  | 2 | ROI 추출       | 컨텍스트 영역       | roi_extraction.py           | min_context ≥ 64px          |
+  | 3 | 데이터 패키징  | 엣지 필터           | controlnet_packager.py L44  | x=10%, y=5% 마진            |
+  | 4 | 데이터 패키징  | 최소 결함 면적      | controlnet_packager.py L164 | area ≥ 100px                |
+  | 5 | 데이터 패키징  | 안정성 점수         | controlnet_packager.py L164 | stability ≥ 0.3             |
+  | 6 | 데이터 패키징  | 매칭 점수           | controlnet_packager.py L164 | matching ≥ 0.5              |
+  | 7 | 데이터 패키징  | 계층화 샘플링       | controlnet_packager.py      | per_class_cap (v5.2)        |
+  | 8 | CASDA 패키징   | 마스크 이진화       | package_casda_data.py       | pixel > 127                 |
+  | 9 | CASDA 패키징   | 최소 bbox           | package_casda_data.py       | bw*bh ≥ 16px               |
+  |10 | CASDA 패키징   | 적합성 Pruning      | package_casda_data.py       | suitability ≥ 0.63          |
+  |11 | CASDA 패키징   | Top-K               | package_casda_data.py       | 2,000장                     |
+  |12 | 벤치마크 데이터 | 적합성 필터         | dataset.py L352             | suitability ≥ 0.60          |
+  |13 | 벤치마크 데이터 | Top-K               | dataset.py L361             | 2,000장                     |
+  |14 | YOLO 데이터    | Tiny bbox 필터      | dataset_yolo.py L134,423    | bw*bh < 16 → skip          |
+  |15 | 벤치마크 평가  | FID 이미지 캡       | run_benchmark.py L544       | 1,000장/세트                |
+
+  ※ 총 15개 품질 게이트가 6개 파일에 분산
+  ※ #10~#13에서 suitability 임계값 불일치: 0.63 vs 0.60 (패키징 vs 데이터셋)
+
+
+5. 현재 병목 및 한계 — 코드 수준 분석
+================================================================================
+
+  5-1. [치명적] Detection bbox 품질 문제 (근본 원인 A)
+  ──────────────────────────────────
+
+    위치: package_casda_data.py → extract_mask_from_hint()
+
+    문제 경로:
+      원본 마스크 → hint Red채널 (가중치 0.5) → 그레이스케일 변환
+        → 생성 이미지 (ControlNet이 재해석)
+        → 힌트 Red채널에서 마스크 역추출 (threshold=127)
+        → contour → boundingRect → YOLO bbox
+
+    손실 체인:
+      (1) hint 생성 시: 원본 마스크 → R*0.5 가중 → 정보 손실
+      (2) 그레이스케일 변환: R*0.5+G*0.3+B*0.2 → 채널 혼합
+      (3) ControlNet 생성: 힌트를 "참고"만 하므로 결함 영역 왜곡 가능
+      (4) 마스크 역추출: 힌트에서 추출 (생성 이미지가 아닌 원본 힌트 사용)
+
+    실제 영향:
+      - Detection은 bbox 정밀도에 직접 의존
+      - 마스크→bbox 변환 시 경계 확장/축소 가능
+      - full-image bbox 폴백이 발생하면 전체 이미지를 bbox로 사용
+      - v5.3에서 EB-YOLOv8 CASDA-Pruning mAP 0.063 (사실상 전멸)
+
+    ※ 단, 힌트에서 마스크를 추출하므로 "생성 이미지와 마스크의 불일치" 문제는
+       일부 완화됨 (생성 이미지의 실제 결함 위치 ≠ 힌트 마스크 위치일 수 있음)
+
+
+  5-2. [치명적] FID 156 — 합성/실제 분포 격차 (근본 원인 B)
+  ──────────────────────────────────
+
+    위치: train_controlnet.py
+
+    현재 한계:
+      - SD v1.5 + ControlNet (canny init) 기반
+      - resolution=512 고정 (원본 1600x256과 종횡비 불일치)
+      - batch_size=1, gradient_accumulation=4 (실효 배치 4)
+      - epoch 3 이후 loss 수렴 정체 (0.076~0.088)
+      - v5.1→v5.3: 학습 데이터 +44% 증가에도 FID 165→156 (-5.5%만 개선)
+
+    구조적 한계:
+      - SD v1.5의 생성 품질 천장
+      - 512x512 정사각형 vs 1600x256 직사각형 도메인 갭
+      - 그레이스케일 강제로 색상 정보 소실 (강철 이미지에 적합하나 정보 제한)
+      - conditioning_scale: 학습=1.0 vs 추론=0.7 불일치
+
+    FID 개선 방향:
+      - SD 2.1 / SDXL 업그레이드 (생성 품질 근본 개선)
+      - 학습 데이터 품질 개선 (양보다 질)
+      - 추론 파라미터 최적화 (이미 validation_phases.py에 sweep 구현)
+
+
+  5-3. [주요] 합성 데이터 비율 문제 (근본 원인 C)
+  ──────────────────────────────────
+
+    위치: run_benchmark.py, dataset.py, dataset_yolo.py
+
+    현재 상태:
+      - CASDA-Full: 원본 4,666 + 합성 4,744 = 50:50 비율
+      - 합성 품질(FID 156)에 비해 과도한 비율
+      - val/test는 원본만 → 학습 분포와 평가 분포의 괴리
+
+    v5.4 개선 (구현 완료, 실행 대기):
+      - --casda-ratio CLI로 10%, 20%, 30% 비율 실험 가능
+      - max_samples = 원본수 * ratio / (1 - ratio)
+      - suitability 순 상위 선택 (품질 보장)
+
+
+  5-4. [주요] YOLO-MFD 합성 데이터 취약성 (근본 원인 D)
+  ──────────────────────────────────
+
+    위치: src/models/yolo_mfd.py
+
+    MEFE 모듈 구조:
+      입력 feature → SobelEdgeExtractor (그레이 변환 + Sobel 커널)
+        → 4개 병렬 브랜치 (1x1, 3x3, 5x5, 3x3 dilated)
+        → concatenate → 1x1 퓨전
+        → 채널 어텐션 게이트 (AvgPool → FC → Sigmoid)
+        → element-wise multiply
+
+    MEFE가 합성에 취약한 이유:
+      - Sobel 엣지 추출이 합성 이미지의 엣지 분포 차이에 민감
+      - 원본: 실제 금속 결함의 자연스러운 엣지 패턴
+      - 합성: ControlNet이 재구성한 엣지 → 미세하게 다른 주파수 특성
+      - 멀티스케일 엣지 강화가 이 차이를 증폭
+      - v5.3: YOLO-MFD -45% vs EB-YOLOv8 -12.4% (3.6배 차이)
+
+    EB-YOLOv8이 상대적으로 견딘 이유:
+      - BiFPN(양방향 피처 퓨전)이 다양한 스케일 정보를 혼합
+      - 엣지 특화가 아닌 범용 피처 퓨전 → 노이즈에 덜 민감
+
+
+  5-5. [보통] Suitability 임계값 불일치
+  ──────────────────────────────────
+
+    | 위치                    | 임계값 | 용도                    |
+    |------------------------|--------|------------------------|
+    | package_casda_data.py  | 0.63   | Pruning 패키징          |
+    | dataset.py             | 0.60   | 데이터 로딩 필터링      |
+    | benchmark_experiment.yaml| 0.60 | 설정 파일               |
+    | roi_extraction.py      | 0.50   | ROI 추출 최소 기준      |
+
+    → 패키징(0.63)과 데이터셋(0.60) 사이 0.03 차이
+    → casda_pruning은 이미 0.63으로 필터링된 데이터이므로
+       데이터셋의 0.60 필터는 무의미 (이미 통과)
+    → casda_full은 0.63 미만 데이터도 포함 → 데이터셋에서 0.60 필터 적용
+    → 실질적 영향은 미미하나, 일관성 부족
+
+
+  5-6. [보통] conditioning_scale 학습/추론 불일치
+  ──────────────────────────────────
+
+    | 단계 | conditioning_scale | 위치                  |
+    |------|--------------------|-----------------------|
+    | 학습 | 1.0                | train_controlnet.py   |
+    | 추론 | 0.7                | test_controlnet.py    |
+
+    → 학습 시 ControlNet 조건 100% 반영으로 학습했으나,
+       추론 시 70%만 반영하여 생성
+    → 의도: 추론 시 SD의 자연스러운 생성 능력을 더 활용
+    → 부작용: 학습된 조건-생성 매핑과 추론 시 매핑이 다를 수 있음
+
+
+  5-7. [보통] baseline_trad 미실행
+  ──────────────────────────────────
+
+    위치: configs/benchmark_experiment.yaml L53-66
+
+    구현 완료:
+      horizontal_flip: 0.5
+      vertical_flip: 0.3
+      rotation_limit: 15
+      scale_range: [0.8, 1.2]
+      brightness_limit: 0.2
+      contrast_limit: 0.2
+
+    → H1 가설 "CASDA > Traditional Augmentation" 검증 불가
+    → 전통 증강이 CASDA보다 우수할 가능성이 높음 (FID 0)
+    → v5.4 Phase 1에서 실행 예정
+
+
+6. 연구 성과 도출을 위한 방법론
+================================================================================
+
+  연구 질문: "CASDA 합성 데이터 증강이 철강 결함 검출/분할 성능을 개선하는가?"
+
+  현재 답변: "Detection에서는 오히려 해롭고(-12%~-45%), Segmentation에서는 중립적"
+
+  이 결과를 연구 성과로 전환하기 위한 3가지 전략:
+
+
+  6-1. 전략 A: 부정적 결과의 학술적 가치 극대화
+  ──────────────────────────────────
+
+    핵심 논점:
+      "합성 데이터 증강이 항상 도움이 되는 것은 아니다"는 중요한 발견.
+      특히 Detection vs Segmentation에서의 비대칭 효과는 학술적 가치가 있음.
+
+    필요 실험:
+      (1) baseline_trad 실행 → CASDA vs 전통 증강 정량 비교
+      (2) CASDA ratio 실험 → 비율에 따른 성능 곡선
+      (3) Bbox 품질 분석 → Detection 실패의 구체적 원인 규명
+      (4) 생성 이미지 시각적 분석 → FID 156이 의미하는 시각적 차이
+
+    논문 프레임:
+      - "When Does Synthetic Data Hurt? A Benchmark Study of
+        ControlNet-based Augmentation for Steel Defect Detection"
+      - 기여: (1) CASDA 벤치마크 프레임워크, (2) Detection vs Segmentation
+        비대칭 발견, (3) 합성 데이터 비율의 임계 효과, (4) 실패 분석
+
+    장점: 현재 데이터만으로 충분히 의미 있는 논문 가능
+    단점: "개선"이 아닌 "분석" 논문이므로 임팩트 제한적
+
+
+  6-2. 전략 B: 합성 비율 최적화를 통한 성능 개선 입증
+  ──────────────────────────────────
+
+    핵심 가설:
+      "소량(10~20%) 고품질 합성 데이터는 Baseline보다 우수할 수 있다"
+
+    필요 실험:
+      (1) CASDA ratio 10%, 20%, 30% (v5.4 코드 준비 완료)
+      (2) ratio x suitability_threshold grid search
+      (3) 최적 조합에서 Baseline 대비 개선 여부 확인
+      (4) 모든 3 모델에서 일관된 결과 도출
+
+    성공 시나리오:
+      - 10% ratio + suitability ≥ 0.70 에서 Baseline 대비 +1~3% 개선
+      - "적은 양의 고품질 합성이 핵심" 메시지
+      - Detection에서도 소폭 개선 입증 가능
+
+    실패 시나리오:
+      - 어떤 비율에서도 Baseline을 넘지 못함
+      - → 전략 A로 전환 (부정적 결과 논문)
+
+    장점: 양성 결과 도출 가능성 존재
+    단점: 성공 보장 없음, FID 156에서 Detection 개선은 난이도 높음
+
+
+  6-3. 전략 C: ControlNet 품질 개선 + 벤치마크 재실행
+  ──────────────────────────────────
+
+    핵심 목표:
+      FID 156 → FID < 100 → Detection 성능 개선
+
+    필요 작업:
+      (1) SD 2.1 또는 SDXL로 기반 모델 업그레이드
+      (2) 학습 데이터 품질 개선 (필터링 강화, 데이터 정제)
+      (3) 추론 파라미터 최적화 (validation_phases.py 결과 활용)
+      (4) 전체 벤치마크 재실행
+
+    장점: 근본적 품질 개선 → 가장 강력한 논문
+    단점: 대규모 작업 (SD 업그레이드, 재학습, 재평가), Colab 시간 소요 큼
+
+
+  6-4. 전략 선택 권고
+  ──────────────────────────────────
+
+    권장 순서: B → A → (선택적) C
+
+    이유:
+      1. 전략 B는 v5.4 코드가 이미 준비되어 즉시 실행 가능
+      2. B 성공 시: 양성 결과 + 비율 최적화 분석 → 강력한 논문
+      3. B 실패 시: 비율 곡선 데이터 자체가 A의 핵심 증거
+      4. A + B 조합이 가장 현실적이고 포괄적인 논문 구성
+      5. C는 시간/리소스 고려 시 후속 연구로 분리
+
+    최소 요구 실험 (논문 완성도):
+      | 실험                         | 목적             | 상태    |
+      |-----------------------------|------------------|---------|
+      | baseline_trad               | H1 검증          | 미실행  |
+      | CASDA ratio 10/20/30%       | 비율 최적화      | 미실행  |
+      | Bbox 품질 분석              | 실패 원인 규명   | 미실행  |
+      | YOLO-MFD Pruning 재실행     | 결측 데이터 보완  | 미실행  |
+
+
+7. 구체적 실험 계획
+================================================================================
+
+  7-1. Phase 0: Bbox 품질 검증 (GPU 불필요)
+  ──────────────────────────────────
+
+    스크립트: scripts/verify_bbox_quality.py (v5.4 신규)
+    소요: ~10분
+
+    분석 항목:
+      (1) 원본 vs 합성 bbox 크기 분포 비교 (w, h)
+      (2) Aspect ratio 분포 차이
+      (3) Full-image fallback 비율 (bbox가 이미지 95%+ 차지)
+      (4) 이상치 비율 (>80% 면적 또는 <0.1% 면적)
+      (5) 클래스별 비교
+
+    기대 결과:
+      - 합성 bbox가 원본 대비 얼마나 다른지 정량화
+      - full-image fallback 빈도 확인
+      - Detection 실패의 bbox 요인 분리
+
+    의사결정:
+      - fallback 비율 > 10%: bbox 추출 로직 개선 필요
+      - 크기 분포 현저히 다름: bbox 필터 추가 또는 재추출 필요
+      - 문제 없음: bbox는 원인 아님 → FID/비율에 집중
+
+
+  7-2. Phase 1: baseline_trad 실행 (GPU 필요)
+  ──────────────────────────────────
+
+    스크립트: run_v54_experiments.sh phase1
+    모델: 3개 (EB-YOLOv8, YOLO-MFD, DeepLabV3+)
+    소요: ~8시간 (3모델 순차)
+
+    실험:
+      원본 + 전통 증강 (flip, rotation, scale, brightness, contrast)
+
+    기대 결과:
+      | 모델        | Baseline(Raw) | baseline_trad 예상   |
+      |-------------|:-------------:|:--------------------:|
+      | EB-YOLOv8   | 0.5819        | 0.58~0.62            |
+      | YOLO-MFD    | 0.5546        | 0.55~0.59            |
+      | DeepLabV3+  | 0.6290        | 0.63~0.66            |
+
+    의의:
+      - H1 가설 검증: CASDA vs Traditional
+      - 전통 증강이 CASDA-Full보다 우수 → CASDA의 한계 입증
+      - 전통 증강 < CASDA 일부 → CASDA의 부분적 가치 입증
+
+
+  7-3. Phase 2: CASDA ratio 실험 (GPU 필요)
+  ──────────────────────────────────
+
+    스크립트: run_v54_experiments.sh phase2
+    모델: 3개 x 3 비율 = 9 실험
+    소요: ~20시간
+
+    비율 설계:
+      | Ratio | 합성 수 | 전체 수 | 계산                  |
+      |-------|---------|---------|------------------------|
+      | 10%   | ~518    | ~5,184  | 4666 * 0.1 / 0.9      |
+      | 20%   | ~1,167  | ~5,833  | 4666 * 0.2 / 0.8      |
+      | 30%   | ~2,000  | ~6,666  | 4666 * 0.3 / 0.7      |
+
+    선택 방식: suitability 점수 내림차순 상위 N개
+    (casda_full 데이터에서 선택, pruning_top_k = max_samples)
+
+    기대 결과:
+      - ratio 증가에 따른 성능 변화 곡선
+      - Detection: 낮은 ratio에서 Baseline에 근접 가능
+      - Segmentation: 소폭 개선 가능
+
+    핵심 관측 포인트:
+      (1) Baseline 대비 양수 변화가 발생하는 비율이 있는가?
+      (2) 성능 곡선이 단조 감소인가, 비단조인가?
+      (3) 모델별 최적 비율이 다른가?
+
+
+  7-4. Phase 3: YOLO-MFD Pruning 재실행 (GPU 필요)
+  ──────────────────────────────────
+
+    스크립트: run_v54_experiments.sh phase3
+    소요: ~2시간
+
+    v5.3 실패 원인: PytorchStreamReader → 체크포인트 손상
+    대응: 체크포인트 저장 경로 변경 (로컬 디스크)
+
+    필요성: 실험 매트릭스 결측 데이터 보완
+
+
+  7-5. Phase 4 (선택): Grid Search
+  ──────────────────────────────────
+
+    Phase 2에서 유망한 비율 발견 시:
+      - ratio: [최적-5%, 최적, 최적+5%]
+      - suitability_threshold: [0.55, 0.60, 0.65, 0.70]
+      - 3 x 4 x 3 모델 = 36 실험
+
+    Phase 2에서 전 비율 하락 시:
+      - Grid Search 스킵 → 전략 A로 전환
+
+
+8. 논문 구성안
+================================================================================
+
+  제목 (안):
+    "CASDA: Context-Aware Synthetic Defect Augmentation —
+     A ControlNet-based Benchmark for Steel Defect Detection"
+
+  8-1. 논문 뼈대 (전략 A+B 혼합)
+  ──────────────────────────────────
+
+    1. Introduction
+       - 산업 결함 검출에서 데이터 부족 문제
+       - 생성 AI 기반 데이터 증강의 가능성과 한계
+       - 연구 질문: ControlNet 합성 데이터가 Detection/Segmentation에 미치는 영향
+
+    2. Related Work
+       - Steel defect detection (YOLO variants, DeepLab)
+       - Synthetic data augmentation (GAN, Diffusion-based)
+       - ControlNet for domain-specific generation
+
+    3. CASDA Framework
+       - 7단계 파이프라인 아키텍처
+       - 힌트 이미지 설계 (3ch→그레이)
+       - 적합성 점수 체계
+       - 품질 게이트 시스템
+
+    4. Experimental Setup
+       - Severstal Steel Defect Detection Dataset
+       - 3 모델: YOLO-MFD, EB-YOLOv8, DeepLabV3+
+       - 4+ 데이터셋 그룹: Raw, Trad, CASDA-Full, CASDA-Ratio variants
+       - 평가 지표: mAP@0.5, Dice, FID
+
+    5. Results
+       - Baseline vs CASDA 비교 (표 + 그래프)
+       - 비율별 성능 곡선
+       - 클래스별 분석
+       - Detection vs Segmentation 비대칭
+
+    6. Analysis & Discussion
+       - 합성 데이터가 해로운 조건 분석
+       - FID와 다운스트림 성능의 관계
+       - MEFE vs BiFPN의 합성 데이터 견딤성
+       - 비율 최적화의 중요성
+
+    7. Conclusion
+       - CASDA 프레임워크 기여
+       - 합성 데이터의 양날의 검 성격
+       - 실용적 가이드라인 (비율, 품질 임계값)
+
+
+  8-2. 논문에 필요한 최소 실험 결과
+  ──────────────────────────────────
+
+    | 결과                           | 상태     | 중요도 |
+    |-------------------------------|----------|--------|
+    | Baseline(Raw) 3모델           | 완료     | 필수   |
+    | CASDA-Full 3모델              | 완료     | 필수   |
+    | CASDA-Pruning 3모델           | 2/3 완료 | 필수   |
+    | baseline_trad 3모델           | 미실행   | 필수   |
+    | CASDA ratio 10/20/30%         | 미실행   | 강력 권장 |
+    | Bbox 품질 분석                | 미실행   | 권장   |
+    | FID 분석 (클래스별)           | 완료     | 필수   |
+    | 생성 이미지 시각적 비교        | 미수행   | 권장   |
+    | YOLO-MFD Pruning 재실행       | 미실행   | 필수   |
+
+
+9. 우선순위별 액션 플랜
+================================================================================
+
+  9-1. P0 — 즉시 실행 (논문 필수)
+  ──────────────────────────────────
+
+    [ ] Phase 0: Bbox 품질 검증 (로컬, ~10분)
+        → 스크립트 준비 완료: scripts/verify_bbox_quality.py
+        → 결과에 따라 Phase 2 전략 조정
+
+    [ ] Phase 1: baseline_trad 실행 (Colab, ~8시간)
+        → 스크립트 준비 완료: run_v54_experiments.sh phase1
+        → H1 가설 검증
+
+    [ ] Phase 2: CASDA ratio 10/20/30% (Colab, ~20시간)
+        → 코드 준비 완료: --casda-ratio CLI
+        → 비율-성능 곡선 도출
+
+    [ ] Phase 3: YOLO-MFD Pruning 재실행 (Colab, ~2시간)
+        → 체크포인트 경로 변경 필요
+
+    소요 예상: Colab ~30시간 (Phase 1-3 합계)
+
+
+  9-2. P1 — 결과 분석 (Phase 0~3 완료 후)
+  ──────────────────────────────────
+
+    [ ] 비율별 성능 곡선 그래프 생성
+    [ ] 전체 실험 결과 통합 표 작성
+    [ ] 생성 이미지 시각적 비교 grid 생성
+    [ ] 통계적 유의성 검정 (가능하면)
+    [ ] 가설 H1~H5 재검증
+
+
+  9-3. P2 — 추가 최적화 (선택적)
+  ──────────────────────────────────
+
+    [ ] Phase 4: ratio x threshold grid search
+    [ ] conditioning_scale 학습/추론 통일 실험
+    [ ] 클래스별 최적 비율 차별화
+
+  9-4. P3 — 논문 작성
+  ──────────────────────────────────
+
+    [ ] 논문 뼈대 작성 (Introduction~Conclusion)
+    [ ] 실험 결과 표/그래프 삽입
+    [ ] 분석/토론 섹션 완성
+    [ ] 관련 연구 조사 및 비교
+
+
+10. 핵심 발견 요약
+================================================================================
+
+  10-1. 코드베이스 분석으로 식별된 근본 원인 4가지
+  ──────────────────────────────────
+
+    (A) Bbox 품질: mask→hint→그레이→역추출→contour→bbox 체인에서 정보 손실
+    (B) FID 156: SD v1.5 + 512x512 정사각 → 1600x256 직사각 도메인 갭
+    (C) 50:50 비율: 저품질 합성이 절반 → 원본 패턴 희석
+    (D) MEFE 취약: Sobel 엣지 기반 모듈이 합성 엣지 차이에 과민
+
+  10-2. 가장 실행 가능한 개선 경로
+  ──────────────────────────────────
+
+    단기 (코드 준비 완료, Colab 실행만 필요):
+      → CASDA ratio 실험 (10/20/30%)
+      → baseline_trad 실행
+      → Bbox 품질 검증
+
+    중기 (코드 수정 필요):
+      → conditioning_scale 통일
+      → suitability 임계값 일관화
+      → 클래스별 비율 차별화
+
+    장기 (아키텍처 변경 필요):
+      → SD 2.1/SDXL 업그레이드
+      → 종횡비 적응형 학습 (1600x256)
+      → 생성 이미지에서 직접 마스크 추출 (bbox 품질 근본 해결)
+
+  10-3. 논문 전략 권고
+  ──────────────────────────────────
+
+    전략 B(비율 최적화) + 전략 A(부정적 결과 분석) 병행이 최적.
+    v5.4 코드 준비 완료 → Colab 30시간으로 논문 필수 데이터 확보 가능.
+    핵심 메시지: "합성 데이터 증강의 효과는 비율, 품질, 모델 아키텍처에 따라
+    극적으로 달라진다 — Detection에서는 소량 고품질이 핵심이다."
+
+
+11. 파일 출처 정리
+================================================================================
+
+  분석 대상 (전체 코드베이스):
+    src/preprocessing/*.py         — 7개 파일, 3,097줄
+    src/analysis/*.py              — 3개 파일, 885줄
+    src/training/*.py              — 5개 파일, 2,687줄
+    src/models/*.py                — 3개 파일, 702줄
+    src/utils/*.py                 — 2개 파일, 585줄
+    scripts/*.py                   — 주요 7개, 6,327줄
+    configs/benchmark_experiment.yaml — 202줄
+
+  참조 문서:
+    docs/20260303_1.docs — v5.3 통합 분석 (558줄)
+    docs/20260303_2.docs — v5.4 코드 준비 (236줄)
+
+  실험 결과:
+    outputs/v5.3/benchmark_results/benchmark_results.json
+    outputs/v5.3/benchmark_results/fid_results.json
+    outputs/v5.3/standard/yolo/benchmark_results.json
+    outputs/v5.3/standard/deeplabv3plus/benchmark_results.json
+    outputs/v5.3/controlnet_training_v5.3/training_log.json
+
+
+12. baseline_trad Detection 구현 상세
+================================================================================
+
+  12-1. 문제 정의
+  ──────────────────────────────────
+
+    v5.3까지 baseline_trad는 Segmentation(DeepLabV3+)에서만 정상 작동했음.
+    Detection(EB-YOLOv8, YOLO-MFD)에서는 YAML의 traditional_augmentation 설정이
+    완전히 무시되어 baseline_raw와 동일하게 동작함.
+
+    원인:
+      - Segmentation: dataset.py → build_transforms() → Albumentations 파이프라인
+        → group_config['augmentation'] 값을 읽고 traditional_augmentation 적용 ✓
+      - Detection: ultralytics_trainer.py → Ultralytics 네이티브 학습 파이프라인
+        → group_config['augmentation'] 값을 읽지 않음 ✗
+        → Ultralytics 기본 augmentation(mosaic 등) 항상 적용
+
+    결과: baseline_trad Detection 실험 결과는 사실상 baseline_raw와 동일했음.
+
+
+  12-2. 설계 결정: Option 1
+  ──────────────────────────────────
+
+    Option 1 선택 근거:
+      - baseline_raw: Ultralytics 기본 augmentation 유지 (mosaic=1.0 등)
+      - baseline_trad: YAML traditional_augmentation을 Ultralytics 파라미터로 매핑
+        + mosaic=0, mixup=0, copy_paste=0 비활성화
+
+    이유:
+      - baseline_raw는 "YOLO 기본 학습 전략" 그 자체 → 변경 불필요
+      - baseline_trad는 "전통적 증강만 사용" → 비전통적 증강 비활성화가 의미적으로 정확
+      - 기존 v5.3 baseline_raw 결과와 비교 가능성 유지
+
+
+  12-3. 코드 변경 상세
+  ──────────────────────────────────
+
+    [변경 1] ultralytics_trainer.py — _compute_scale_range() 추가 (L93-104)
+
+      위치: class UltralyticsTrainer 내 정적 메서드
+      역할: YAML scale_range [min, max] → Ultralytics scale 파라미터 변환
+      변환: scale_range=[0.8, 1.2] → max(|1.0-0.8|, |1.2-1.0|) = 0.2
+      기본값: 리스트 형식이 아니면 0.2 반환
+      호출: augmentation=='traditional' 블록 내에서만 호출됨
+
+    [변경 2] ultralytics_trainer.py — augmentation 매핑 블록 (L375-397)
+
+      위치: train() 메서드 내, train_kwargs 구성 직후
+      조건: group_config['augmentation'] == 'traditional' 인 경우만 실행
+
+      YAML → Ultralytics 매핑표:
+        | YAML 파라미터        | Ultralytics 파라미터 | 값 (기본)     |
+        |---------------------|---------------------|--------------|
+        | horizontal_flip     | fliplr              | 0.5          |
+        | vertical_flip       | flipud              | 0.3          |
+        | rotation_limit      | degrees             | 15.0         |
+        | scale_range         | scale               | 0.2 (±20%)  |
+        | brightness_limit    | hsv_v               | 0.2          |
+        | contrast_limit      | (매핑 없음)          | —            |
+
+      비활성화 항목:
+        | Ultralytics 파라미터 | 설정값 | 이유                          |
+        |---------------------|--------|------------------------------|
+        | mosaic              | 0.0    | 비전통적 증강 → 격리 필요     |
+        | mixup               | 0.0    | 비전통적 증강 → 격리 필요     |
+        | copy_paste          | 0.0    | 비전통적 증강 → 격리 필요     |
+
+      ※ contrast_limit 미매핑 사유:
+        Ultralytics에 직접 대응하는 contrast 하이퍼파라미터 없음.
+        hsv_s (채도)가 가장 유사하나 의미적 불일치로 매핑하지 않음.
+        Segmentation(Albumentations)에서는 A.RandomBrightnessContrast로 적용됨.
+
+      로깅: 적용된 모든 파라미터 값을 logger.info로 출력
+
+    [변경 3] dataset.py — build_transforms() RandomScale 추가 (L585-593)
+
+      위치: build_transforms() 내 traditional augmentation 블록
+      조건: augmentation=='traditional' AND trad_config 존재 AND
+            scale_range가 2원소 리스트/튜플인 경우만 실행 (3중 가드)
+      변환: scale_range=[0.8, 1.2] → A.RandomScale(scale_limit=(-0.2, 0.2), p=0.5)
+      용도: Segmentation(DeepLabV3+)에서 스케일 증강 적용
+      ※ 기존 HFlip, VFlip, Rotate, BrightnessContrast 유지
+
+
+  12-4. 호환성 검증 결과
+  ──────────────────────────────────
+
+    검증 대상: baseline_raw, casda_full, casda_pruning이 영향받지 않는지 확인
+
+    | 데이터셋 그룹    | augmentation 값 | 새 블록 실행 여부 | 영향 |
+    |-----------------|----------------|------------------|------|
+    | baseline_raw    | "none"         | 미실행            | 없음 |
+    | baseline_trad   | "traditional"  | 실행              | 의도 |
+    | casda_full      | "none"         | 미실행            | 없음 |
+    | casda_pruning   | "none"         | 미실행            | 없음 |
+    | (ratio 그룹)    | "none"         | 미실행            | 없음 |
+
+    가드 구조:
+      ultralytics_trainer.py:
+        - group_config.get('augmentation', 'none') → 기본값 'none' (안전)
+        - if augmentation == 'traditional': → 'none'이면 전체 블록 건너뜀
+
+      dataset.py:
+        - if augmentation == "traditional" and trad_config: → 이중 가드
+        - scale_range 추가: isinstance + len == 2 → 삼중 가드
+        - eval transform: 항상 augmentation="none"으로 빌드 → 검증/테스트 무영향
+
+    결론: 후방 호환성 완전 확보. 기존 v5.3 결과 재현 가능.
+
+
+  12-5. Segmentation vs Detection 증강 비교
+  ──────────────────────────────────
+
+    baseline_trad에서 모델 타입별 증강 파이프라인이 다른 구조:
+
+    | 증강 항목      | Segmentation (Albumentations) | Detection (Ultralytics) |
+    |---------------|------------------------------|------------------------|
+    | 수평 반전      | A.HorizontalFlip(p=0.5)      | fliplr=0.5             |
+    | 수직 반전      | A.VerticalFlip(p=0.3)        | flipud=0.3             |
+    | 회전          | A.Rotate(limit=15, p=0.5)    | degrees=15.0           |
+    | 스케일        | A.RandomScale(±0.2, p=0.5)   | scale=0.2              |
+    | 밝기          | A.RandomBrightnessContrast   | hsv_v=0.2              |
+    | 대비          | A.RandomBrightnessContrast   | (매핑 없음)             |
+    | Mosaic        | N/A                          | 0.0 (비활성화)          |
+    | Mixup         | N/A                          | 0.0 (비활성화)          |
+    | Copy-paste    | N/A                          | 0.0 (비활성화)          |
+
+    ※ 두 파이프라인은 구조가 다르나 의미적으로 동일한 전통적 증강을 수행.
+       미세한 차이(대비, 확률 분포 등)는 있으나 벤치마크 비교에 충분히 공정함.
+
+
+  12-6. 실행 방법
+  ──────────────────────────────────
+
+    # baseline_trad만 실행 (Detection + Segmentation)
+    python scripts/run_benchmark.py --groups trad --version v5.4
+
+    # 또는 run_v54_experiments.sh Phase 1 사용 (Colab)
+    bash scripts/run_v54_experiments.sh  # Phase 1: baseline_trad 포함
+
+    예상 소요: GPU당 약 2-3시간 (3 모델 × baseline_trad)

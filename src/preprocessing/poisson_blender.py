@@ -202,6 +202,54 @@ class PoissonBlender:
         
         return dilated
     
+    def smooth_mask_boundary(
+        self,
+        mask: np.ndarray,
+        ksize: int = 21,
+        sigma: float = 7.0,
+    ) -> np.ndarray:
+        """
+        마스크 경계를 가우시안 블러로 부드럽게 처리한다.
+        
+        dilated 마스크에 가우시안 블러를 적용하되, 결함 핵심 영역은
+        원본 값(최소 0.8)을 유지하여 경계만 부드럽게 처리한다.
+        seamlessClone 요구사항: 가장자리 1px = 0 강제 유지.
+        
+        Args:
+            mask: H x W 이진 마스크 (0/255)
+            ksize: 가우시안 커널 크기 (홀수, 기본 21)
+            sigma: 가우시안 시그마 (기본 7.0)
+            
+        Returns:
+            H x W 마스크 (0~255, 경계 부드러움)
+        """
+        # 커널 크기 홀수 보장
+        if ksize % 2 == 0:
+            ksize += 1
+        
+        # 0~1 스케일로 변환
+        mask_f = mask.astype(np.float32) / 255.0
+        
+        # 코어 영역 저장 (원본 마스크에서 255인 영역)
+        core = mask_f.copy()
+        
+        # 가우시안 블러 적용
+        blurred = cv2.GaussianBlur(mask_f, (ksize, ksize), sigma)
+        
+        # 코어 영역은 최소 0.8 보장
+        smoothed = np.maximum(blurred, core * 0.8)
+        
+        # 0~1 클리핑 후 uint8 복원
+        result = (np.clip(smoothed, 0.0, 1.0) * 255).astype(np.uint8)
+        
+        # seamlessClone 요구사항: 가장자리 1px = 0 강제
+        result[0, :] = 0
+        result[-1, :] = 0
+        result[:, 0] = 0
+        result[:, -1] = 0
+        
+        return result
+    
     # ──────────────────────────────────────────────
     # 붙여넣기 위치 계산
     # ──────────────────────────────────────────────
@@ -210,6 +258,7 @@ class PoissonBlender:
         self,
         roi_bbox: Tuple[int, int, int, int],
         target_shape: Tuple[int, int],
+        jitter_x: int = 0,
     ) -> Tuple[int, int]:
         """
         roi_bbox를 기반으로 Poisson 블렌딩의 중심점(center)을 계산한다.
@@ -220,6 +269,7 @@ class PoissonBlender:
         Args:
             roi_bbox: (x1, y1, x2, y2) 원본 이미지 좌표계
             target_shape: (height, width) target 이미지 크기
+            jitter_x: x축 방향 오프셋 (기본 0, 하위호환)
             
         Returns:
             (center_x, center_y) 정수 튜플
@@ -227,8 +277,8 @@ class PoissonBlender:
         x1, y1, x2, y2 = roi_bbox
         target_h, target_w = target_shape
         
-        # ROI 중심점
-        center_x = (x1 + x2) // 2
+        # ROI 중심점 + jitter 오프셋
+        center_x = (x1 + x2) // 2 + jitter_x
         center_y = (y1 + y2) // 2
         
         # ROI 크기 (source 크기)
@@ -498,17 +548,23 @@ class PoissonBlender:
         clean_background: np.ndarray,
         roi_bbox: Tuple[int, int, int, int],
         class_id: int,
+        jitter_x: int = 0,
+        scale_factor: float = 1.0,
+        use_smooth_mask: bool = False,
+        smooth_ksize: int = 21,
+        smooth_sigma: float = 7.0,
     ) -> CompositionResult:
         """
         단일 이미지의 전체 합성 파이프라인을 실행한다.
         
         처리 흐름:
           1. 힌트에서 마스크 추출
-          2. 512→256 다운스케일
+          2. 512→scaled_h x scaled_w 다운스케일 (scale_factor 적용)
           3. 마스크 확장
-          4. 붙여넣기 위치 계산
+          3a. smooth_mask_boundary (use_smooth_mask=True 시)
+          4. 붙여넣기 위치 계산 (jitter_x 적용)
           5. Poisson 블렌딩
-          6. 전체 크기 마스크 + YOLO bbox
+          6. 전체 크기 마스크 + YOLO bbox (jitter/scale 반영)
         
         Args:
             generated_image: 512x512x3 ControlNet 생성 이미지 (BGR)
@@ -516,6 +572,11 @@ class PoissonBlender:
             clean_background: 1600x256x3 결함 없는 배경 이미지 (BGR)
             roi_bbox: (x1, y1, x2, y2) 원본 이미지 좌표계
             class_id: 결함 클래스 ID (0-indexed)
+            jitter_x: x축 방향 오프셋 (기본 0, 하위호환)
+            scale_factor: 다운스케일 비율 (기본 1.0, 하위호환)
+            use_smooth_mask: 마스크 경계 부드럽게 처리 (기본 False, 하위호환)
+            smooth_ksize: 가우시안 커널 크기 (기본 21)
+            smooth_sigma: 가우시안 시그마 (기본 7.0)
             
         Returns:
             CompositionResult
@@ -545,10 +606,12 @@ class PoissonBlender:
                 blend_method="none", message="마스크에 결함 픽셀 없음"
             )
         
-        # Step 2: 512→ROI 크기 다운스케일
+        # Step 2: 512→ROI 크기 다운스케일 (scale_factor 적용)
+        scaled_h = max(1, round(roi_h * scale_factor))
+        scaled_w = max(1, round(roi_w * scale_factor))
         image_roi, mask_roi = self.downscale_to_roi(
             generated_image, mask_512,
-            target_h=roi_h, target_w=roi_w
+            target_h=scaled_h, target_w=scaled_w
         )
         
         # 다운스케일 후 마스크 검증: INTER_NEAREST로 축소 시
@@ -565,6 +628,12 @@ class PoissonBlender:
         
         # Step 3: 마스크 확장 (블렌딩용)
         mask_dilated = self.dilate_mask(mask_roi)
+        
+        # Step 3a: 마스크 경계 부드럽게 처리 (Tier-1)
+        if use_smooth_mask:
+            mask_dilated = self.smooth_mask_boundary(
+                mask_dilated, ksize=smooth_ksize, sigma=smooth_sigma
+            )
         
         # Step 3.5: seamlessClone 크기 제약 처리
         # seamlessClone은 source 전체 영역(center ± source_size/2)이 target
@@ -587,8 +656,8 @@ class PoissonBlender:
                 f"{blend_src.shape[0]}x{blend_src.shape[1]} (crop_y={crop_y}, crop_x={crop_x})"
             )
         
-        # Step 4: 붙여넣기 중심점 계산
-        center = self.compute_paste_center(roi_bbox, (target_h, target_w))
+        # Step 4: 붙여넣기 중심점 계산 (jitter_x 적용)
+        center = self.compute_paste_center(roi_bbox, (target_h, target_w), jitter_x=jitter_x)
         
         # Step 5: 블렌딩 영역 검증
         if not self.validate_blend_region(blend_mask, center, (target_h, target_w)):
@@ -611,12 +680,27 @@ class PoissonBlender:
         
         # Step 6: Poisson 블렌딩
         composited, blend_method = self.poisson_blend(
-            blend_src, blend_mask, clean_background.copy(), center
+            blend_src, blend_mask, clean_background, center
         )
         
-        # Step 7: 전체 크기 마스크 생성 (비확장 원본 마스크 사용)
+        # Step 7: actual_roi_bbox 역산 (jitter/scale 반영)
+        # center 기준으로 실제 합성된 영역의 bbox를 계산
+        actual_half_w = scaled_w // 2
+        actual_half_h = scaled_h // 2
+        actual_x1 = center[0] - actual_half_w
+        actual_y1 = center[1] - actual_half_h
+        actual_x2 = actual_x1 + scaled_w
+        actual_y2 = actual_y1 + scaled_h
+        actual_roi_bbox = (
+            max(0, actual_x1),
+            max(0, actual_y1),
+            min(target_w, actual_x2),
+            min(target_h, actual_y2),
+        )
+        
+        # 전체 크기 마스크 생성 (비확장 원본 마스크 사용, 실제 합성 위치 반영)
         full_mask = self.generate_full_mask(
-            mask_roi, roi_bbox, (target_h, target_w)
+            mask_roi, actual_roi_bbox, (target_h, target_w)
         )
         
         # Step 8: YOLO bbox 계산
@@ -651,6 +735,11 @@ class PoissonBlender:
         clean_bg_path: str,
         roi_bbox: Tuple[int, int, int, int],
         class_id: int,
+        jitter_x: int = 0,
+        scale_factor: float = 1.0,
+        use_smooth_mask: bool = False,
+        smooth_ksize: int = 21,
+        smooth_sigma: float = 7.0,
     ) -> CompositionResult:
         """
         파일 경로에서 이미지를 로드하여 합성을 실행한다.
@@ -661,6 +750,11 @@ class PoissonBlender:
             clean_bg_path: 결함 없는 배경 이미지 경로 (1600x256)
             roi_bbox: (x1, y1, x2, y2) 원본 이미지 좌표계
             class_id: 결함 클래스 ID (0-indexed)
+            jitter_x: x축 방향 오프셋 (기본 0)
+            scale_factor: 다운스케일 비율 (기본 1.0)
+            use_smooth_mask: 마스크 경계 부드럽게 처리 (기본 False)
+            smooth_ksize: 가우시안 커널 크기 (기본 21)
+            smooth_sigma: 가우시안 시그마 (기본 7.0)
             
         Returns:
             CompositionResult
@@ -694,7 +788,10 @@ class PoissonBlender:
             )
         
         return self.compose_single(
-            generated, hint, clean_bg, roi_bbox, class_id
+            generated, hint, clean_bg, roi_bbox, class_id,
+            jitter_x=jitter_x, scale_factor=scale_factor,
+            use_smooth_mask=use_smooth_mask,
+            smooth_ksize=smooth_ksize, smooth_sigma=smooth_sigma,
         )
     
     # ──────────────────────────────────────────────

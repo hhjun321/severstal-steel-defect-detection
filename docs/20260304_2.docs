@@ -1,0 +1,232 @@
+20260304 작업 일지 #3 - compose_casda_images.py 성능 최적화
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+compose_casda_images.py의 실행 시간이 오래 걸리는 문제를 분석하고,
+멀티프로세싱 병렬화, 캐싱, I/O 최적화 등을 적용하여 4~10배 속도 향상을 달성한다.
+
+
+2. 성능 병목 분석
+--------------------------------------------------------------------------------
+
+  | #  | 병목 지점                        | 원인                                         | 예상 비중 |
+  |----|----------------------------------|----------------------------------------------|-----------|
+  | B1 | BackgroundPool._analyze_backgrounds() | 5,000장 이미지를 순차 로드 + 엣지 분석     | ~40%      |
+  | B2 | 메인 합성 루프 (Poisson 블렌딩)  | 이미지 3개 디스크 I/O + seamlessClone 순차    | ~45%      |
+  | B3 | cv2.imwrite() PNG 저장           | PNG 기본 압축(level=3) 동기 저장 x 2장       | ~15%      |
+
+  보조 병목:
+  - load_roi_metadata()에서 df.iterrows() 사용 (느린 pandas 반복)
+  - classify_background_simple()에서 256x256 패치 처리 (불필요한 해상도)
+  - poisson_blender.py compose_single()에서 불필요한 clean_background.copy()
+
+
+3. 코드 수정 내역
+--------------------------------------------------------------------------------
+
+  3.1 변경 파일 목록
+
+    (1) scripts/compose_casda_images.py — 성능 최적화 전면 개편
+    (2) src/preprocessing/poisson_blender.py — 불필요 copy() 제거
+
+  3.2 [최적화 #1] 배경 분석 결과 캐싱 (--bg-cache)
+
+    파일: scripts/compose_casda_images.py
+    대상: BackgroundPool 클래스
+
+    추가 메서드:
+      _load_cache(cache_path) — JSON에서 {filename: bg_type} 매핑 로드
+      _save_cache(cache_path) — 분석 결과를 JSON으로 저장
+
+    동작:
+      1) --bg-cache 경로가 지정되면 해당 JSON에서 캐시 로드 시도
+      2) 캐시에 없는 이미지만 분석 수행
+      3) 분석 완료 후 캐시 파일 자동 저장
+      4) 두 번째 실행부터 배경 분석 단계가 0초로 단축
+
+    효과: 재실행 시 배경 분석 2~4분 → 0초
+
+  3.3 [최적화 #2] 배경 분석 멀티프로세싱 병렬화
+
+    파일: scripts/compose_casda_images.py
+    대상: BackgroundPool._analyze_parallel(), _classify_single_background()
+
+    변경:
+      - 톱레벨 함수 _classify_single_background(args) 추가 (pickle 직렬화 가능)
+      - ProcessPoolExecutor로 이미지 분류를 병렬 실행
+      - chunksize=32로 프로세스 간 통신 오버헤드 최소화
+      - --workers N > 1일 때 자동으로 병렬 모드 진입
+
+    효과: 첫 실행 시 배경 분석 4~8배 단축 (코어 수 비례)
+
+  3.4 [최적화 #3] 메인 합성 루프 멀티프로세싱 병렬화
+
+    파일: scripts/compose_casda_images.py
+    대상: compose_all() Step 5-6, _compose_single_task()
+
+    구조 변경:
+      Before: 루프 내에서 메타데이터 조회 + 블렌딩 + 저장을 순차 실행
+      After:  두 단계로 분리
+        Step 5: 메인 프로세스에서 메타데이터 조회 + 배경 선택 → task dict 리스트 구성
+        Step 6: task 리스트를 ProcessPoolExecutor.map()으로 워커에 분배
+
+    워커 함수 _compose_single_task(args):
+      - 워커 프로세스 내에서 PoissonBlender를 생성 (stateless)
+      - 이미지 3개 로드 → compose_from_paths() → cv2.imwrite() 수행
+      - 성공 시 메타데이터 dict 반환, 실패 시 {'__fail__': reason} 반환
+      - chunksize=4로 프로세스 간 통신과 작업 단위 균형
+
+    순차 모드 (--workers 0):
+      기존 로직 유지 + 배경 이미지 LRU 캐시 적용
+
+    효과: 합성 처리 시간 코어 수에 비례하여 단축 (4~8배)
+
+  3.5 [최적화 #4] 배경 이미지 LRU 캐시 (순차 모드)
+
+    파일: scripts/compose_casda_images.py
+    대상: compose_all() 내 _load_bg_cached()
+
+    구현:
+      - dict 기반 간이 캐시 (최대 128개 이미지)
+      - 같은 배경 이미지가 여러 결함에 재사용될 때 디스크 I/O 제거
+      - 멀티프로세싱 모드에서는 프로세스 간 메모리 공유 불가로 비활성
+
+    효과: 순차 모드에서 배경 이미지 중복 로드 제거
+
+  3.6 [최적화 #5] PNG 압축 레벨 조절 (--png-compression)
+
+    파일: scripts/compose_casda_images.py
+    대상: compose_all(), _compose_single_task()
+
+    변경:
+      cv2.imwrite(path, img) → cv2.imwrite(path, img, [cv2.IMWRITE_PNG_COMPRESSION, N])
+      기본값: 1 (OpenCV 기본 3 대비 2~3배 빠른 저장, 파일 크기 소폭 증가)
+
+    효과: PNG 저장 시간 2~3배 단축
+
+  3.7 [최적화 #6] iterrows() → to_dict('records')
+
+    파일: scripts/compose_casda_images.py
+    대상: load_roi_metadata()
+
+    변경:
+      Before: for _, row in df.iterrows():
+      After:  records = df.to_dict('records'); for row in records:
+
+    부수 변경:
+      - 'defect_bbox' 컬럼 존재 여부를 루프 밖에서 1회만 체크
+      - row.get() 대신 dict.get()으로 직접 접근
+
+    효과: 메타데이터 로딩 2~5배 빠름
+
+  3.8 [최적화 #7] classify_background_simple() 패치 크기 축소
+
+    파일: scripts/compose_casda_images.py
+    대상: classify_background_simple()
+
+    변경:
+      중앙 256x256 패치 추출 후 128x128로 cv2.resize (INTER_AREA)
+      이후 모든 연산(Canny, Sobel 등)이 128x128에서 수행
+
+    효과: 배경 분류 연산량 4배 감소
+
+  3.9 [최적화 #8] 불필요한 copy() 제거
+
+    파일: src/preprocessing/poisson_blender.py
+    대상: compose_single() L613
+
+    변경:
+      Before: composited, blend_method = self.poisson_blend(
+                  blend_src, blend_mask, clean_background.copy(), center)
+      After:  composited, blend_method = self.poisson_blend(
+                  blend_src, blend_mask, clean_background, center)
+
+    근거: cv2.seamlessClone()은 새 배열을 반환하고 target을 변경하지 않음.
+    _alpha_blend_fallback()에서도 내부적으로 target.copy()를 수행하므로 안전.
+
+  3.10 [부가] 성능 타이머 및 리포트 확장
+
+    파일: scripts/compose_casda_images.py
+    대상: compose_all()
+
+    추가:
+      - pipeline_start / compose_start 타이머
+      - composition_report.json에 "performance" 섹션 추가:
+        {
+          "total_pipeline_sec": 45.3,
+          "compose_sec": 32.1,
+          "images_per_sec": 62.3
+        }
+      - 완료 로그에 성능 지표 출력
+
+
+4. 새 CLI 옵션
+--------------------------------------------------------------------------------
+
+  | 옵션               | 타입 | 기본값 | 설명                                          |
+  |--------------------|------|--------|-----------------------------------------------|
+  | --workers N        | int  | 0      | 멀티프로세싱 워커 수 (0=순차, -1=자동 감지)   |
+  | --bg-cache PATH    | str  | None   | 배경 유형 캐시 JSON 경로                      |
+  | --png-compression N| int  | 1      | PNG 압축 레벨 (0-9, 낮을수록 빠름)            |
+
+  하위 호환성:
+    - 기존 CLI 인자 100% 호환 (새 옵션 미지정 시 기존과 동일하게 순차 실행)
+    - 출력 결과물(images, masks, metadata.json) 형식 변경 없음
+    - composition_report.json에 performance / num_workers / png_compression 필드 추가
+
+
+5. 예상 성능 향상
+--------------------------------------------------------------------------------
+
+  1,000장 합성 기준 (8코어 CPU):
+
+  | 단계             | Before     | After (순차)  | After (8 workers) |
+  |------------------|------------|---------------|-------------------|
+  | 배경 분석        | ~3분       | ~45초 (128px) | ~6초 (병렬)       |
+  | 배경 분석 (캐시) | ~3분       | ~0초          | ~0초              |
+  | 합성 루프        | ~100초     | ~85초 (LRU)   | ~13초 (병렬)      |
+  | PNG 저장         | ~60초      | ~25초 (lv1)   | ~25초 (lv1, 포함) |
+  | 전체             | ~6분       | ~2분          | ~20초             |
+
+  고속 모드 사용 예시:
+
+    python scripts/compose_casda_images.py \
+      --generated-dir outputs/v5.1/test_results_v5.1/generated \
+      --hint-dir data/processed/controlnet_dataset/hints \
+      --metadata-csv data/processed/controlnet_dataset/packaged_roi_metadata.csv \
+      --summary-json outputs/v5.1/test_results_v5.1/generation_summary.json \
+      --clean-images-dir data/raw/train_images \
+      --train-csv data/raw/train.csv \
+      --output-dir data/augmented/casda_composed \
+      --workers 8 \
+      --bg-cache data/cache/bg_types.json \
+      --png-compression 1
+
+    자동 워커 감지:
+      --workers -1   (os.cpu_count() - 1로 자동 설정)
+
+
+6. 검증
+--------------------------------------------------------------------------------
+
+  [v] Python 구문 오류 체크 (ast.parse) — 통과
+  [v] import 체크 — 모든 함수/클래스 정상 import
+  [v] CLI --help — 3개 새 옵션 정상 표시
+  [v] 하위 호환성 — 기존 인자만으로 실행 시 순차 모드 동작
+
+  남은 검증:
+  [ ] Colab에서 실제 데이터로 순차 vs 병렬 성능 비교
+  [ ] 병렬 모드 출력과 순차 모드 출력의 결과 일치 확인
+  [ ] bg_cache JSON 저장/로드 정합성 확인
+
+
+7. 코드 품질 참고
+--------------------------------------------------------------------------------
+
+  LSP 경고 (기존 코드에서 이미 존재, 런타임 무관):
+    - cv2/numpy/pandas "could not be resolved" — 가상환경 pyright 설정 문제
+    - random 모듈 타입 힌트 — 기존 get_compatible_background()의 타입 어노테이션 문제
+    - tuple[int, ...] 크기 불일치 — parse_bbox_string()의 동적 튜플 생성
+
+  이상의 경고는 모두 런타임에 영향 없으며, 기존 코드에서 이미 존재하던 문제이다.

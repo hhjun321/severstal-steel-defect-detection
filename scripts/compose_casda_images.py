@@ -6,9 +6,15 @@ ControlNet 생성 512x512 결함 ROI를 Poisson Blending으로 결함 없는 원
 파이프라인:
   1. 메타데이터 로딩 (generation_summary.json + packaged_roi_metadata.csv)
   2. 결함 없는 배경 이미지 풀 구축 (train.csv에 없는 이미지)
-  3. 배경 유형 분석 + 호환성 매칭
-  4. PoissonBlender로 각 생성 이미지를 1600x256 배경에 합성
+  3. 배경 유형 분석 + 호환성 매칭 (캐시 지원)
+  4. PoissonBlender로 각 생성 이미지를 1600x256 배경에 합성 (병렬 지원)
   5. 합성 이미지 + 전체 크기 마스크 + metadata.json 저장
+
+성능 최적화:
+  - --workers N : 멀티프로세싱 병렬 합성 (배경 분석 + Poisson 블렌딩)
+  - --bg-cache path : 배경 유형 분석 결과 캐싱 (재실행 시 분석 건너뜀)
+  - --png-compression 1 : PNG 압축 레벨 조절 (기본 1, 빠른 저장)
+  - --workers -1 : CPU 코어 수 자동 감지
 
 출력:
   casda_composed/
@@ -17,36 +23,46 @@ ControlNet 생성 512x512 결함 ROI를 Poisson Blending으로 결함 없는 원
   └── metadata.json    # 메타데이터 (YOLO bbox, suitability_score 포함)
 
 Usage:
-  python scripts/compose_casda_images.py \
-    --generated-dir outputs/v5.1/test_results_v5.1/generated \
-    --hint-dir data/processed/controlnet_dataset/hints \
-    --metadata-csv data/processed/controlnet_dataset/packaged_roi_metadata.csv \
-    --summary-json outputs/v5.1/test_results_v5.1/generation_summary.json \
-    --clean-images-dir data/raw/train_images \
-    --train-csv data/raw/train.csv \
-    --output-dir data/augmented/casda_composed \
-    --dilation-px 15 \
-    --blend-mode NORMAL_CLONE
-
-  # With quality scores (for suitability_score in metadata):
-  python scripts/compose_casda_images.py \
-    --generated-dir outputs/v5.1/test_results_v5.1/generated \
-    --hint-dir data/processed/controlnet_dataset/hints \
-    --metadata-csv data/processed/controlnet_dataset/packaged_roi_metadata.csv \
-    --summary-json outputs/v5.1/test_results_v5.1/generation_summary.json \
-    --quality-json outputs/v5.1/test_results_v5.1/quality_scores.json \
-    --clean-images-dir data/raw/train_images \
-    --train-csv data/raw/train.csv \
+  # 기본 (순차 처리):
+  python scripts/compose_casda_images.py \\
+    --generated-dir outputs/v5.1/test_results_v5.1/generated \\
+    --hint-dir data/processed/controlnet_dataset/hints \\
+    --metadata-csv data/processed/controlnet_dataset/packaged_roi_metadata.csv \\
+    --summary-json outputs/v5.1/test_results_v5.1/generation_summary.json \\
+    --clean-images-dir data/raw/train_images \\
+    --train-csv data/raw/train.csv \\
     --output-dir data/augmented/casda_composed
+
+  # 고속 (8 워커 + 배경 캐시 + 빠른 PNG):
+  python scripts/compose_casda_images.py \\
+    --generated-dir outputs/v5.1/test_results_v5.1/generated \\
+    --hint-dir data/processed/controlnet_dataset/hints \\
+    --metadata-csv data/processed/controlnet_dataset/packaged_roi_metadata.csv \\
+    --summary-json outputs/v5.1/test_results_v5.1/generation_summary.json \\
+    --clean-images-dir data/raw/train_images \\
+    --train-csv data/raw/train.csv \\
+    --output-dir data/augmented/casda_composed \\
+    --workers 8 \\
+    --bg-cache data/cache/bg_types.json \\
+    --png-compression 1
+
+  # 자동 워커 수 감지:
+  python scripts/compose_casda_images.py \\
+    ... \\
+    --workers -1 --bg-cache data/cache/bg_types.json
 """
 
 import argparse
 import ast
 import json
 import logging
+import os
 import random
 import re
 import sys
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -143,21 +159,25 @@ def find_clean_images(train_csv_path: Path, train_images_dir: Path) -> List[str]
 
 def classify_background_simple(image: np.ndarray) -> str:
     """
-    1600x256 이미지의 중앙 256x256 영역에서 배경 유형을 간단히 분류.
+    1600x256 이미지의 중앙 영역에서 배경 유형을 간단히 분류.
     
     BackgroundCharacterizer의 전체 파이프라인을 사용하지 않고,
     엣지 방향성과 분산으로 빠르게 분류한다.
+    128x128 패치로 축소하여 연산량을 줄임 (256x256 대비 4배 빠름).
     
     Returns:
         'smooth', 'vertical_stripe', 'horizontal_stripe', 'textured', 'complex_pattern'
     """
     h, w = image.shape[:2]
     
-    # 중앙 256x256 패치 추출
+    # 중앙 256x256 패치 추출 후 128x128로 축소
     cx = w // 2
     x1 = max(0, cx - 128)
     x2 = min(w, x1 + 256)
     patch = image[:, x1:x2]
+    
+    # 128x128로 축소하여 연산량 절감
+    patch = cv2.resize(patch, (128, 128), interpolation=cv2.INTER_AREA)
     
     # 그레이스케일 변환
     if len(patch.shape) == 3:
@@ -203,6 +223,25 @@ def classify_background_simple(image: np.ndarray) -> str:
         return 'textured'
     
     return 'smooth'
+
+
+def _classify_single_background(args: Tuple[str, str]) -> Tuple[str, str]:
+    """
+    단일 배경 이미지를 분류하는 워커 함수 (멀티프로세싱용).
+    
+    Args:
+        args: (image_name, images_dir_str) 튜플
+        
+    Returns:
+        (image_name, bg_type) 튜플. 로드 실패 시 (image_name, '') 반환.
+    """
+    name, images_dir_str = args
+    img_path = Path(images_dir_str) / name
+    img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+    if img is None:
+        return (name, '')
+    bg_type = classify_background_simple(img)
+    return (name, bg_type)
 
 
 def build_quality_map(
@@ -277,6 +316,10 @@ class BackgroundPool:
     """
     결함 없는 배경 이미지 풀.
     배경 유형별로 인덱싱하여 호환성 기반 선택을 지원한다.
+    
+    성능 최적화:
+    - 배경 유형 분석 결과를 JSON 캐시 파일로 저장/로드
+    - 멀티프로세싱으로 배경 유형 분석 병렬화
     """
     
     def __init__(
@@ -285,6 +328,8 @@ class BackgroundPool:
         images_dir: Path,
         cache_bg_types: bool = True,
         max_analyze: int = 5000,
+        bg_cache_path: Optional[Path] = None,
+        num_workers: int = 0,
     ):
         """
         Args:
@@ -292,23 +337,92 @@ class BackgroundPool:
             images_dir: 이미지 디렉토리 경로
             cache_bg_types: 배경 유형을 캐싱할지 여부
             max_analyze: 배경 유형 분석할 최대 이미지 수
+            bg_cache_path: 배경 유형 캐시 JSON 경로 (None이면 캐시 미사용)
+            num_workers: 병렬 분석 워커 수 (0이면 순차 처리)
         """
         self.images_dir = images_dir
         self.clean_names = clean_image_names
+        self.num_workers = num_workers
         
         # 배경 유형별 인덱스: {bg_type: [filename, ...]}
         self.type_index: Dict[str, List[str]] = {t: [] for t in ALL_BACKGROUND_TYPES}
         self.bg_types: Dict[str, str] = {}  # filename → bg_type
         
         if cache_bg_types:
-            self._analyze_backgrounds(max_analyze)
+            self._analyze_backgrounds(max_analyze, bg_cache_path)
     
-    def _analyze_backgrounds(self, max_analyze: int):
+    def _load_cache(self, cache_path: Path) -> Dict[str, str]:
+        """캐시 파일에서 배경 유형 매핑을 로드한다."""
+        if cache_path and cache_path.exists():
+            try:
+                with open(cache_path) as f:
+                    data = json.load(f)
+                logger.info(f"배경 유형 캐시 로드 성공: {cache_path} ({len(data)}개)")
+                return data
+            except (json.JSONDecodeError, IOError) as e:
+                logger.warning(f"배경 유형 캐시 로드 실패: {e}")
+        return {}
+    
+    def _save_cache(self, cache_path: Path):
+        """배경 유형 매핑을 캐시 파일에 저장한다."""
+        if cache_path:
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(cache_path, "w") as f:
+                    json.dump(self.bg_types, f)
+                logger.info(f"배경 유형 캐시 저장: {cache_path} ({len(self.bg_types)}개)")
+            except IOError as e:
+                logger.warning(f"배경 유형 캐시 저장 실패: {e}")
+    
+    def _analyze_backgrounds(
+        self, max_analyze: int, cache_path: Optional[Path] = None
+    ):
         """배경 이미지들의 유형을 분석하여 인덱스 구축."""
         names_to_analyze = self.clean_names[:max_analyze]
-        logger.info(f"배경 유형 분석 시작: {len(names_to_analyze)}장...")
         
-        for name in tqdm(names_to_analyze, desc="배경 유형 분석"):
+        # 캐시에서 로드 시도
+        cached = self._load_cache(cache_path) if cache_path else {}
+        
+        # 캐시에 없는 이미지만 분석 대상으로 필터링
+        names_uncached = [n for n in names_to_analyze if n not in cached]
+        names_cached = [n for n in names_to_analyze if n in cached]
+        
+        # 캐시 히트 적용
+        for name in names_cached:
+            bg_type = cached[name]
+            self.bg_types[name] = bg_type
+            self.type_index[bg_type].append(name)
+        
+        if names_cached:
+            logger.info(f"배경 유형 캐시 히트: {len(names_cached)}장")
+        
+        if not names_uncached:
+            logger.info("모든 배경 유형이 캐시에서 로드됨 — 분석 건너뜀")
+            self._log_type_stats()
+            return
+        
+        logger.info(f"배경 유형 분석 시작: {len(names_uncached)}장 (캐시 미스)...")
+        t_start = time.time()
+        
+        if self.num_workers > 1 and len(names_uncached) > 10:
+            # 멀티프로세싱 병렬 분석
+            self._analyze_parallel(names_uncached)
+        else:
+            # 순차 분석
+            self._analyze_sequential(names_uncached)
+        
+        elapsed = time.time() - t_start
+        logger.info(f"배경 유형 분석 완료: {len(names_uncached)}장, {elapsed:.1f}초")
+        
+        # 캐시 저장
+        if cache_path:
+            self._save_cache(cache_path)
+        
+        self._log_type_stats()
+    
+    def _analyze_sequential(self, names: List[str]):
+        """순차적으로 배경 유형을 분석한다."""
+        for name in tqdm(names, desc="배경 유형 분석"):
             img_path = self.images_dir / name
             img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
             if img is None:
@@ -317,10 +431,28 @@ class BackgroundPool:
             bg_type = classify_background_simple(img)
             self.bg_types[name] = bg_type
             self.type_index[bg_type].append(name)
+    
+    def _analyze_parallel(self, names: List[str]):
+        """멀티프로세싱으로 배경 유형을 병렬 분석한다."""
+        images_dir_str = str(self.images_dir)
+        args_list = [(name, images_dir_str) for name in names]
         
-        # 분석 통계 출력
+        with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
+            results = list(tqdm(
+                executor.map(_classify_single_background, args_list, chunksize=32),
+                total=len(args_list),
+                desc=f"배경 유형 분석 (workers={self.num_workers})",
+            ))
+        
+        for name, bg_type in results:
+            if bg_type:  # 빈 문자열이면 로드 실패
+                self.bg_types[name] = bg_type
+                self.type_index[bg_type].append(name)
+    
+    def _log_type_stats(self):
+        """배경 유형별 통계를 로그에 출력한다."""
         total = sum(len(v) for v in self.type_index.values())
-        logger.info(f"배경 유형 분석 완료: {total}장")
+        logger.info(f"배경 유형 분석 결과: {total}장")
         for bg_type in ALL_BACKGROUND_TYPES:
             count = len(self.type_index[bg_type])
             pct = 100.0 * count / max(total, 1)
@@ -413,7 +545,11 @@ def load_roi_metadata(
     logger.info(f"ROI 메타데이터 로딩: {len(df)}행, 컬럼: {list(df.columns)}")
     
     lookup = {}
-    for _, row in df.iterrows():
+    # to_dict('records')가 iterrows()보다 2~5배 빠름
+    has_defect_bbox = 'defect_bbox' in df.columns
+    records = df.to_dict('records')
+    
+    for row in records:
         image_id = row['image_id']
         class_id = int(row['class_id'])
         region_id = int(row['region_id'])
@@ -424,7 +560,7 @@ def load_roi_metadata(
         
         # defect_bbox 파싱 (존재하는 경우)
         defect_bbox = None
-        if 'defect_bbox' in row and pd.notna(row['defect_bbox']):
+        if has_defect_bbox and pd.notna(row.get('defect_bbox')):
             try:
                 defect_bbox = parse_bbox_string(row['defect_bbox'])
             except (ValueError, TypeError):
@@ -469,6 +605,99 @@ def load_generation_summary(
     return summary, sample_map
 
 
+def _compose_single_task(args: dict) -> Optional[dict]:
+    """
+    단일 합성 작업을 수행하는 워커 함수 (멀티프로세싱용).
+    
+    Args:
+        args: 합성에 필요한 모든 인자를 담은 dict
+        
+    Returns:
+        성공 시 메타데이터 dict, 실패 시 실패 사유를 담은 dict {'__fail__': reason}
+    """
+    img_path_str = args['img_path']
+    hint_path_str = args['hint_path']
+    bg_path_str = args['bg_path']
+    roi_bbox = tuple(args['roi_bbox'])
+    class_id = args['class_id']
+    filename = args['filename']
+    bg_name = args['bg_name']
+    quality_score = args['quality_score']
+    defect_subtype = args['defect_subtype']
+    background_type = args['background_type']
+    defect_bbox_original = args.get('defect_bbox_original')
+    out_img_path_str = args['out_img_path']
+    out_mask_path_str = args['out_mask_path']
+    dilation_px = args['dilation_px']
+    blend_mode = args['blend_mode']
+    mask_threshold = args['mask_threshold']
+    png_compression = args['png_compression']
+    # Tier-1 증강 파라미터
+    jitter_x = args.get('jitter_x', 0)
+    scale_factor = args.get('scale_factor', 1.0)
+    use_smooth_mask = args.get('use_smooth_mask', False)
+    smooth_ksize = args.get('smooth_ksize', 21)
+    smooth_sigma = args.get('smooth_sigma', 7.0)
+    
+    # 워커 프로세스에서 PoissonBlender 생성 (stateless이므로 매번 생성해도 무방)
+    blender = PoissonBlender(
+        dilation_px=dilation_px,
+        blend_mode=blend_mode,
+        mask_threshold=mask_threshold,
+    )
+    
+    result = blender.compose_from_paths(
+        generated_path=img_path_str,
+        hint_path=hint_path_str,
+        clean_bg_path=bg_path_str,
+        roi_bbox=roi_bbox,
+        class_id=class_id,
+        jitter_x=jitter_x,
+        scale_factor=scale_factor,
+        use_smooth_mask=use_smooth_mask,
+        smooth_ksize=smooth_ksize,
+        smooth_sigma=smooth_sigma,
+    )
+    
+    if not result.success:
+        return {'__fail__': 'blend', 'filename': filename}
+    
+    # 출력 저장 (PNG 압축 레벨 적용)
+    png_params = [cv2.IMWRITE_PNG_COMPRESSION, png_compression]
+    cv2.imwrite(out_img_path_str, result.composited_image, png_params)
+    cv2.imwrite(out_mask_path_str, result.full_mask, png_params)
+    
+    out_img_name = Path(out_img_path_str).name
+    out_mask_name = Path(out_mask_path_str).name
+    
+    entry = {
+        "image_path": f"images/{out_img_name}",
+        "class_id": class_id,
+        "suitability_score": round(quality_score, 6),
+        "mask_path": f"masks/{out_mask_name}",
+        "bboxes": [[round(v, 6) for v in bbox] for bbox in result.bboxes],
+        "labels": result.labels,
+        "bbox_format": "yolo",
+        "image_width": result.composited_image.shape[1],
+        "image_height": result.composited_image.shape[0],
+        "source_generated": filename,
+        "source_background": bg_name,
+        "blend_method": result.blend_method,
+        "roi_bbox": list(roi_bbox),
+        "jitter_x": jitter_x,
+        "scale_factor": round(scale_factor, 6),
+    }
+    
+    if defect_bbox_original:
+        entry["defect_bbox_original"] = list(defect_bbox_original)
+    if defect_subtype != 'unknown':
+        entry["defect_subtype"] = defect_subtype
+    if background_type != 'unknown':
+        entry["background_type"] = background_type
+    
+    return entry
+
+
 def compose_all(
     generated_dir: Path,
     hint_dir: Path,
@@ -484,6 +713,15 @@ def compose_all(
     seed: int = 42,
     max_backgrounds: int = 5000,
     default_quality_score: float = 0.5,
+    num_workers: int = 0,
+    bg_cache_path: Optional[Path] = None,
+    png_compression: int = 1,
+    jitter_range: int = 0,
+    scale_min: float = 1.0,
+    scale_max: float = 1.0,
+    use_smooth_mask: bool = False,
+    smooth_ksize: int = 21,
+    smooth_sigma: float = 7.0,
 ):
     """
     전체 합성 파이프라인 실행.
@@ -503,8 +741,29 @@ def compose_all(
         seed: 랜덤 시드
         max_backgrounds: 배경 유형 분석할 최대 이미지 수
         default_quality_score: 품질 점수 없을 때 기본값
+        num_workers: 합성 병렬 워커 수 (0이면 순차 처리)
+        bg_cache_path: 배경 유형 캐시 JSON 경로 (None이면 캐시 미사용)
+        png_compression: PNG 압축 레벨 (0-9, 낮을수록 빠름, 기본 1)
+        jitter_range: x축 위치 랜덤 오프셋 최대값 (±N px, 0이면 비활성)
+        scale_min: 다운스케일 최소 비율 (기본 1.0)
+        scale_max: 다운스케일 최대 비율 (기본 1.0)
+        use_smooth_mask: 마스크 경계 가우시안 블러 적용 여부
+        smooth_ksize: 가우시안 커널 크기 (홀수, 기본 21)
+        smooth_sigma: 가우시안 시그마 (기본 7.0)
     """
+    pipeline_start = time.time()
     rng = random.Random(seed)
+    
+    # ── Tier-1 증강 옵션 로깅 ──
+    augmentation_active = jitter_range > 0 or scale_min < 1.0 or use_smooth_mask
+    if augmentation_active:
+        logger.info("Tier-1 증강 옵션 활성화:")
+        if jitter_range > 0:
+            logger.info(f"  Positional Jittering: ±{jitter_range}px")
+        if scale_min < 1.0:
+            logger.info(f"  Multi-Scale: [{scale_min:.4f}, {scale_max:.4f}]")
+        if use_smooth_mask:
+            logger.info(f"  Smooth Mask: ksize={smooth_ksize}, sigma={smooth_sigma}")
     
     # ── Step 1: 메타데이터 로딩 ──
     logger.info("=" * 60)
@@ -544,27 +803,24 @@ def compose_all(
         images_dir=clean_images_dir,
         cache_bg_types=True,
         max_analyze=max_backgrounds,
+        bg_cache_path=bg_cache_path,
+        num_workers=num_workers,
     )
     
-    # ── Step 4: PoissonBlender 초기화 ──
-    blender = PoissonBlender(
-        dilation_px=dilation_px,
-        blend_mode=blend_mode,
-        mask_threshold=mask_threshold,
-    )
-    
-    # ── Step 5: 출력 디렉토리 생성 ──
+    # ── Step 4: 출력 디렉토리 생성 ──
     out_img_dir = output_dir / "images"
     out_mask_dir = output_dir / "masks"
     out_img_dir.mkdir(parents=True, exist_ok=True)
     out_mask_dir.mkdir(parents=True, exist_ok=True)
     
-    # ── Step 6: 합성 처리 ──
+    # ── Step 5: 합성 작업 목록 사전 준비 ──
+    # 메인 프로세스에서 메타데이터 조회 + 배경 선택을 수행하고,
+    # 실제 합성(I/O + seamlessClone)은 워커로 분배한다.
     logger.info("=" * 60)
-    logger.info("Step 6: Poisson Blending 합성 시작")
+    logger.info("Step 5: 합성 작업 준비")
     logger.info("=" * 60)
     
-    all_metadata = []
+    tasks = []
     stats = {
         'total': len(generated_images),
         'success': 0,
@@ -577,7 +833,7 @@ def compose_all(
         'class_counts': {},
     }
     
-    for img_path in tqdm(generated_images, desc="Poisson 합성"):
+    for img_path in generated_images:
         filename = img_path.name
         sample_name = filename_to_sample_name(filename)
         
@@ -604,7 +860,6 @@ def compose_all(
         hint_path = hint_dir / hint_filename
         
         if not hint_path.exists():
-            # generation_summary에서 힌트 경로 폴백
             result_entry = sample_name_map.get(sample_name, {})
             hint_path_str = result_entry.get("hint_path", "")
             if hint_path_str:
@@ -630,69 +885,175 @@ def compose_all(
         
         bg_path = clean_images_dir / bg_name
         
-        # Poisson 합성 실행
-        result = blender.compose_from_paths(
-            generated_path=str(img_path),
-            hint_path=str(hint_path),
-            clean_bg_path=str(bg_path),
-            roi_bbox=roi_bbox,
-            class_id=class_id,
-        )
-        
-        if not result.success:
-            stats['fail_blend'] += 1
-            logger.debug(f"합성 실패: {filename} — {result.message}")
-            continue
-        
-        # ── 출력 저장 ──
-        # 파일명 구성: 원본 생성 파일명 유지 (추적 용이성)
-        out_img_name = filename
-        out_mask_name = filename.replace(".png", "_mask.png")
-        
-        out_img_path = out_img_dir / out_img_name
-        out_mask_path = out_mask_dir / out_mask_name
-        
-        cv2.imwrite(str(out_img_path), result.composited_image)
-        cv2.imwrite(str(out_mask_path), result.full_mask)
-        
         # 품질 점수 조회
         quality_score = get_quality_score(
             quality_map, filename, default=default_quality_score
         )
         
-        # 메타데이터 엔트리 구성
-        entry = {
-            "image_path": f"images/{out_img_name}",
-            "class_id": class_id,
-            "suitability_score": round(quality_score, 6),
-            "mask_path": f"masks/{out_mask_name}",
-            "bboxes": [[round(v, 6) for v in bbox] for bbox in result.bboxes],
-            "labels": result.labels,
-            "bbox_format": "yolo",
-            "image_width": result.composited_image.shape[1],
-            "image_height": result.composited_image.shape[0],
-            "source_generated": filename,
-            "source_background": bg_name,
-            "blend_method": result.blend_method,
-            "roi_bbox": list(roi_bbox),
+        out_img_name = filename
+        out_mask_name = filename.replace(".png", "_mask.png")
+        
+        # Tier-1 증강: 이미지별 랜덤 jitter_x, scale_factor 생성
+        img_jitter_x = rng.randint(-jitter_range, jitter_range) if jitter_range > 0 else 0
+        img_scale_factor = rng.uniform(scale_min, scale_max) if scale_min < scale_max else scale_min
+        
+        task = {
+            'img_path': str(img_path),
+            'hint_path': str(hint_path),
+            'bg_path': str(bg_path),
+            'roi_bbox': list(roi_bbox),
+            'class_id': class_id,
+            'filename': filename,
+            'bg_name': bg_name,
+            'quality_score': quality_score,
+            'defect_subtype': defect_subtype,
+            'background_type': background_type,
+            'defect_bbox_original': list(roi_meta['defect_bbox']) if roi_meta.get('defect_bbox') else None,
+            'out_img_path': str(out_img_dir / out_img_name),
+            'out_mask_path': str(out_mask_dir / out_mask_name),
+            'dilation_px': dilation_px,
+            'blend_mode': blend_mode,
+            'mask_threshold': mask_threshold,
+            'png_compression': png_compression,
+            # Tier-1 증강 파라미터
+            'jitter_x': img_jitter_x,
+            'scale_factor': img_scale_factor,
+            'use_smooth_mask': use_smooth_mask,
+            'smooth_ksize': smooth_ksize,
+            'smooth_sigma': smooth_sigma,
         }
+        tasks.append(task)
+    
+    logger.info(f"합성 작업 준비 완료: {len(tasks)}개 (사전 필터링 실패: "
+                f"{stats['total'] - len(tasks) - stats['fail_class_parse']}개)")
+    
+    # ── Step 6: 합성 실행 (순차 또는 병렬) ──
+    logger.info("=" * 60)
+    logger.info(f"Step 6: Poisson Blending 합성 시작 "
+                f"(workers={num_workers if num_workers > 1 else 'sequential'}, "
+                f"png_compression={png_compression})")
+    logger.info("=" * 60)
+    
+    all_metadata = []
+    compose_start = time.time()
+    
+    if num_workers > 1 and len(tasks) > 1:
+        # 멀티프로세싱 병렬 합성
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            results = list(tqdm(
+                executor.map(_compose_single_task, tasks, chunksize=4),
+                total=len(tasks),
+                desc=f"Poisson 합성 (workers={num_workers})",
+            ))
         
-        # 선택적 메타데이터
-        if roi_meta.get('defect_bbox'):
-            entry["defect_bbox_original"] = list(roi_meta['defect_bbox'])
-        if defect_subtype != 'unknown':
-            entry["defect_subtype"] = defect_subtype
-        if background_type != 'unknown':
-            entry["background_type"] = background_type
+        for result in results:
+            if result is None:
+                stats['fail_blend'] += 1
+            elif '__fail__' in result:
+                stats['fail_blend'] += 1
+            else:
+                all_metadata.append(result)
+                stats['success'] += 1
+                bm = result.get('blend_method', 'unknown')
+                stats['blend_methods'][bm] = stats['blend_methods'].get(bm, 0) + 1
+                cid = result['class_id']
+                stats['class_counts'][cid] = stats['class_counts'].get(cid, 0) + 1
+    else:
+        # 순차 합성 (싱글 프로세스, 배경 이미지 LRU 캐시 활용)
+        blender = PoissonBlender(
+            dilation_px=dilation_px,
+            blend_mode=blend_mode,
+            mask_threshold=mask_threshold,
+        )
         
-        all_metadata.append(entry)
+        # 배경 이미지 LRU 캐시 (순차 모드에서만 유효)
+        _bg_cache: Dict[str, np.ndarray] = {}
+        _BG_CACHE_MAX = 128
         
-        # 통계 갱신
-        stats['success'] += 1
-        stats['blend_methods'][result.blend_method] = \
-            stats['blend_methods'].get(result.blend_method, 0) + 1
-        stats['class_counts'][class_id] = \
-            stats['class_counts'].get(class_id, 0) + 1
+        def _load_bg_cached(path_str: str) -> Optional[np.ndarray]:
+            """배경 이미지를 LRU 캐시에서 로드. 없으면 디스크에서 읽고 캐시."""
+            if path_str in _bg_cache:
+                return _bg_cache[path_str]
+            img = cv2.imread(path_str, cv2.IMREAD_COLOR)
+            if img is not None and len(_bg_cache) < _BG_CACHE_MAX:
+                _bg_cache[path_str] = img
+            return img
+        
+        png_params = [cv2.IMWRITE_PNG_COMPRESSION, png_compression]
+        
+        for task in tqdm(tasks, desc="Poisson 합성"):
+            # 이미지 로드 (배경만 캐시)
+            generated = cv2.imread(task['img_path'], cv2.IMREAD_COLOR)
+            if generated is None:
+                stats['fail_blend'] += 1
+                continue
+            
+            hint = cv2.imread(task['hint_path'], cv2.IMREAD_COLOR)
+            if hint is None:
+                stats['fail_blend'] += 1
+                continue
+            
+            clean_bg = _load_bg_cached(task['bg_path'])
+            if clean_bg is None:
+                stats['fail_blend'] += 1
+                continue
+            
+            result = blender.compose_single(
+                generated, hint, clean_bg,
+                tuple(task['roi_bbox']), task['class_id'],
+                jitter_x=task['jitter_x'],
+                scale_factor=task['scale_factor'],
+                use_smooth_mask=task['use_smooth_mask'],
+                smooth_ksize=task['smooth_ksize'],
+                smooth_sigma=task['smooth_sigma'],
+            )
+            
+            if not result.success:
+                stats['fail_blend'] += 1
+                logger.debug(f"합성 실패: {task['filename']} — {result.message}")
+                continue
+            
+            # 출력 저장
+            cv2.imwrite(task['out_img_path'], result.composited_image, png_params)
+            cv2.imwrite(task['out_mask_path'], result.full_mask, png_params)
+            
+            out_img_name = Path(task['out_img_path']).name
+            out_mask_name = Path(task['out_mask_path']).name
+            
+            entry = {
+                "image_path": f"images/{out_img_name}",
+                "class_id": task['class_id'],
+                "suitability_score": round(task['quality_score'], 6),
+                "mask_path": f"masks/{out_mask_name}",
+                "bboxes": [[round(v, 6) for v in bbox] for bbox in result.bboxes],
+                "labels": result.labels,
+                "bbox_format": "yolo",
+                "image_width": result.composited_image.shape[1],
+                "image_height": result.composited_image.shape[0],
+                "source_generated": task['filename'],
+                "source_background": task['bg_name'],
+                "blend_method": result.blend_method,
+                "roi_bbox": task['roi_bbox'],
+                "jitter_x": task['jitter_x'],
+                "scale_factor": round(task['scale_factor'], 6),
+            }
+            
+            if task.get('defect_bbox_original'):
+                entry["defect_bbox_original"] = task['defect_bbox_original']
+            if task['defect_subtype'] != 'unknown':
+                entry["defect_subtype"] = task['defect_subtype']
+            if task['background_type'] != 'unknown':
+                entry["background_type"] = task['background_type']
+            
+            all_metadata.append(entry)
+            
+            stats['success'] += 1
+            stats['blend_methods'][result.blend_method] = \
+                stats['blend_methods'].get(result.blend_method, 0) + 1
+            stats['class_counts'][task['class_id']] = \
+                stats['class_counts'].get(task['class_id'], 0) + 1
+    
+    compose_elapsed = time.time() - compose_start
     
     # ── Step 7: metadata.json 저장 ──
     logger.info("=" * 60)
@@ -704,6 +1065,8 @@ def compose_all(
         json.dump(all_metadata, f, indent=2)
     
     # ── Step 8: 패키징 리포트 ──
+    pipeline_elapsed = time.time() - pipeline_start
+    
     report = {
         "source": {
             "generated_dir": str(generated_dir),
@@ -722,6 +1085,14 @@ def compose_all(
             "seed": seed,
             "max_backgrounds": max_backgrounds,
             "default_quality_score": default_quality_score,
+            "num_workers": num_workers,
+            "png_compression": png_compression,
+            "jitter_range": jitter_range,
+            "scale_min": scale_min,
+            "scale_max": scale_max,
+            "use_smooth_mask": use_smooth_mask,
+            "smooth_ksize": smooth_ksize,
+            "smooth_sigma": smooth_sigma,
         },
         "statistics": {
             "total_generated": stats['total'],
@@ -738,6 +1109,13 @@ def compose_all(
             "class_distribution": {
                 str(k): v for k, v in sorted(stats['class_counts'].items())
             },
+        },
+        "performance": {
+            "total_pipeline_sec": round(pipeline_elapsed, 1),
+            "compose_sec": round(compose_elapsed, 1),
+            "images_per_sec": round(
+                stats['success'] / max(compose_elapsed, 0.001), 1
+            ),
         },
         "output": {
             "output_dir": str(output_dir),
@@ -770,6 +1148,10 @@ def compose_all(
     logger.info(f"  총 bbox 수: {report['output']['total_bboxes']}")
     logger.info(f"  출력 디렉토리: {output_dir}")
     logger.info(f"  리포트: {report_path}")
+    logger.info(f"  --- 성능 ---")
+    logger.info(f"  전체 파이프라인: {pipeline_elapsed:.1f}초")
+    logger.info(f"  합성 처리: {compose_elapsed:.1f}초 "
+                f"({report['performance']['images_per_sec']} img/s)")
     
     # 품질 점수 통계
     if all_metadata:
@@ -844,6 +1226,44 @@ def main():
         "--default-quality-score", type=float, default=0.5,
         help="품질 점수 없을 때 기본값 (기본: 0.5)",
     )
+    # ── 성능 최적화 옵션 ──
+    parser.add_argument(
+        "--workers", type=int, default=0,
+        help="병렬 처리 워커 수 (0=순차, 권장: CPU코어수, 기본: 0)",
+    )
+    parser.add_argument(
+        "--bg-cache", type=str, default=None,
+        help="배경 유형 캐시 JSON 경로 (지정 시 재실행에서 분석 건너뜀)",
+    )
+    parser.add_argument(
+        "--png-compression", type=int, default=1,
+        help="PNG 압축 레벨 0-9 (낮을수록 빠름, 기본: 1, OpenCV 기본: 3)",
+    )
+    # ── Tier-1 합성 품질 개선 옵션 ──
+    parser.add_argument(
+        "--jitter-range", type=int, default=0,
+        help="x축 위치 랜덤 오프셋 최대값 ±N px (0=비활성, 권장: 50~200)",
+    )
+    parser.add_argument(
+        "--scale-min", type=float, default=1.0,
+        help="다운스케일 최소 비율 (권장: 0.875, 기본: 1.0)",
+    )
+    parser.add_argument(
+        "--scale-max", type=float, default=1.0,
+        help="다운스케일 최대 비율 (기본: 1.0)",
+    )
+    parser.add_argument(
+        "--smooth-mask", action="store_true", default=False,
+        help="마스크 경계 가우시안 블러 적용 (기본: 비활성)",
+    )
+    parser.add_argument(
+        "--smooth-ksize", type=int, default=21,
+        help="가우시안 커널 크기 (홀수, 기본: 21)",
+    )
+    parser.add_argument(
+        "--smooth-sigma", type=float, default=7.0,
+        help="가우시안 시그마 (기본: 7.0)",
+    )
     
     args = parser.parse_args()
     
@@ -852,6 +1272,13 @@ def main():
         cv2.NORMAL_CLONE if args.blend_mode == "NORMAL_CLONE"
         else cv2.MIXED_CLONE
     )
+    
+    # workers 자동 설정 (0이면 순차)
+    num_workers = args.workers
+    if num_workers < 0:
+        cpu_count = os.cpu_count() or 4
+        num_workers = max(1, cpu_count - 1)
+        logger.info(f"워커 수 자동 설정: {num_workers} (CPU: {cpu_count})")
     
     compose_all(
         generated_dir=Path(args.generated_dir),
@@ -868,6 +1295,15 @@ def main():
         seed=args.seed,
         max_backgrounds=args.max_backgrounds,
         default_quality_score=args.default_quality_score,
+        num_workers=num_workers,
+        bg_cache_path=Path(args.bg_cache) if args.bg_cache else None,
+        png_compression=args.png_compression,
+        jitter_range=args.jitter_range,
+        scale_min=args.scale_min,
+        scale_max=args.scale_max,
+        use_smooth_mask=args.smooth_mask,
+        smooth_ksize=args.smooth_ksize,
+        smooth_sigma=args.smooth_sigma,
     )
 
 

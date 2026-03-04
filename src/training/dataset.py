@@ -300,12 +300,14 @@ class CASDASyntheticDataset(Dataset):
         suitability_threshold: Optional[float] = None,
         max_samples: Optional[int] = None,
         transform=None,
+        stratified: bool = False,
     ):
         self.data_dir = Path(data_dir)
         self.mode = mode
         self.input_size = input_size
         self.num_classes = num_classes
         self.transform = transform
+        self.stratified = stratified
 
         # Load metadata
         self.samples = self._load_metadata(suitability_threshold, max_samples)
@@ -345,22 +347,88 @@ class CASDASyntheticDataset(Dataset):
                 all_samples.append({
                     'image_path': str(img_path),
                     'class_id': class_id,
-                    'suitability_score': 1.0,
+                    'suitability_score': 0.0,
                 })
 
         # Filter by suitability
         if suitability_threshold is not None:
             all_samples = [
                 s for s in all_samples
-                if s.get('suitability_score', 1.0) >= suitability_threshold
+                if s.get('suitability_score', 0.0) >= suitability_threshold
             ]
 
         # Sort by suitability (descending) and limit
-        all_samples.sort(key=lambda x: x.get('suitability_score', 1.0), reverse=True)
+        all_samples.sort(key=lambda x: x.get('suitability_score', 0.0), reverse=True)
         if max_samples is not None:
-            all_samples = all_samples[:max_samples]
+            if self.stratified:
+                all_samples = CASDASyntheticDataset._stratified_top_k(all_samples, max_samples)
+            else:
+                all_samples = all_samples[:max_samples]
 
         return all_samples
+
+    @staticmethod
+    def _stratified_top_k(samples: List[Dict], k: int) -> List[Dict]:
+        """
+        클래스 비율을 유지하면서 suitability_score 상위 k개를 선택한다.
+        
+        알고리즘:
+          (a) 전체 샘플을 class_id별로 그룹화
+          (b) 각 클래스에 비율 기반 할당량 계산 (최소 1개 보장)
+          (c) 할당량 합계가 k를 초과하면 큰 그룹부터 1씩 감소
+          (d) 할당량 합계가 k 미만이면 여유 있는 그룹에 1씩 추가
+          (e) 각 그룹 내에서 suitability_score 내림차순 정렬 후 할당량만큼 선택
+        """
+        from collections import defaultdict
+
+        if len(samples) <= k:
+            return samples
+
+        # (a) class_id별 그룹화
+        groups: Dict[int, List[Dict]] = defaultdict(list)
+        for s in samples:
+            groups[s.get('class_id', 0)].append(s)
+
+        n_total = len(samples)
+        n_classes = len(groups)
+
+        # (b) 비율 기반 할당량 (최소 1개 보장)
+        quotas: Dict[int, int] = {}
+        for cls_id, cls_samples in groups.items():
+            quota = max(1, round(len(cls_samples) / n_total * k))
+            # 그룹 크기를 초과하지 않도록 제한
+            quota = min(quota, len(cls_samples))
+            quotas[cls_id] = quota
+
+        # (c) 할당량 합계가 k를 초과하면 큰 그룹부터 1씩 감소
+        while sum(quotas.values()) > k:
+            # 할당량이 가장 큰 클래스부터 감소 (최소 1 유지)
+            largest_cls = max(quotas, key=lambda c: quotas[c])
+            if quotas[largest_cls] > 1:
+                quotas[largest_cls] -= 1
+            else:
+                break
+
+        # (d) 할당량 합계가 k 미만이면 여유 있는 그룹에 1씩 추가
+        while sum(quotas.values()) < k:
+            added = False
+            # 여유(그룹 크기 - 할당량)가 큰 클래스부터 추가
+            for cls_id in sorted(quotas, key=lambda c: len(groups[c]) - quotas[c], reverse=True):
+                if quotas[cls_id] < len(groups[cls_id]):
+                    quotas[cls_id] += 1
+                    added = True
+                    if sum(quotas.values()) >= k:
+                        break
+            if not added:
+                break
+
+        # (e) 각 그룹에서 score 내림차순 상위 할당량만큼 선택
+        result = []
+        for cls_id, cls_samples in groups.items():
+            cls_samples.sort(key=lambda x: x.get('suitability_score', 0.0), reverse=True)
+            result.extend(cls_samples[:quotas[cls_id]])
+
+        return result
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -734,6 +802,35 @@ def create_data_loaders(
                 max_samples=group_max_samples or casda_config.get('pruning_top_k', 2000),
                 transform=train_transform,
             )
+        elif casda_data == "composed":
+            raw_casda = casda_config.get('composed_dir', 'data/augmented/casda_composed')
+            casda_dir = raw_casda if os.path.isabs(raw_casda) else str(project_root / raw_casda)
+            # casda_pruning 설정 병합 (casda_composed_pruning 그룹용)
+            pruning_cfg = group_config.get('casda_pruning', {})
+            pruning_enabled = pruning_cfg.get('enabled', False)
+            stratified = pruning_cfg.get('stratified', False)
+            if pruning_enabled:
+                casda_dataset = CASDASyntheticDataset(
+                    data_dir=casda_dir,
+                    mode=model_type,
+                    input_size=input_size,
+                    num_classes=ds_config.get('num_classes', 4),
+                    suitability_threshold=pruning_cfg.get('suitability_threshold',
+                                                          casda_config.get('suitability_threshold', 0.63)),
+                    max_samples=group_max_samples or pruning_cfg.get('top_k',
+                                                                     casda_config.get('pruning_top_k', 2000)),
+                    transform=train_transform,
+                    stratified=stratified,
+                )
+            else:
+                casda_dataset = CASDASyntheticDataset(
+                    data_dir=casda_dir,
+                    mode=model_type,
+                    input_size=input_size,
+                    num_classes=ds_config.get('num_classes', 4),
+                    max_samples=group_max_samples,
+                    transform=train_transform,
+                )
         else:
             casda_dataset = None
 

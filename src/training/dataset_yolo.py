@@ -285,6 +285,66 @@ def prepare_yolo_dataset(
     return str(yaml_path)
 
 
+def _stratified_top_k_yolo(samples: List[Dict], k: int) -> List[Dict]:
+    """
+    클래스 비율을 유지하면서 suitability_score 상위 k개를 선택한다.
+    YOLO 데이터 구조에 맞게 적용.
+    
+    알고리즘:
+      (a) 전체 샘플을 class_id별로 그룹화
+      (b) 각 클래스에 비율 기반 할당량 계산 (최소 1개 보장)
+      (c) 할당량 합계가 k를 초과하면 큰 그룹부터 1씩 감소
+      (d) 할당량 합계가 k 미만이면 여유 있는 그룹에 1씩 추가
+      (e) 각 그룹 내에서 suitability_score 내림차순 정렬 후 할당량만큼 선택
+    """
+    from collections import defaultdict
+
+    if len(samples) <= k:
+        return samples
+
+    # (a) class_id별 그룹화
+    groups: Dict[int, List[Dict]] = defaultdict(list)
+    for s in samples:
+        groups[s.get('class_id', 0)].append(s)
+
+    n_total = len(samples)
+
+    # (b) 비율 기반 할당량 (최소 1개 보장)
+    quotas: Dict[int, int] = {}
+    for cls_id, cls_samples in groups.items():
+        quota = max(1, round(len(cls_samples) / n_total * k))
+        quota = min(quota, len(cls_samples))
+        quotas[cls_id] = quota
+
+    # (c) 할당량 합계가 k를 초과하면 큰 그룹부터 1씩 감소
+    while sum(quotas.values()) > k:
+        largest_cls = max(quotas, key=lambda c: quotas[c])
+        if quotas[largest_cls] > 1:
+            quotas[largest_cls] -= 1
+        else:
+            break
+
+    # (d) 할당량 합계가 k 미만이면 여유 있는 그룹에 1씩 추가
+    while sum(quotas.values()) < k:
+        added = False
+        for cls_id in sorted(quotas, key=lambda c: len(groups[c]) - quotas[c], reverse=True):
+            if quotas[cls_id] < len(groups[cls_id]):
+                quotas[cls_id] += 1
+                added = True
+                if sum(quotas.values()) >= k:
+                    break
+        if not added:
+            break
+
+    # (e) 각 그룹에서 score 내림차순 상위 할당량만큼 선택
+    result = []
+    for cls_id, cls_samples in groups.items():
+        cls_samples.sort(key=lambda x: x.get('suitability_score', 0.0), reverse=True)
+        result.extend(cls_samples[:quotas[cls_id]])
+
+    return result
+
+
 def _add_casda_to_training(
     casda_dir: str,
     casda_mode: str,
@@ -345,19 +405,23 @@ def _add_casda_to_training(
             all_samples.append({
                 'image_path': str(img_path),
                 'class_id': class_id,
-                'suitability_score': 1.0,
+                'suitability_score': 0.0,
             })
 
     # Filter by suitability for pruning mode
     if casda_mode == "pruning":
         threshold = casda_config.get('suitability_threshold', 0.63)
         top_k = casda_config.get('pruning_top_k', 2000)
+        stratified = casda_config.get('stratified', False)
         all_samples = [
             s for s in all_samples
-            if s.get('suitability_score', 1.0) >= threshold
+            if s.get('suitability_score', 0.0) >= threshold
         ]
-        all_samples.sort(key=lambda x: x.get('suitability_score', 1.0), reverse=True)
-        all_samples = all_samples[:top_k]
+        all_samples.sort(key=lambda x: x.get('suitability_score', 0.0), reverse=True)
+        if stratified:
+            all_samples = _stratified_top_k_yolo(all_samples, top_k)
+        else:
+            all_samples = all_samples[:top_k]
 
     count = 0
     for idx, sample in enumerate(all_samples):

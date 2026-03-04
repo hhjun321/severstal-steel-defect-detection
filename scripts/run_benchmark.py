@@ -90,6 +90,8 @@ GROUP_ALIASES = {
     "traditional": "baseline_trad",
     "full":      "casda_full",
     "pruning":   "casda_pruning",
+    "composed":  "casda_composed",
+    "composed_pruning": "casda_composed_pruning",
     # Special
     "all":       "__ALL__",
 }
@@ -734,10 +736,16 @@ Examples:
                              '없으면 이 디렉토리에 변환 결과를 저장하여 다음 실행 시 재사용')
     parser.add_argument('--casda-ratio', type=float, nargs='+', default=None,
                         help='CASDA 합성 데이터 주입 비율 (0.0~1.0). '
-                             '지정 시 casda_full 데이터에서 비율에 맞는 수량만 선택. '
+                             '지정 시 CASDA 데이터에서 비율에 맞는 수량만 선택. '
                              '복수 비율 지정 가능: --casda-ratio 0.1 0.2 0.3. '
                              '원본 train 수 대비 비율로 max_samples 자동 계산. '
                              '예: 0.1 → 원본 4666장의 10% ≈ 518장 합성 추가')
+    parser.add_argument('--casda-ratio-source', type=str, default='full',
+                        choices=['full', 'composed'],
+                        help='--casda-ratio 그룹의 데이터 소스 선택. '
+                             'full: casda_full 디렉토리 (기본), '
+                             'composed: casda_composed 디렉토리. '
+                             '예: --casda-ratio 0.3 --casda-ratio-source composed')
     args = parser.parse_args()
 
     # Load config
@@ -764,6 +772,12 @@ Examples:
                 tag = " [CASDA full]"
             elif casda == "pruning":
                 tag = " [CASDA pruning]"
+            elif casda == "composed":
+                pruning_cfg = grp.get('casda_pruning', {})
+                if pruning_cfg.get('enabled', False):
+                    tag = " [CASDA composed+pruning]"
+                else:
+                    tag = " [CASDA composed]"
             elif grp.get('augmentation') == 'traditional':
                 tag = " [traditional aug]"
             else:
@@ -797,7 +811,8 @@ Examples:
             config['dataset']['casda'] = {}
         config['dataset']['casda']['full_dir'] = os.path.join(casda_base, 'casda_full')
         config['dataset']['casda']['pruning_dir'] = os.path.join(casda_base, 'casda_pruning')
-        print(f"[INFO] casda paths overridden: {casda_base}/casda_full, {casda_base}/casda_pruning")
+        config['dataset']['casda']['composed_dir'] = os.path.join(casda_base, 'casda_composed')
+        print(f"[INFO] casda paths overridden: {casda_base}/casda_full, {casda_base}/casda_pruning, {casda_base}/casda_composed")
 
     # Override split CSV if specified
     if args.split_csv:
@@ -865,6 +880,7 @@ Examples:
 
     # ====== --casda-ratio: 동적 ratio 그룹 생성 ======
     # --casda-ratio 0.1 0.2 0.3 → casda_ratio_10, casda_ratio_20, casda_ratio_30 그룹 자동 생성
+    # --casda-ratio-source full|composed → 데이터 소스 선택 (기본: full)
     # --groups 미지정 + --casda-ratio 지정 시: ratio 그룹만 실행
     # --groups 지정 + --casda-ratio 지정 시: 기존 그룹 + ratio 그룹 병행
     casda_ratio_map = {}  # group_key → (ratio, max_samples)
@@ -873,10 +889,22 @@ Examples:
         if args.groups is None:
             group_keys = []
 
+        # ratio 소스 결정
+        ratio_source = getattr(args, 'casda_ratio_source', 'full')
+        if ratio_source == 'composed':
+            ratio_casda_data = 'composed'
+            ratio_casda_subdir = 'casda_composed'
+            ratio_source_label = 'casda_composed'
+        else:
+            ratio_casda_data = 'full'
+            ratio_casda_subdir = 'casda_full'
+            ratio_source_label = 'casda_full'
+
         # 원본 train 수 계산 (split IDs로부터)
         train_ids_for_ratio, _, _ = get_split_ids(config)
         num_train_original = len(train_ids_for_ratio)
         logging.info(f"Original training set size: {num_train_original}")
+        logging.info(f"CASDA ratio source: {ratio_source_label}")
 
         for ratio in args.casda_ratio:
             if not (0.0 < ratio < 1.0):
@@ -892,10 +920,10 @@ Examples:
             # 동적 dataset group 등록
             config['dataset_groups'][ratio_key] = {
                 'name': f"CASDA-Ratio-{ratio_pct}%",
-                'description': f"Original + {max_samples} CASDA images ({ratio_pct}% synthetic ratio)",
+                'description': f"Original + {max_samples} CASDA images ({ratio_pct}% synthetic ratio, source={ratio_source_label})",
                 'use_original': True,
                 'augmentation': 'none',
-                'casda_data': 'full',  # casda_full 디렉토리에서 상위 N개 선택
+                'casda_data': ratio_casda_data,
                 '_casda_max_samples': max_samples,
                 '_casda_ratio': ratio,
             }
@@ -905,7 +933,7 @@ Examples:
                 group_keys.append(ratio_key)
 
             logging.info(f"  Created ratio group: {ratio_key} "
-                         f"(ratio={ratio:.0%}, max_samples={max_samples})")
+                         f"(ratio={ratio:.0%}, max_samples={max_samples}, source={ratio_source_label})")
 
     logging.info(f"Models: {model_keys}")
     logging.info(f"Dataset groups: {group_keys}")
@@ -924,7 +952,7 @@ Examples:
     reporter = BenchmarkReporter(str(experiment_dir))
 
     # ====== FID Evaluation ======
-    casda_groups_for_fid = {'casda_full', 'casda_pruning'}
+    casda_groups_for_fid = {'casda_full', 'casda_pruning', 'casda_composed', 'casda_composed_pruning'}
     casda_groups_for_fid.update(casda_ratio_map.keys())
     has_casda = any(g in casda_groups_for_fid for g in group_keys)
 
@@ -945,16 +973,19 @@ Examples:
     run_idx = 0
     start_time = time.time()
 
-    CASDA_GROUPS = {"casda_full", "casda_pruning"}
+    CASDA_GROUPS = {"casda_full", "casda_pruning", "casda_composed", "casda_composed_pruning"}
     CASDA_GROUP_TO_SUBDIR = {
         "casda_full": "casda_full",
         "casda_pruning": "casda_pruning",
+        "casda_composed": "casda_composed",
+        "casda_composed_pruning": "casda_composed",
     }
 
-    # ratio 그룹도 CASDA 그룹으로 취급 (casda_full 디렉토리 사용)
+    # ratio 그룹도 CASDA 그룹으로 취급 (소스에 따라 casda_full 또는 casda_composed)
+    ratio_subdir = "casda_composed" if getattr(args, 'casda_ratio_source', 'full') == 'composed' else "casda_full"
     for rk in casda_ratio_map:
         CASDA_GROUPS.add(rk)
-        CASDA_GROUP_TO_SUBDIR[rk] = "casda_full"  # ratio 그룹은 casda_full에서 선택
+        CASDA_GROUP_TO_SUBDIR[rk] = ratio_subdir
 
     # Resolve baseline_raw YOLO directory
     baseline_yolo_dir = None
@@ -983,6 +1014,8 @@ Examples:
                     casda_data_dir = casda_cfg.get('full_dir', '')
                 elif casda_subdir == "casda_pruning":
                     casda_data_dir = casda_cfg.get('pruning_dir', '')
+                elif casda_subdir == "casda_composed":
+                    casda_data_dir = casda_cfg.get('composed_dir', '')
                 else:
                     casda_data_dir = casda_cfg.get('full_dir', '')
 

@@ -155,6 +155,22 @@ class UltralyticsTrainer:
                 raw_dir = casda_cfg.get('pruning_dir', 'data/augmented/casda_pruning')
                 casda_dir = self._resolve_path(raw_dir)
                 casda_mode = "pruning"
+            elif casda_data == "composed":
+                raw_dir = casda_cfg.get('composed_dir', 'data/augmented/casda_composed')
+                casda_dir = self._resolve_path(raw_dir)
+                # group_config의 casda_pruning 설정으로 pruning 여부 결정
+                pruning_cfg = self.group_config.get('casda_pruning', {})
+                if pruning_cfg.get('enabled', False):
+                    casda_mode = "pruning"
+                    # pruning 설정을 casda_config에 병합하여 전달
+                    casda_config_dict = dict(casda_cfg)
+                    casda_config_dict['suitability_threshold'] = pruning_cfg.get(
+                        'suitability_threshold', casda_cfg.get('suitability_threshold', 0.63))
+                    casda_config_dict['pruning_top_k'] = pruning_cfg.get(
+                        'top_k', casda_cfg.get('pruning_top_k', 2000))
+                    casda_config_dict['stratified'] = pruning_cfg.get('stratified', False)
+                else:
+                    casda_mode = "full"
 
         # Determine output directory for converted dataset
         # If yolo_dir specified (but invalid/empty), save there for future reuse

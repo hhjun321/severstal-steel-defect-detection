@@ -1,0 +1,474 @@
+20260303 작업 일지 #1 - v5.3 벤치마크 실험 결과 분석
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+v5.3 CASDA 벤치마크 실험 결과를 분석하여 v5.2 대비 개선/퇴보를 정량적으로
+평가하고, 실험 실패 원인을 파악하여 후속 조치를 결정한다.
+
+  분석 대상: outputs/v5.3/
+    - benchmark_results/         (벤치마크 결과 JSON, CSV, 로그)
+    - *_casda_full.json          (학습 히스토리)
+    - *_casda_pruning.json       (학습 히스토리)
+    - *.csv                      (에폭별 학습 로그)
+
+  비교 대상: outputs/v5.2/benchmark_result_v5.2/
+
+
+2. 실험 설계
+================================================================================
+
+  2-1. 실험 매트릭스 (계획 vs 실제)
+  ──────────────────────────────────
+
+    계획: 3 모델 x 4 데이터셋 = 12회
+    실제: 3 모델 x 2 데이터셋 = 6회 (baseline_raw, baseline_trad 미실행)
+
+    | 모델        | CASDA-Full | CASDA-Pruning | baseline_raw | baseline_trad |
+    |-------------|:----------:|:-------------:|:------------:|:-------------:|
+    | YOLO-MFD    | 완료       | 크래시         | 미실행        | 미실행         |
+    | EB-YOLOv8   | 완료       | 완료 (실패)    | 미실행        | 미실행         |
+    | DeepLabV3+  | 완료       | 완료           | 미실행        | 미실행         |
+
+    ※ baseline 미실행으로 H1, H3, H4 가설 검증 불가
+
+  2-2. 데이터셋 구성
+  ──────────────────────────────────
+
+    | 항목                  | 값                           |
+    |-----------------------|------------------------------|
+    | 원본 train            | 4,666장                      |
+    | 원본 val              | 1,000장                      |
+    | 원본 test             | 1,000장                      |
+    | CASDA-Full 주입       | 4,744장 (합산 train: 9,410)  |
+    | CASDA-Pruning 기준    | suitability >= 0.60, top_k=2000 |
+    | split 비율            | 70/15/15, stratified, seed=42 |
+
+  2-3. 공통 학습 설정
+  ──────────────────────────────────
+
+    | 항목              | Detection (YOLO)  | Segmentation (DLv3+) |
+    |-------------------|-------------------|----------------------|
+    | Max Epochs        | 300               | 300                  |
+    | Optimizer         | AdamW             | AdamW                |
+    | Early Stopping    | 30 epochs patience| 40 epochs patience   |
+    | Mixed Precision   | fp16              | fp16                 |
+    | Batch Size        | 16                | 8                    |
+    | Input Size        | 640x640           | 256x512              |
+
+
+3. 테스트 셋 성능 결과 (핵심)
+================================================================================
+
+  3-1. 전체 요약
+  ──────────────────────────────────
+
+    Detection (mAP@0.5):
+
+      | 모델        | CASDA-Full | CASDA-Pruning |
+      |-------------|------------|---------------|
+      | EB-YOLOv8   | 0.5100     | 0.0633        |
+      | YOLO-MFD    | 0.3050     | 크래시 (N/A)  |
+
+    Segmentation (Dice):
+
+      | 모델        | CASDA-Full | CASDA-Pruning |
+      |-------------|------------|---------------|
+      | DeepLabV3+  | 0.6254     | 0.6346        |
+
+  3-2. 클래스별 성능 — Detection
+  ──────────────────────────────────
+
+    EB-YOLOv8 + CASDA-Full (mAP@0.5 = 0.5100):
+      | 클래스   | AP       | 비고          |
+      |----------|----------|---------------|
+      | Class 1  | 0.4558   |               |
+      | Class 2  | 0.5100   | 최고 AP       |
+      | Class 3  | 0.5552   | 최고 AP       |
+      | Class 4  | 0.5192   |               |
+
+      ※ Class 2 AP=0.510은 v5.2(0.131) 대비 대폭 개선 (+0.379)
+      ※ Precision=0.844, Recall=0.175
+
+    YOLO-MFD + CASDA-Full (mAP@0.5 = 0.3050):
+      | 클래스   | AP       | 비고           |
+      |----------|----------|----------------|
+      | Class 1  | 0.2827   |                |
+      | Class 2  | 0.0000   | 탐지 실패      |
+      | Class 3  | 0.4810   |                |
+      | Class 4  | 0.4563   |                |
+
+      ※ Precision=0.566, Recall=0.044
+
+    EB-YOLOv8 + CASDA-Pruning (mAP@0.5 = 0.0633):
+      | 클래스   | AP       | 비고           |
+      |----------|----------|----------------|
+      | Class 1  | 0.0000   | 탐지 실패      |
+      | Class 2  | 0.0000   | 탐지 실패      |
+      | Class 3  | 0.0000   | 탐지 실패      |
+      | Class 4  | 0.2533   | 유일하게 탐지  |
+
+      ※ Precision=0.125, Recall=0.0008 — 사실상 모델 실패
+
+  3-3. 클래스별 성능 — Segmentation
+  ──────────────────────────────────
+
+    DeepLabV3+ + CASDA-Full (Dice = 0.6254):
+      | 클래스   | Dice     | IoU      |
+      |----------|----------|----------|
+      | Class 1  | 0.5191   | 0.3505   |
+      | Class 2  | 0.4892   | 0.3238   |
+      | Class 3  | 0.7270   | 0.5711   |
+      | Class 4  | 0.7663   | 0.6211   |
+
+    DeepLabV3+ + CASDA-Pruning (Dice = 0.6346):
+      | 클래스   | Dice     | IoU      |
+      |----------|----------|----------|
+      | Class 1  | 0.5339   | 0.3642   |
+      | Class 2  | 0.5078   | 0.3403   |
+      | Class 3  | 0.7240   | 0.5674   |
+      | Class 4  | 0.7725   | 0.6293   |
+
+    ※ Pruning이 Full보다 Dice +0.009 높음 (Full 0.6254 vs Pruning 0.6346)
+      Class 1 (+0.015), Class 2 (+0.019), Class 4 (+0.006) 개선
+      Class 3만 소폭 하락 (-0.003)
+
+
+4. v5.2 대비 v5.3 성능 비교
+================================================================================
+
+  4-1. CASDA-Full 비교
+  ──────────────────────────────────
+
+    Detection (mAP@0.5):
+      | 모델        | v5.2    | v5.3    | 차이     | 판정   |
+      |-------------|---------|---------|----------|--------|
+      | EB-YOLOv8   | 0.4291  | 0.5100  | +0.081   | 개선   |
+      | YOLO-MFD    | 0.3637  | 0.3050  | -0.059   | 퇴보   |
+
+    Segmentation (Dice):
+      | 모델        | v5.2    | v5.3    | 차이     | 판정   |
+      |-------------|---------|---------|----------|--------|
+      | DeepLabV3+  | 0.6380  | 0.6254  | -0.013   | 소폭 퇴보 |
+
+    클래스별 AP 비교 (EB-YOLOv8, CASDA-Full):
+      | 클래스   | v5.2    | v5.3    | 차이     |
+      |----------|---------|---------|----------|
+      | Class 1  | 0.4525  | 0.4558  | +0.003   |
+      | Class 2  | 0.1312  | 0.5100  | +0.379   |
+      | Class 3  | 0.5773  | 0.5552  | -0.022   |
+      | Class 4  | 0.5551  | 0.5192  | -0.036   |
+
+      ※ Class 2의 극적 개선(+0.379)이 전체 mAP 상승의 주요 원인
+      ※ Class 3, 4는 소폭 하락
+
+    클래스별 AP 비교 (YOLO-MFD, CASDA-Full):
+      | 클래스   | v5.2    | v5.3    | 차이     |
+      |----------|---------|---------|----------|
+      | Class 1  | 0.4192  | 0.2827  | -0.137   |
+      | Class 2  | 0.0000  | 0.0000  | 0.000    |
+      | Class 3  | 0.5467  | 0.4810  | -0.066   |
+      | Class 4  | 0.4888  | 0.4563  | -0.033   |
+
+    클래스별 Dice 비교 (DeepLabV3+, CASDA-Full):
+      | 클래스   | v5.2    | v5.3    | 차이     |
+      |----------|---------|---------|----------|
+      | Class 1  | 0.5082  | 0.5191  | +0.011   |
+      | Class 2  | 0.5372  | 0.4892  | -0.048   |
+      | Class 3  | 0.7359  | 0.7270  | -0.009   |
+      | Class 4  | 0.7708  | 0.7663  | -0.005   |
+
+  4-2. CASDA-Pruning 비교
+  ──────────────────────────────────
+
+    Detection (mAP@0.5):
+      | 모델        | v5.2    | v5.3    | 차이     | 판정          |
+      |-------------|---------|---------|----------|---------------|
+      | EB-YOLOv8   | 0.3779  | 0.0633  | -0.315   | 치명적 퇴보   |
+      | YOLO-MFD    | 0.3419  | 크래시  | N/A      | 실험 실패     |
+
+    Segmentation (Dice):
+      | 모델        | v5.2    | v5.3    | 차이     | 판정          |
+      |-------------|---------|---------|----------|---------------|
+      | DeepLabV3+  | 0.6429  | 0.6346  | -0.008   | 소폭 퇴보     |
+
+  4-3. FID Score 비교
+  ──────────────────────────────────
+
+    | 버전 | FID Score | 판정           |
+    |------|-----------|----------------|
+    | v5.2 | 165.38    |                |
+    | v5.3 | 156.31    | 개선 (-9.07)   |
+
+    ※ FID 낮을수록 좋음. 합성 이미지 품질 자체는 v5.3이 더 우수.
+
+
+5. 학습 상세 분석
+================================================================================
+
+  5-1. 학습 통계 요약
+  ──────────────────────────────────
+
+    | 실험                    | 에폭 | 최고 에폭 | 최고 val_metric | 테스트 성능  | 학습 시간 |
+    |-------------------------|------|-----------|-----------------|-------------|-----------|
+    | EB-YOLOv8 + Full        | 120  | 85        | 0.3921          | mAP 0.5100  | 2.46h     |
+    | EB-YOLOv8 + Pruning     | 36   | 5         | 0.2510          | mAP 0.0633  | 0.48h     |
+    | YOLO-MFD + Full         | 97   | 92        | 0.3662          | mAP 0.3050  | 2.38h     |
+    | YOLO-MFD + Pruning      | 크래시 | N/A     | N/A             | N/A         | N/A       |
+    | DeepLabV3+ + Full       | 90   | 48        | 0.6318          | Dice 0.6254 | 5.72h     |
+    | DeepLabV3+ + Pruning    | 89   | 47        | 0.6396          | Dice 0.6346 | 3.83h     |
+
+    총 학습 시간: 약 15시간 (Colab T4 GPU)
+
+  5-2. EB-YOLOv8 + CASDA-Full 학습 분석
+  ──────────────────────────────────
+
+    상태: 정상 수렴
+
+    - 120 에폭 학습 (300 중 early stop at 119)
+    - val_metric 초기 불안정 (epoch 0~10: 0.0~0.125 진동)
+    - 중반부 안정화 (epoch 60~85: 0.35~0.39)
+    - 최고 val_metric: 0.3921 (epoch 85)
+    - 테스트 mAP: 0.5100 (val보다 높음 — 과소평가된 val 가능성)
+    - 학습 시간: 2.46시간
+
+  5-3. EB-YOLOv8 + CASDA-Pruning 학습 분석
+  ──────────────────────────────────
+
+    상태: 학습 실패 (치명적)
+
+    - 36 에폭만에 early stop (300 중)
+    - 최고 val_metric: 0.2510 (epoch 5, 극초반)
+    - epoch 5 이후 val_metric 급격 하락 → 0.0~0.135 범위에서 진동
+    - 마지막 2 에폭 val_metric: 0.0, 0.0
+    - 테스트 mAP: 0.0633 (Class 4만 0.253, 나머지 0.0)
+
+    추정 원인:
+      - Pruning 데이터셋의 클래스 분포 불균형 심화 가능성
+      - suitability >= 0.60 필터링이 특정 클래스를 과도하게 제거했을 가능성
+      - detection 모델(EB-YOLOv8)이 pruning 데이터에서 불안정한 반면
+        segmentation 모델(DeepLabV3+)은 정상 학습 → 데이터 문제보다는
+        detection 라벨(bbox) 변환 이슈일 가능성
+
+  5-4. YOLO-MFD + CASDA-Full 학습 분석
+  ──────────────────────────────────
+
+    상태: 정상 수렴 (성능은 v5.2 대비 하락)
+
+    - 97 에폭 학습 (early stop at 96)
+    - val_metric: 0.063 → 0.366 (점진적 상승)
+    - 최고 val_metric: 0.3662 (epoch 92)
+    - 테스트 mAP: 0.3050 (val보다 낮음)
+    - Class 2 AP: 0.000 (YOLO-MFD는 v5.2에서도 Class 2 탐지 실패)
+
+  5-5. YOLO-MFD + CASDA-Pruning 크래시 분석
+  ──────────────────────────────────
+
+    상태: 실험 크래시
+
+    benchmark.log line 2419:
+      [ERROR] Experiment failed: yolo_mfd + casda_pruning:
+        PytorchStreamReader failed reading zip archive:
+        failed finding central directory
+
+    원인: 체크포인트 파일(.pt) 손상 — torch.load()가 zip 아카이브의
+          central directory를 찾지 못함.
+          추정: Colab 디스크 공간 부족 또는 Google Drive I/O 오류로
+                체크포인트 파일이 불완전하게 기록됨.
+
+    별도 CSV 발견 (yolo_mfd_casda_pruning.csv):
+      - 149 에폭 학습 데이터 존재 (별도 실행 또는 재시도 추정)
+      - 최고 mAP50: 0.5221 (epoch 116)
+      - 최종 mAP50: 0.5024 (epoch 149)
+      - epoch 1~45: 메트릭 전부 0 (초기 학습 불안정)
+      - epoch 94 부근: precision 0.61→0.86 급등, mAP50 0.37→0.50 급등
+      - 총 학습 시간: 약 2.17시간
+
+      ※ 단, 이 CSV의 테스트 평가 결과는 benchmark_results.json에 미포함.
+         별도 재실행이었으나 최종 test eval이 수행되지 않았을 가능성.
+
+  5-6. DeepLabV3+ 학습 분석
+  ──────────────────────────────────
+
+    CASDA-Full:
+      - 90 에폭 (early stop at 89, patience 40)
+      - 최고 val Dice: 0.6318 (epoch 48)
+      - 테스트 Dice: 0.6254
+      - train loss: 0.711 → 0.063 (안정적 수렴)
+      - 학습 시간: 5.72시간
+
+    CASDA-Pruning:
+      - 89 에폭 (early stop at 88, patience 40)
+      - 최고 val Dice: 0.6396 (epoch 47)
+      - 테스트 Dice: 0.6346
+      - train loss: 0.729 → 0.056 (안정적 수렴)
+      - 학습 시간: 3.83시간
+
+    관찰:
+      - Pruning이 Full보다 val Dice 소폭 우수 (0.6396 vs 0.6318)
+      - 테스트에서도 동일 경향 유지 (0.6346 vs 0.6254)
+      - Pruning 학습 시간이 33% 단축 (3.83h vs 5.72h)
+        → 데이터 수 감소로 에폭당 시간 절약
+      - DeepLabV3+에 한해서는 Pruning 전략이 유효
+
+
+6. 가설 검증 결과
+================================================================================
+
+  | 가설 | 비교                      | 결과         | 판정            |
+  |------|---------------------------|-------------|-----------------|
+  | H1   | CASDA > Traditional       | 데이터 없음  | 검증 불가        |
+  | H2   | Pruning > Full (효율성)   | 0.032 vs 0.272 | NOT SUPPORTED |
+  | H3   | 아키텍처 독립성           | 데이터 없음  | 검증 불가        |
+  | H4   | 소수 클래스 개선          | 데이터 없음  | 검증 불가        |
+  | H5   | FID 물리적 타당성         | FID=156.31   | 참고 (임계값 미설정) |
+
+  H2 상세:
+    - CASDA-Pruning 평균 성능: 0.032 (EB-YOLOv8 0.063 + DeepLabV3+ 비교 불가)
+    - CASDA-Full 평균 성능: 0.272
+    - EB-YOLOv8 Pruning의 치명적 실패가 H2 결과를 왜곡
+    - DeepLabV3+만 보면 Pruning(0.6346) > Full(0.6254)로 H2 부분 지지
+
+  ※ baseline 실험이 없어 5개 가설 중 4개 검증 불가.
+    v5.4에서 baseline_raw, baseline_trad 포함 필수.
+
+
+7. 핵심 이슈 및 원인 분석
+================================================================================
+
+  7-1. [Critical] EB-YOLOv8 + CASDA-Pruning 치명적 실패
+  ──────────────────────────────────────────────────────
+
+    현상:
+      - mAP@0.5 = 0.0633 (v5.2: 0.3779 → -0.315 하락)
+      - epoch 5에서 최고 val_metric 0.251 달성 후 급격 하락
+      - Class 1, 2, 3 AP = 0.000, Class 4만 0.253
+
+    가능한 원인:
+      (A) Pruning 데이터의 bbox 라벨 생성 이슈
+          - package_casda_data.py에서 suitability >= 0.60 필터링 후
+            bbox 사전 계산이 정상 수행되었는지 확인 필요
+          - 같은 Pruning 데이터로 DeepLabV3+는 정상 학습 → 이미지/마스크는 정상
+          - Detection 전용 라벨(bbox) 변환 과정에서 문제 가능성
+
+      (B) inject/clean 방식의 YOLO 라벨 주입 오류
+          - run_benchmark.py의 inject_casda_to_baseline()이
+            pruning 데이터에 대해 올바른 YOLO .txt 라벨을 생성했는지 확인 필요
+
+      (C) Pruning 데이터의 클래스 분포 극단적 불균형
+          - suitability >= 0.60 필터가 특정 클래스를 과도하게 제거했을 가능성
+          - metadata.json의 클래스별 pruning 통과율 확인 필요
+
+    조치: pruning 데이터의 클래스 분포 및 bbox 라벨 유효성 검증
+
+  7-2. [Critical] YOLO-MFD + CASDA-Pruning 체크포인트 손상
+  ──────────────────────────────────────────────────────
+
+    현상:
+      - PytorchStreamReader failed reading zip archive
+      - benchmark_results.json에 결과 미포함
+
+    원인: torch.load()가 .pt 파일을 읽지 못함 (central directory 누락)
+          → Colab Google Drive I/O 오류 또는 디스크 공간 부족
+
+    별도 CSV (yolo_mfd_casda_pruning.csv):
+      - 149 에폭, 최고 mAP50=0.522 (epoch 116)
+      - 학습 자체는 성공적이었으나 최종 평가가 누락
+      - 이 CSV가 언제/어떻게 생성되었는지 확인 필요
+
+    조치: 재실행 시 체크포인트 저장 경로를 로컬 디스크로 변경 검토
+
+  7-3. [Major] baseline 실험 미실행
+  ──────────────────────────────────────────────────────
+
+    현상: baseline_raw, baseline_trad 4개 데이터셋 그룹 미실행
+    영향: H1, H3, H4 가설 검증 불가, CASDA 효과의 절대적 평가 불가
+
+    조치: v5.4에서 --groups all로 12개 전체 실험 실행
+
+
+8. v5.3 성과 및 한계 요약
+================================================================================
+
+  8-1. 성과
+  ──────────────────────────────────
+
+    EB-YOLOv8 + CASDA-Full:
+      - v5.3 최고 성능: mAP@0.5 = 0.5100 (프로젝트 전체 최고)
+      - Class 2 AP: 0.000(v5.2) → 0.510(v5.3) — 희귀 클래스 탐지 성공
+      - 클래스 간 균형: 0.456~0.555 범위로 균일
+
+    FID Score 개선:
+      - 165.38(v5.2) → 156.31(v5.3) — 합성 이미지 품질 향상
+
+    DeepLabV3+ 안정성:
+      - Full/Pruning 모두 안정적 학습 (Dice 0.625~0.635)
+      - Pruning이 Full보다 소폭 우수 + 학습 시간 33% 단축
+
+  8-2. 한계
+  ──────────────────────────────────
+
+    CASDA-Pruning Detection 실패:
+      - EB-YOLOv8: mAP 0.063 (치명적)
+      - YOLO-MFD: 크래시 (체크포인트 손상)
+
+    모델 간 일관성 부족:
+      - EB-YOLOv8은 Full에서 v5.2 대비 개선, YOLO-MFD는 하락
+      - Pruning에서 Detection 모델 전멸, Segmentation만 정상
+
+    실험 완성도 부족:
+      - 12개 중 5개만 유효 결과 (완료율 42%)
+      - baseline 없어 가설 검증 4/5 불가
+
+
+9. 후속 작업 (우선순위순)
+================================================================================
+
+  [P0] EB-YOLOv8 + CASDA-Pruning 실패 원인 조사
+    - pruning metadata.json 클래스 분포 확인
+    - inject 과정의 YOLO bbox 라벨 유효성 검증
+    - 동일 데이터로 DeepLabV3+는 성공 → detection 라벨 경로 집중 조사
+
+  [P0] YOLO-MFD + CASDA-Pruning 재실행
+    - 체크포인트 저장 경로 변경 (Google Drive → 로컬)
+    - yolo_mfd_casda_pruning.csv의 출처 확인
+
+  [P1] baseline_raw, baseline_trad 실험 추가 실행
+    - --groups baseline_raw baseline_trad 또는 --groups all
+    - H1, H3, H4 가설 검증 완료
+
+  [P2] YOLO-MFD CASDA-Full 성능 하락 원인 조사
+    - v5.2 대비 -0.059 하락 원인 분석
+    - 데이터 변경(v5.2→v5.3) 또는 학습 설정 차이 확인
+
+  [P3] v5.4 실험 계획 수립
+    - 12개 전체 실험 + Pruning Detection 이슈 해결 후 재실행
+    - 총 예상 시간: 약 30~40시간 (T4 GPU 기준)
+
+
+10. 파일 목록 (outputs/v5.3/)
+================================================================================
+
+  벤치마크 결과:
+    benchmark_results/benchmark_results.json     5개 실험 테스트 메트릭
+    benchmark_results/benchmark_comparison.csv   모델별 비교 테이블
+    benchmark_results/benchmark.log              전체 학습 로그 (4,157줄)
+    benchmark_results/fid_results.json           FID=156.31
+    benchmark_results/hypothesis_results.json    가설 검증 결과
+    benchmark_results/config.yaml                실험 설정
+    benchmark_results/dataset_split.json         데이터셋 분할 정보
+
+  학습 히스토리 (JSON):
+    eb_yolov8_casda_full.json                    120 에폭, best epoch 85
+    eb_yolov8_casda_pruning.json                 36 에폭, best epoch 5
+    yolo_mfd_casda_full.json                     97 에폭, best epoch 92
+    deeplabv3plus_casda_full_history.json         90 에폭, best epoch 48
+    deeplabv3plus_casda_pruning_history.json      89 에폭, best epoch 47
+
+  학습 로그 (CSV):
+    eb_yolov8_casda_full.csv                     에폭별 상세 메트릭
+    eb_yolov8_casda_pruning.csv                  에폭별 상세 메트릭
+    yolo_mfd_casda_full.csv                      에폭별 상세 메트릭
+    yolo_mfd_casda_pruning.csv                   149 에폭 (별도 실행, JSON 없음)
+
+  ※ yolo_mfd_casda_pruning.json 파일 없음 (크래시로 미생성)

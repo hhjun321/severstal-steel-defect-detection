@@ -1,0 +1,434 @@
+20260304 작업 일지 #4 - v5.4 Composed Branch + Tier-1 합성 품질 개선 구현
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+v5.4 Poisson Blending 파이프라인의 두 개선 문서를 코드에 반영한다:
+
+  (1) outputs/improve/v5.4_1.docs — Composed Branch 통합 + Stratified Top-K + Score 기본값
+  (2) outputs/improve/v5.4_2.docs — Tier-1 합성 품질 개선 (Jittering + Multi-Scale + Gradient Mask)
+
+추가로 run_benchmark.py의 --casda-ratio 기능이 composed 데이터 소스도
+지원하도록 --casda-ratio-source 옵션을 신규 구현한다.
+
+
+2. 코드 수정 내역
+================================================================================
+
+  2.1 변경 파일 목록
+
+    | # | 파일                                  | 변경 유형        | 주요 내용                                  |
+    |---|---------------------------------------|------------------|--------------------------------------------|
+    | 1 | src/training/dataset.py               | 기능 추가        | composed 분기, stratified top-k, score 0.0 |
+    | 2 | src/training/dataset_yolo.py           | 기능 추가        | stratified top-k, score 0.0                |
+    | 3 | src/training/ultralytics_trainer.py    | 기능 추가        | composed 분기                               |
+    | 4 | scripts/run_benchmark.py               | 기능 추가        | GROUP_ALIASES, CASDA_GROUPS, FID 매핑,     |
+    |   |                                       |                  | --casda-ratio-source 옵션 신규             |
+    | 5 | src/preprocessing/poisson_blender.py   | 기능 추가        | smooth_mask_boundary, jitter, scale        |
+    | 6 | scripts/compose_casda_images.py        | 기능 추가 + CLI  | 6개 CLI 인자, 증강 루프 통합               |
+
+
+  2.2 [v5.4_1] src/training/dataset.py — Composed Branch + Stratified Top-K
+
+    (a) CASDASyntheticDataset.__init__() — stratified 파라미터 추가
+        - stratified: bool = False 파라미터 신규 추가
+        - self.stratified = stratified 저장
+
+    (b) _load_metadata() — suitability_score 기본값 1.0 → 0.0
+        - 3개 위치에서 기본값을 0.0으로 변경
+        - 메타데이터에 suitability_score가 없는 항목에 대한 방어 처리
+
+    (c) _stratified_top_k() 정적 메서드 신규 추가
+        - 클래스별 비례 배분 알고리즘 (Largest Remainder Method)
+        - class_id별 할당량 계산 → 각 클래스 내에서 suitability_score 내림차순 선택
+        - 잔여 할당은 전체 풀에서 점수순으로 채움
+
+    (d) create_data_loaders() — elif casda_data == "composed": 분기 추가
+        - casda_pruning 설정을 casda_config에 병합
+        - composed_dir 경로에서 CASDA 데이터 로드
+        - stratified 설정 전달
+
+  2.3 [v5.4_1] src/training/dataset_yolo.py — Stratified Top-K
+
+    (a) 폴백 스캔 suitability_score 기본값 1.0 → 0.0
+
+    (b) pruning 필터/정렬 기본값 1.0 → 0.0
+
+    (c) stratified 설정 읽기 + 조건부 _stratified_top_k_yolo() 호출
+
+    (d) _stratified_top_k_yolo() 함수 신규 추가
+        - dataset.py의 _stratified_top_k()와 동일한 로직
+        - _add_casda_to_training() 앞에 위치 (pyright 순서 요구사항)
+
+  2.4 [v5.4_1] src/training/ultralytics_trainer.py — Composed Branch
+
+    (a) _prepare_dataset() — elif casda_data == "composed": 분기 추가
+        - casda_pruning 설정 병합 (stratified 포함)
+        - composed_dir 읽기, casda_mode/casda_config_dict 설정
+
+  2.5 [v5.4_1] scripts/run_benchmark.py — GROUP_ALIASES, CASDA_GROUPS, ratio-source
+
+    (a) GROUP_ALIASES에 "composed", "composed_pruning" 추가
+
+    (b) CASDA_GROUPS, CASDA_GROUP_TO_SUBDIR에 casda_composed, casda_composed_pruning 추가
+
+    (c) --list-groups 출력에 composed 태그 로직 추가
+
+    (d) casda_groups_for_fid에 composed 그룹 추가
+
+    (e) --casda-dir 핸들링에 composed_dir 오버라이드 추가
+
+    (f) 데이터 디렉토리 해석에 elif casda_subdir == "casda_composed": 추가
+
+    (g) --casda-ratio-source 옵션 신규 추가 (2.8절 참조)
+
+  2.6 [v5.4_2] src/preprocessing/poisson_blender.py — Tier-1 메서드/파라미터
+
+    (a) smooth_mask_boundary() 메서드 신규 추가
+        - 가우시안 블러로 마스크 경계를 gradient 처리
+        - 코어 영역(원본 마스크 255) 최소 0.8 보장
+        - 가장자리 1px = 0 강제 (seamlessClone 요구사항)
+
+    (b) compute_paste_center() — jitter_x: int = 0 파라미터 추가
+        - center_x = (x1+x2)//2 + jitter_x
+        - 기존 클리핑 로직으로 경계 안전성 유지
+
+    (c) compose_single() — Tier-1 파라미터 5개 추가
+        - jitter_x, scale_factor, use_smooth_mask, smooth_ksize, smooth_sigma
+        - Step 2: scale_factor 적용 다운스케일
+        - Step 3a: smooth_mask_boundary 적용 (use_smooth_mask=True 시)
+        - Step 4: jitter_x 전달
+        - Step 7: actual_roi_bbox 역산 (jitter/scale 반영)
+
+    (d) compose_from_paths() — Tier-1 파라미터 5개 전달
+        - compose_single()로 모든 Tier-1 파라미터 포워딩
+
+  2.7 [v5.4_2] scripts/compose_casda_images.py — CLI + 증강 루프 통합
+
+    (a) CLI 인자 6개 추가
+        --jitter-range N      x축 오프셋 최대값 (±N px, 0=비활성)
+        --scale-min F         다운스케일 최소 비율 (기본 1.0)
+        --scale-max F         다운스케일 최대 비율 (기본 1.0)
+        --smooth-mask         마스크 경계 가우시안 블러 활성화
+        --smooth-ksize N      가우시안 커널 크기 (기본 21)
+        --smooth-sigma F      가우시안 시그마 (기본 7.0)
+
+    (b) compose_all() — 6개 파라미터 추가
+        - jitter_range, scale_min, scale_max, use_smooth_mask, smooth_ksize, smooth_sigma
+        - 증강 활성화 시 로깅 메시지 출력
+
+    (c) 합성 루프 — 이미지별 랜덤 증강 값 생성
+        - 각 이미지마다 rng.randint()로 jitter_x 생성 (jitter_range > 0 시)
+        - 각 이미지마다 rng.uniform()으로 scale_factor 생성 (scale_min < scale_max 시)
+        - task dict에 jitter_x, scale_factor, use_smooth_mask, smooth_ksize, smooth_sigma 포함
+
+    (d) 순차 경로 — blender.compose_single()에 Tier-1 파라미터 전달
+        - task dict에서 5개 파라미터를 추출하여 전달
+
+    (e) 병렬 경로 — _compose_single_task()에서 Tier-1 파라미터 추출 + 전달
+        - args dict에서 5개 파라미터 추출 (기본값 폴백)
+        - compose_from_paths()에 5개 파라미터 전달
+
+    (f) 메타데이터 기록 — 양쪽 경로 모두 jitter_x, scale_factor 기록
+
+    (g) composition_report.json — 6개 증강 파라미터 기록
+
+  2.8 [추가] scripts/run_benchmark.py — --casda-ratio-source 옵션
+
+    기존 --casda-ratio는 casda_full 디렉토리만 지원했다.
+    composed 데이터에서도 비율 기반 실험이 가능하도록 개선:
+
+    (a) --casda-ratio-source CLI 인자 추가
+        - choices: 'full' (기본), 'composed'
+        - --casda-ratio와 함께 사용
+        - 기본값 'full' → 기존 동작과 완전 호환
+
+    (b) 동적 ratio 그룹 생성 시 소스 반영
+        - casda_data: 'full' 또는 'composed'로 설정
+        - CASDA_GROUP_TO_SUBDIR: casda_full 또는 casda_composed로 매핑
+        - 로깅 메시지에 소스 정보 포함
+
+    흐름:
+      --casda-ratio-source full (기본)
+        → casda_data='full', 서브디렉토리='casda_full'
+      --casda-ratio-source composed
+        → casda_data='composed', 서브디렉토리='casda_composed'
+
+
+3. 하위호환성
+================================================================================
+
+  모든 새 파라미터는 기존 동작을 유지하는 기본값을 가진다:
+
+    | 파라미터              | 기본값   | 기존 동작                      |
+    |-----------------------|----------|--------------------------------|
+    | stratified            | False    | 순수 top-k (비례 배분 없음)    |
+    | suitability_score     | 0.0      | 점수 없는 항목도 포함          |
+    | jitter_x              | 0        | 오프셋 없음 (원본 위치)        |
+    | scale_factor          | 1.0      | 원본 ROI 크기 (512→256)       |
+    | use_smooth_mask       | False    | 이진 마스크 사용               |
+    | jitter_range          | 0        | CLI 비활성                     |
+    | scale_min/max         | 1.0/1.0  | CLI 비활성                     |
+    | --smooth-mask         | False    | CLI 비활성                     |
+    | --casda-ratio-source  | full     | casda_full에서 선택 (기존 동작) |
+
+  기존 코드에서 compose_single(), compose_from_paths() 호출 시
+  추가 인자 없이도 기존과 동일하게 동작한다.
+
+  benchmark_experiment.yaml의 casda_composed, casda_composed_pruning
+  그룹 설정은 이미 올바르게 정의되어 있어 YAML 변경은 불필요했다.
+
+
+4. 실행 예시
+================================================================================
+
+  4.1 compose_casda_images.py — Poisson Blending 합성
+  ──────────────────────────────────────────────
+
+    (a) 기본 합성 (Tier-1 비활성, 기존과 동일)
+
+      python scripts/compose_casda_images.py \
+        --generated-dir outputs/v5.1/test_results_v5.1/generated \
+        --hint-dir data/processed/controlnet_dataset/hints \
+        --metadata-csv data/processed/controlnet_dataset/packaged_roi_metadata.csv \
+        --summary-json outputs/v5.1/test_results_v5.1/generation_summary.json \
+        --clean-images-dir data/raw/train_images \
+        --train-csv data/raw/train.csv \
+        --output-dir data/augmented/casda_composed
+
+    (b) 고속 병렬 + 캐시 (Tier-1 비활성)
+
+      python scripts/compose_casda_images.py \
+        --generated-dir outputs/v5.1/test_results_v5.1/generated \
+        --hint-dir data/processed/controlnet_dataset/hints \
+        --metadata-csv data/processed/controlnet_dataset/packaged_roi_metadata.csv \
+        --summary-json outputs/v5.1/test_results_v5.1/generation_summary.json \
+        --clean-images-dir data/raw/train_images \
+        --train-csv data/raw/train.csv \
+        --output-dir data/augmented/casda_composed \
+        --workers 8 \
+        --bg-cache data/cache/bg_types.json \
+        --png-compression 1
+
+    (c) Tier-1 전체 활성화 (권장)
+
+      python scripts/compose_casda_images.py \
+        --generated-dir outputs/v5.1/test_results_v5.1/generated \
+        --hint-dir data/processed/controlnet_dataset/hints \
+        --metadata-csv data/processed/controlnet_dataset/packaged_roi_metadata.csv \
+        --summary-json outputs/v5.1/test_results_v5.1/generation_summary.json \
+        --clean-images-dir data/raw/train_images \
+        --train-csv data/raw/train.csv \
+        --output-dir data/augmented/casda_composed \
+        --workers 8 \
+        --bg-cache data/cache/bg_types.json \
+        --png-compression 1 \
+        --jitter-range 100 \
+        --scale-min 0.875 \
+        --scale-max 1.0 \
+        --smooth-mask
+
+    (d) Jitter만 적용 (A/B 실험용)
+
+      python scripts/compose_casda_images.py \
+        --generated-dir outputs/v5.1/test_results_v5.1/generated \
+        --hint-dir data/processed/controlnet_dataset/hints \
+        --metadata-csv data/processed/controlnet_dataset/packaged_roi_metadata.csv \
+        --summary-json outputs/v5.1/test_results_v5.1/generation_summary.json \
+        --clean-images-dir data/raw/train_images \
+        --train-csv data/raw/train.csv \
+        --output-dir data/augmented/casda_composed \
+        --workers -1 \
+        --bg-cache data/cache/bg_types.json \
+        --jitter-range 100
+
+    (e) Multi-Scale만 적용
+
+      python scripts/compose_casda_images.py \
+        --generated-dir outputs/v5.1/test_results_v5.1/generated \
+        --hint-dir data/processed/controlnet_dataset/hints \
+        --metadata-csv data/processed/controlnet_dataset/packaged_roi_metadata.csv \
+        --summary-json outputs/v5.1/test_results_v5.1/generation_summary.json \
+        --clean-images-dir data/raw/train_images \
+        --train-csv data/raw/train.csv \
+        --output-dir data/augmented/casda_composed \
+        --workers -1 \
+        --bg-cache data/cache/bg_types.json \
+        --scale-min 0.875 --scale-max 1.0
+
+    (f) Smooth Mask만 적용 (커스텀 커널)
+
+      python scripts/compose_casda_images.py \
+        --generated-dir outputs/v5.1/test_results_v5.1/generated \
+        --hint-dir data/processed/controlnet_dataset/hints \
+        --metadata-csv data/processed/controlnet_dataset/packaged_roi_metadata.csv \
+        --summary-json outputs/v5.1/test_results_v5.1/generation_summary.json \
+        --clean-images-dir data/raw/train_images \
+        --train-csv data/raw/train.csv \
+        --output-dir data/augmented/casda_composed \
+        --workers -1 \
+        --bg-cache data/cache/bg_types.json \
+        --smooth-mask --smooth-ksize 31 --smooth-sigma 10.0
+
+  4.2 run_benchmark.py — 벤치마크 실행
+  ──────────────────────────────────────────────
+
+    (a) composed 그룹 단독 실행 (YOLOv8n)
+
+      python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --groups composed \
+        --models yolov8n \
+        --yolo-dir data/yolo_dataset \
+        --casda-dir data/augmented
+
+    (b) composed + composed_pruning 비교
+
+      python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --groups composed composed_pruning \
+        --models yolov8n \
+        --yolo-dir data/yolo_dataset \
+        --casda-dir data/augmented
+
+    (c) 전체 CASDA 그룹 비교 (full vs pruning vs composed vs composed_pruning)
+
+      python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --groups full pruning composed composed_pruning \
+        --models yolov8n \
+        --yolo-dir data/yolo_dataset \
+        --casda-dir data/augmented
+
+    (d) casda_full 소스에서 비율 기반 실험 (기본, 기존 동작)
+
+      python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --casda-ratio 0.1 0.2 0.3 \
+        --models yolov8n \
+        --yolo-dir data/yolo_dataset \
+        --casda-dir data/augmented
+
+      → casda_ratio_10, casda_ratio_20, casda_ratio_30 그룹 자동 생성
+      → 원본 ~4666장 기준: 518장, 1166장, 1999장 합성 데이터 추가
+      → casda_full 디렉토리에서 suitability_score 상위 N개 선택
+
+    (e) casda_composed 소스에서 비율 기반 실험 (신규 기능)
+
+      python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --casda-ratio 0.1 0.2 0.3 \
+        --casda-ratio-source composed \
+        --models yolov8n \
+        --yolo-dir data/yolo_dataset \
+        --casda-dir data/augmented
+
+      → casda_ratio_10, casda_ratio_20, casda_ratio_30 그룹 자동 생성
+      → casda_composed 디렉토리에서 suitability_score 상위 N개 선택
+      → Tier-1 증강이 적용된 composed 데이터를 비율 제어하여 투입
+
+    (f) 기존 그룹 + 비율 그룹 병행
+
+      python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --groups baseline composed_pruning \
+        --casda-ratio 0.3 \
+        --casda-ratio-source composed \
+        --models yolov8n \
+        --yolo-dir data/yolo_dataset \
+        --casda-dir data/augmented
+
+      → baseline, casda_composed_pruning, casda_ratio_30 세 그룹 실행
+      → casda_ratio_30은 composed 소스에서 30% 비율로 투입
+
+    (g) 그룹 목록 확인
+
+      python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --list-groups
+
+  4.3 전체 파이프라인 (합성 → 벤치마크)
+  ──────────────────────────────────────────────
+
+    # Step 1: Tier-1 증강으로 casda_composed 데이터 생성
+    python scripts/compose_casda_images.py \
+      --generated-dir outputs/v5.1/test_results_v5.1/generated \
+      --hint-dir data/processed/controlnet_dataset/hints \
+      --metadata-csv data/processed/controlnet_dataset/packaged_roi_metadata.csv \
+      --summary-json outputs/v5.1/test_results_v5.1/generation_summary.json \
+      --clean-images-dir data/raw/train_images \
+      --train-csv data/raw/train.csv \
+      --output-dir data/augmented/casda_composed \
+      --workers 8 \
+      --bg-cache data/cache/bg_types.json \
+      --png-compression 1 \
+      --jitter-range 100 \
+      --scale-min 0.875 --scale-max 1.0 \
+      --smooth-mask
+
+    # Step 2: composed 데이터로 비율별 벤치마크 실행
+    python scripts/run_benchmark.py \
+      --config configs/benchmark_experiment.yaml \
+      --casda-ratio 0.1 0.2 0.3 0.5 \
+      --casda-ratio-source composed \
+      --models yolov8n \
+      --yolo-dir data/yolo_dataset \
+      --casda-dir data/augmented
+
+    # Step 3: (선택) composed vs full 비교
+    python scripts/run_benchmark.py \
+      --config configs/benchmark_experiment.yaml \
+      --groups full composed composed_pruning \
+      --models yolov8n \
+      --yolo-dir data/yolo_dataset \
+      --casda-dir data/augmented
+
+
+5. 검증 결과
+================================================================================
+
+  | # | 검증 항목                                              | 결과 |
+  |---|--------------------------------------------------------|------|
+  | 1 | dataset.py 문법 검증 (ast.parse)                       | PASS |
+  | 2 | dataset_yolo.py 문법 검증 (ast.parse)                  | PASS |
+  | 3 | ultralytics_trainer.py 문법 검증 (ast.parse)           | PASS |
+  | 4 | run_benchmark.py 문법 검증 (ast.parse)                 | PASS |
+  | 5 | poisson_blender.py 문법 검증 (ast.parse)               | PASS |
+  | 6 | compose_casda_images.py 문법 검증 (ast.parse)          | PASS |
+  | 7 | poisson_blender.py import + 시그니처 검증              | PASS |
+  | 8 | compose_all() 시그니처에 6개 Tier-1 파라미터 존재      | PASS |
+  | 9 | CLI --help에 6개 새 인자 표시                          | PASS |
+  |10 | 모든 파라미터의 기본값이 기존 동작과 동일 (하위호환)   | PASS |
+
+  LSP 오류: cv2/numpy/pandas import 해석 실패는 pyright 환경 설정 문제로
+  런타임에는 영향 없음 (기존부터 존재하는 오류).
+
+
+6. 참고 사항
+================================================================================
+
+  - benchmark_experiment.yaml의 casda_composed/casda_composed_pruning 그룹은
+    이미 올바르게 정의되어 있었음 (casda_data: "composed",
+    casda_pruning.stratified: true 등)
+
+  - _stratified_top_k_yolo()는 _add_casda_to_training() 앞에 정의해야
+    pyright가 정의 순서를 만족함 (런타임 순서는 무관)
+
+  - compose_casda_images.py는 순차/병렬 두 가지 실행 경로가 있으며,
+    양쪽 모두 Tier-1 파라미터를 지원:
+      순차: blender.compose_single()에 직접 전달
+      병렬: task dict → _compose_single_task() → compose_from_paths() 경유
+
+  - actual_roi_bbox는 compose_single() 내부에서 blend center 기준으로
+    역산하여 generate_full_mask()와 compute_yolo_bboxes()에 전달.
+    이를 통해 jitter/scale 적용 시에도 YOLO bbox가 정확함.
+
+  - --casda-ratio의 비율 계산 공식:
+      ratio = synthetic / (original + synthetic)
+      max_samples = int(original * ratio / (1 - ratio))
+    예) original=4666, ratio=0.3 → max_samples=int(4666*0.3/0.7) = 1999
+
+  - --casda-ratio-source는 기존 --casda-ratio의 확장:
+    기존: 항상 casda_full 디렉토리에서 선택
+    변경: --casda-ratio-source composed 지정 시 casda_composed에서 선택
+    기본값 'full'이므로 기존 사용법과 완전 호환

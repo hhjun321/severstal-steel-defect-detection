@@ -55,14 +55,16 @@ class PoissonBlender:
     
     def __init__(
         self,
-        dilation_px: int = 15,
+        dilation_px: int = 8,
         blend_mode: int = cv2.NORMAL_CLONE,
         mask_threshold: int = 127,
         min_defect_area: int = 16,
     ):
         """
         Args:
-            dilation_px: 마스크 확장 픽셀 수 (기본 15px, 타원 커널)
+            dilation_px: 마스크 확장 픽셀 수 (기본 8px, 타원 커널).
+                         배경 텍스처 보존과 경계 아티팩트 억제의 균형.
+                         이전 기본값 15px은 과도한 smoothing을 유발할 수 있음.
             blend_mode: cv2.NORMAL_CLONE 또는 cv2.MIXED_CLONE
             mask_threshold: 힌트 Red 채널 이진화 임계값 (기본 127)
             min_defect_area: YOLO bbox 추출 시 최소 면적 (기본 16px)

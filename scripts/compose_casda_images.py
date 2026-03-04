@@ -225,23 +225,39 @@ def classify_background_simple(image: np.ndarray) -> str:
     return 'smooth'
 
 
-def _classify_single_background(args: Tuple[str, str]) -> Tuple[str, str]:
+def compute_mean_brightness(image: np.ndarray) -> float:
     """
-    단일 배경 이미지를 분류하는 워커 함수 (멀티프로세싱용).
+    이미지의 평균 밝기를 계산한다 (0~255 스케일).
+    
+    그레이스케일 변환 후 전체 평균을 반환.
+    Severstal 강재 이미지는 보통 80~200 범위.
+    """
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
+    return float(np.mean(gray))
+
+
+def _classify_single_background(args: Tuple[str, str]) -> Tuple[str, str, float]:
+    """
+    단일 배경 이미지를 분류하고 밝기를 측정하는 워커 함수 (멀티프로세싱용).
     
     Args:
         args: (image_name, images_dir_str) 튜플
         
     Returns:
-        (image_name, bg_type) 튜플. 로드 실패 시 (image_name, '') 반환.
+        (image_name, bg_type, mean_brightness) 튜플.
+        로드 실패 시 (image_name, '', 0.0) 반환.
     """
     name, images_dir_str = args
     img_path = Path(images_dir_str) / name
     img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
     if img is None:
-        return (name, '')
+        return (name, '', 0.0)
     bg_type = classify_background_simple(img)
-    return (name, bg_type)
+    brightness = compute_mean_brightness(img)
+    return (name, bg_type, brightness)
 
 
 def build_quality_map(
@@ -316,10 +332,11 @@ class BackgroundPool:
     """
     결함 없는 배경 이미지 풀.
     배경 유형별로 인덱싱하여 호환성 기반 선택을 지원한다.
+    밝기(brightness) 매칭으로 Poisson blending 시 밝기 halo 아티팩트를 최소화한다.
     
     성능 최적화:
-    - 배경 유형 분석 결과를 JSON 캐시 파일로 저장/로드
-    - 멀티프로세싱으로 배경 유형 분석 병렬화
+    - 배경 유형+밝기 분석 결과를 JSON 캐시 파일로 저장/로드
+    - 멀티프로세싱으로 배경 분석 병렬화
     """
     
     def __init__(
@@ -337,7 +354,7 @@ class BackgroundPool:
             images_dir: 이미지 디렉토리 경로
             cache_bg_types: 배경 유형을 캐싱할지 여부
             max_analyze: 배경 유형 분석할 최대 이미지 수
-            bg_cache_path: 배경 유형 캐시 JSON 경로 (None이면 캐시 미사용)
+            bg_cache_path: 배경 유형+밝기 캐시 JSON 경로 (None이면 캐시 미사용)
             num_workers: 병렬 분석 워커 수 (0이면 순차 처리)
         """
         self.images_dir = images_dir
@@ -347,61 +364,119 @@ class BackgroundPool:
         # 배경 유형별 인덱스: {bg_type: [filename, ...]}
         self.type_index: Dict[str, List[str]] = {t: [] for t in ALL_BACKGROUND_TYPES}
         self.bg_types: Dict[str, str] = {}  # filename → bg_type
+        self.bg_brightness: Dict[str, float] = {}  # filename → mean_brightness (0~255)
         
         if cache_bg_types:
             self._analyze_backgrounds(max_analyze, bg_cache_path)
     
-    def _load_cache(self, cache_path: Path) -> Dict[str, str]:
-        """캐시 파일에서 배경 유형 매핑을 로드한다."""
+    def _load_cache(self, cache_path: Path) -> dict:
+        """
+        캐시 파일에서 배경 유형+밝기 매핑을 로드한다.
+        
+        v2 캐시 형식: {"_version": 2, "types": {...}, "brightness": {...}}
+        v1 호환: {filename: bg_type, ...} (밝기 없음, 재분석 필요)
+        """
         if cache_path and cache_path.exists():
             try:
                 with open(cache_path) as f:
                     data = json.load(f)
-                logger.info(f"배경 유형 캐시 로드 성공: {cache_path} ({len(data)}개)")
-                return data
+                # v2 형식 확인
+                if isinstance(data, dict) and data.get("_version") == 2:
+                    types = data.get("types", {})
+                    brightness = data.get("brightness", {})
+                    logger.info(f"배경 캐시 v2 로드 성공: {cache_path} "
+                                f"({len(types)}개 유형, {len(brightness)}개 밝기)")
+                    return {"types": types, "brightness": brightness}
+                # v1 형식 (하위 호환): 유형만 있고 밝기 없음
+                if isinstance(data, dict) and "_version" not in data:
+                    logger.info(f"배경 캐시 v1 로드 (밝기 없음, 재분석 예정): "
+                                f"{cache_path} ({len(data)}개)")
+                    return {"types": data, "brightness": {}}
             except (json.JSONDecodeError, IOError) as e:
                 logger.warning(f"배경 유형 캐시 로드 실패: {e}")
-        return {}
+        return {"types": {}, "brightness": {}}
     
     def _save_cache(self, cache_path: Path):
-        """배경 유형 매핑을 캐시 파일에 저장한다."""
+        """배경 유형+밝기 매핑을 v2 캐시 파일에 저장한다."""
         if cache_path:
             try:
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_data = {
+                    "_version": 2,
+                    "types": self.bg_types,
+                    "brightness": {k: round(v, 2) for k, v in self.bg_brightness.items()},
+                }
                 with open(cache_path, "w") as f:
-                    json.dump(self.bg_types, f)
-                logger.info(f"배경 유형 캐시 저장: {cache_path} ({len(self.bg_types)}개)")
+                    json.dump(cache_data, f)
+                logger.info(f"배경 캐시 v2 저장: {cache_path} "
+                            f"({len(self.bg_types)}개 유형, "
+                            f"{len(self.bg_brightness)}개 밝기)")
             except IOError as e:
                 logger.warning(f"배경 유형 캐시 저장 실패: {e}")
     
     def _analyze_backgrounds(
         self, max_analyze: int, cache_path: Optional[Path] = None
     ):
-        """배경 이미지들의 유형을 분석하여 인덱스 구축."""
+        """배경 이미지들의 유형과 밝기를 분석하여 인덱스 구축."""
         names_to_analyze = self.clean_names[:max_analyze]
         
         # 캐시에서 로드 시도
-        cached = self._load_cache(cache_path) if cache_path else {}
+        cached = self._load_cache(cache_path) if cache_path else {"types": {}, "brightness": {}}
+        cached_types = cached.get("types", {})
+        cached_brightness = cached.get("brightness", {})
         
-        # 캐시에 없는 이미지만 분석 대상으로 필터링
-        names_uncached = [n for n in names_to_analyze if n not in cached]
-        names_cached = [n for n in names_to_analyze if n in cached]
+        # 유형+밝기 모두 캐시에 있는 이미지만 완전 캐시 히트
+        names_full_cached = [
+            n for n in names_to_analyze
+            if n in cached_types and n in cached_brightness
+        ]
+        # 유형은 있지만 밝기가 없는 이미지 → 밝기만 재분석
+        names_brightness_miss = [
+            n for n in names_to_analyze
+            if n in cached_types and n not in cached_brightness
+        ]
+        # 유형도 없는 이미지 → 전체 분석
+        names_uncached = [
+            n for n in names_to_analyze
+            if n not in cached_types
+        ]
         
-        # 캐시 히트 적용
-        for name in names_cached:
-            bg_type = cached[name]
+        # 완전 캐시 히트 적용
+        for name in names_full_cached:
+            bg_type = cached_types[name]
             self.bg_types[name] = bg_type
+            self.bg_brightness[name] = float(cached_brightness[name])
             self.type_index[bg_type].append(name)
         
-        if names_cached:
-            logger.info(f"배경 유형 캐시 히트: {len(names_cached)}장")
+        if names_full_cached:
+            logger.info(f"배경 캐시 완전 히트: {len(names_full_cached)}장")
+        
+        # 밝기만 누락된 이미지 처리 (유형 캐시 활용, 밝기만 측정)
+        if names_brightness_miss:
+            logger.info(f"밝기 재분석 필요: {len(names_brightness_miss)}장 "
+                        f"(유형은 캐시에서 로드)")
+            for name in tqdm(names_brightness_miss, desc="밝기 측정"):
+                bg_type = cached_types[name]
+                self.bg_types[name] = bg_type
+                self.type_index[bg_type].append(name)
+                # 밝기만 측정
+                img_path = self.images_dir / name
+                img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+                if img is not None:
+                    self.bg_brightness[name] = compute_mean_brightness(img)
+                else:
+                    self.bg_brightness[name] = 128.0  # 로드 실패 시 중간값
         
         if not names_uncached:
-            logger.info("모든 배경 유형이 캐시에서 로드됨 — 분석 건너뜀")
+            if not names_brightness_miss:
+                logger.info("모든 배경 데이터가 캐시에서 로드됨 — 분석 건너뜀")
             self._log_type_stats()
+            # 캐시 갱신 (밝기 추가된 경우)
+            if names_brightness_miss and cache_path:
+                self._save_cache(cache_path)
             return
         
-        logger.info(f"배경 유형 분석 시작: {len(names_uncached)}장 (캐시 미스)...")
+        logger.info(f"배경 유형+밝기 분석 시작: {len(names_uncached)}장 (캐시 미스)...")
         t_start = time.time()
         
         if self.num_workers > 1 and len(names_uncached) > 10:
@@ -412,7 +487,7 @@ class BackgroundPool:
             self._analyze_sequential(names_uncached)
         
         elapsed = time.time() - t_start
-        logger.info(f"배경 유형 분석 완료: {len(names_uncached)}장, {elapsed:.1f}초")
+        logger.info(f"배경 분석 완료: {len(names_uncached)}장, {elapsed:.1f}초")
         
         # 캐시 저장
         if cache_path:
@@ -421,19 +496,21 @@ class BackgroundPool:
         self._log_type_stats()
     
     def _analyze_sequential(self, names: List[str]):
-        """순차적으로 배경 유형을 분석한다."""
-        for name in tqdm(names, desc="배경 유형 분석"):
+        """순차적으로 배경 유형과 밝기를 분석한다."""
+        for name in tqdm(names, desc="배경 유형+밝기 분석"):
             img_path = self.images_dir / name
             img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
             if img is None:
                 continue
             
             bg_type = classify_background_simple(img)
+            brightness = compute_mean_brightness(img)
             self.bg_types[name] = bg_type
+            self.bg_brightness[name] = brightness
             self.type_index[bg_type].append(name)
     
     def _analyze_parallel(self, names: List[str]):
-        """멀티프로세싱으로 배경 유형을 병렬 분석한다."""
+        """멀티프로세싱으로 배경 유형과 밝기를 병렬 분석한다."""
         images_dir_str = str(self.images_dir)
         args_list = [(name, images_dir_str) for name in names]
         
@@ -441,37 +518,52 @@ class BackgroundPool:
             results = list(tqdm(
                 executor.map(_classify_single_background, args_list, chunksize=32),
                 total=len(args_list),
-                desc=f"배경 유형 분석 (workers={self.num_workers})",
+                desc=f"배경 유형+밝기 분석 (workers={self.num_workers})",
             ))
         
-        for name, bg_type in results:
+        for name, bg_type, brightness in results:
             if bg_type:  # 빈 문자열이면 로드 실패
                 self.bg_types[name] = bg_type
+                self.bg_brightness[name] = brightness
                 self.type_index[bg_type].append(name)
     
     def _log_type_stats(self):
-        """배경 유형별 통계를 로그에 출력한다."""
+        """배경 유형별 통계와 밝기 분포를 로그에 출력한다."""
         total = sum(len(v) for v in self.type_index.values())
         logger.info(f"배경 유형 분석 결과: {total}장")
         for bg_type in ALL_BACKGROUND_TYPES:
             count = len(self.type_index[bg_type])
             pct = 100.0 * count / max(total, 1)
             logger.info(f"  {bg_type:20s}: {count:5d} ({pct:5.1f}%)")
+        # 밝기 분포 통계
+        if self.bg_brightness:
+            brightness_vals = list(self.bg_brightness.values())
+            logger.info(f"  밝기 분포: min={min(brightness_vals):.1f}, "
+                        f"max={max(brightness_vals):.1f}, "
+                        f"mean={sum(brightness_vals)/len(brightness_vals):.1f}")
     
     def get_compatible_background(
         self,
         defect_subtype: str,
         roi_x_center: Optional[int] = None,
         min_compatibility: float = 0.3,
+        target_brightness: Optional[float] = None,
+        brightness_tolerance: float = 30.0,
         rng: Optional[random.Random] = None,
     ) -> Optional[str]:
         """
-        호환성 기반으로 배경 이미지 파일명을 선택한다.
+        호환성 + 밝기 매칭 기반으로 배경 이미지 파일명을 선택한다.
+        
+        밝기 매칭: target_brightness가 지정되면 해당 밝기와 ±tolerance 이내의
+        배경만 후보로 사용한다. 후보가 부족하면(5개 미만) tolerance를 2배로 완화.
+        그래도 부족하면 밝기 필터를 해제한다.
         
         Args:
             defect_subtype: 결함 하위 유형 (COMPATIBILITY_MATRIX 키)
             roi_x_center: ROI의 x 중심점 (미사용, 향후 위치 기반 매칭 확장용)
             min_compatibility: 최소 호환 점수
+            target_brightness: 목표 밝기 (None이면 밝기 필터링 비활성)
+            brightness_tolerance: 밝기 허용 오차 (±, 기본 30.0)
             rng: 난수 생성기 (None이면 모듈 random 사용)
             
         Returns:
@@ -480,14 +572,60 @@ class BackgroundPool:
         if rng is None:
             rng = random
         
+        def _brightness_filter(names: List[str], tol: float) -> List[str]:
+            """밝기 범위 내 후보 필터링."""
+            if target_brightness is None or not self.bg_brightness:
+                return names
+            lo = target_brightness - tol
+            hi = target_brightness + tol
+            return [n for n in names
+                    if lo <= self.bg_brightness.get(n, 128.0) <= hi]
+        
+        def _select_with_brightness(candidates: List[Tuple[str, float]]) -> Optional[str]:
+            """
+            호환성 가중 후보에서 밝기 필터링 후 선택.
+            후보 부족 시 tolerance 완화 → 해제 순으로 폴백.
+            """
+            if not candidates:
+                return None
+            
+            names_only = [name for name, _ in candidates]
+            
+            if target_brightness is not None and self.bg_brightness:
+                # 1차: 기본 tolerance
+                filtered = _brightness_filter(names_only, brightness_tolerance)
+                if len(filtered) < 5:
+                    # 2차: tolerance 2배 완화
+                    filtered = _brightness_filter(names_only, brightness_tolerance * 2)
+                if len(filtered) < 5:
+                    # 3차: 밝기 필터 해제
+                    filtered = names_only
+                
+                # 필터링된 이름 set으로 가중치 재구성
+                filtered_set = set(filtered)
+                filtered_candidates = [(n, w) for n, w in candidates
+                                       if n in filtered_set]
+                if filtered_candidates:
+                    f_names, f_weights = zip(*filtered_candidates)
+                    return rng.choices(f_names, weights=f_weights, k=1)[0]
+            
+            # 밝기 필터 없이 원래 가중 선택
+            c_names, c_weights = zip(*candidates)
+            return rng.choices(c_names, weights=c_weights, k=1)[0]
+        
         # 호환 배경 유형 수집 (점수순 내림차순)
         compat_scores = COMPATIBILITY_MATRIX.get(defect_subtype, {})
         
         if not compat_scores:
-            # 알 수 없는 defect_subtype → 모든 유형에서 랜덤 선택
+            # 알 수 없는 defect_subtype → 모든 유형에서 밝기 매칭 후 랜덤 선택
             all_analyzed = [n for n in self.clean_names if n in self.bg_types]
             if all_analyzed:
-                return rng.choice(all_analyzed)
+                filtered = _brightness_filter(all_analyzed, brightness_tolerance)
+                if len(filtered) < 5:
+                    filtered = _brightness_filter(all_analyzed, brightness_tolerance * 2)
+                if len(filtered) < 5:
+                    filtered = all_analyzed
+                return rng.choice(filtered)
             # 분석 안 된 경우 전체에서 랜덤
             return rng.choice(self.clean_names) if self.clean_names else None
         
@@ -507,14 +645,15 @@ class BackgroundPool:
                 candidates.extend([(name, score) for name in type_names])
         
         if candidates:
-            # 가중 랜덤 선택
-            names, weights = zip(*candidates)
-            return rng.choices(names, weights=weights, k=1)[0]
+            return _select_with_brightness(candidates)
         
-        # 호환 후보가 없으면 전체에서 랜덤
+        # 호환 후보가 없으면 전체에서 밝기 매칭 랜덤
         all_analyzed = [n for n in self.clean_names if n in self.bg_types]
         if all_analyzed:
-            return rng.choice(all_analyzed)
+            filtered = _brightness_filter(all_analyzed, brightness_tolerance)
+            if len(filtered) < 5:
+                filtered = all_analyzed
+            return rng.choice(filtered)
         return rng.choice(self.clean_names) if self.clean_names else None
     
     def get_random_background(
@@ -524,6 +663,10 @@ class BackgroundPool:
         if rng is None:
             rng = random
         return rng.choice(self.clean_names) if self.clean_names else None
+    
+    def get_brightness(self, name: str) -> float:
+        """배경 이미지의 평균 밝기를 반환한다. 미분석 시 128.0."""
+        return self.bg_brightness.get(name, 128.0)
 
 
 # ============================================================================
@@ -707,7 +850,7 @@ def compose_all(
     train_csv: Path,
     output_dir: Path,
     quality_json: Optional[Path] = None,
-    dilation_px: int = 15,
+    dilation_px: int = 8,
     blend_mode: int = cv2.NORMAL_CLONE,
     mask_threshold: int = 127,
     seed: int = 42,
@@ -716,12 +859,13 @@ def compose_all(
     num_workers: int = 0,
     bg_cache_path: Optional[Path] = None,
     png_compression: int = 1,
-    jitter_range: int = 0,
-    scale_min: float = 1.0,
+    jitter_range: int = 100,
+    scale_min: float = 0.875,
     scale_max: float = 1.0,
-    use_smooth_mask: bool = False,
+    use_smooth_mask: bool = True,
     smooth_ksize: int = 21,
     smooth_sigma: float = 7.0,
+    brightness_tolerance: float = 30.0,
 ):
     """
     전체 합성 파이프라인 실행.
@@ -742,14 +886,15 @@ def compose_all(
         max_backgrounds: 배경 유형 분석할 최대 이미지 수
         default_quality_score: 품질 점수 없을 때 기본값
         num_workers: 합성 병렬 워커 수 (0이면 순차 처리)
-        bg_cache_path: 배경 유형 캐시 JSON 경로 (None이면 캐시 미사용)
+        bg_cache_path: 배경 유형+밝기 캐시 JSON 경로 (None이면 캐시 미사용)
         png_compression: PNG 압축 레벨 (0-9, 낮을수록 빠름, 기본 1)
-        jitter_range: x축 위치 랜덤 오프셋 최대값 (±N px, 0이면 비활성)
-        scale_min: 다운스케일 최소 비율 (기본 1.0)
+        jitter_range: x축 위치 랜덤 오프셋 최대값 (±N px, 0이면 비활성, 기본 100)
+        scale_min: 다운스케일 최소 비율 (기본 0.875)
         scale_max: 다운스케일 최대 비율 (기본 1.0)
-        use_smooth_mask: 마스크 경계 가우시안 블러 적용 여부
+        use_smooth_mask: 마스크 경계 가우시안 블러 적용 여부 (기본 True)
         smooth_ksize: 가우시안 커널 크기 (홀수, 기본 21)
         smooth_sigma: 가우시안 시그마 (기본 7.0)
+        brightness_tolerance: 배경 밝기 매칭 허용 오차 (±, 기본 30.0, 0이면 비활성)
     """
     pipeline_start = time.time()
     rng = random.Random(seed)
@@ -764,6 +909,10 @@ def compose_all(
             logger.info(f"  Multi-Scale: [{scale_min:.4f}, {scale_max:.4f}]")
         if use_smooth_mask:
             logger.info(f"  Smooth Mask: ksize={smooth_ksize}, sigma={smooth_sigma}")
+    if brightness_tolerance > 0:
+        logger.info(f"밝기 매칭 활성화: tolerance=±{brightness_tolerance:.1f}")
+    else:
+        logger.info("밝기 매칭 비활성화")
     
     # ── Step 1: 메타데이터 로딩 ──
     logger.info("=" * 60)
@@ -871,11 +1020,17 @@ def compose_all(
                 logger.debug(f"힌트 없음: {hint_filename}")
                 continue
         
-        # 호환 배경 이미지 선택
+        # 호환 배경 이미지 선택 (밝기 매칭 포함)
+        # 생성 이미지의 밝기를 빠르게 측정하여 배경 매칭에 활용
+        gen_img_small = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+        target_brightness = float(np.mean(gen_img_small)) if gen_img_small is not None else None
+        
         roi_x_center = (roi_bbox[0] + roi_bbox[2]) // 2
         bg_name = bg_pool.get_compatible_background(
             defect_subtype=defect_subtype,
             roi_x_center=roi_x_center,
+            target_brightness=target_brightness,
+            brightness_tolerance=brightness_tolerance,
             rng=rng,
         )
         
@@ -1093,6 +1248,7 @@ def compose_all(
             "use_smooth_mask": use_smooth_mask,
             "smooth_ksize": smooth_ksize,
             "smooth_sigma": smooth_sigma,
+            "brightness_tolerance": brightness_tolerance,
         },
         "statistics": {
             "total_generated": stats['total'],
@@ -1202,13 +1358,15 @@ def main():
         help="품질 점수 JSON 파일 경로 (선택)",
     )
     parser.add_argument(
-        "--dilation-px", type=int, default=15,
-        help="마스크 확장 픽셀 수 (기본: 15)",
+        "--dilation-px", type=int, default=8,
+        help="마스크 확장 픽셀 수 (기본: 8, 이전 기본 15는 과도한 smoothing 유발)",
     )
     parser.add_argument(
         "--blend-mode", type=str, default="NORMAL_CLONE",
         choices=["NORMAL_CLONE", "MIXED_CLONE"],
-        help="Poisson 블렌딩 모드 (기본: NORMAL_CLONE)",
+        help="Poisson 블렌딩 모드 (기본: NORMAL_CLONE). "
+             "MIXED_CLONE: 배경 텍스처가 강한 강재에서 배경 보존이 우수하며 "
+             "FID 개선에 유리할 수 있음",
     )
     parser.add_argument(
         "--mask-threshold", type=int, default=127,
@@ -1239,22 +1397,26 @@ def main():
         "--png-compression", type=int, default=1,
         help="PNG 압축 레벨 0-9 (낮을수록 빠름, 기본: 1, OpenCV 기본: 3)",
     )
-    # ── Tier-1 합성 품질 개선 옵션 ──
+    # ── Tier-1 합성 품질 개선 옵션 (기본값 = 권장값 활성화) ──
     parser.add_argument(
-        "--jitter-range", type=int, default=0,
-        help="x축 위치 랜덤 오프셋 최대값 ±N px (0=비활성, 권장: 50~200)",
+        "--jitter-range", type=int, default=100,
+        help="x축 위치 랜덤 오프셋 최대값 ±N px (0=비활성, 권장: 50~200, 기본: 100)",
     )
     parser.add_argument(
-        "--scale-min", type=float, default=1.0,
-        help="다운스케일 최소 비율 (권장: 0.875, 기본: 1.0)",
+        "--scale-min", type=float, default=0.875,
+        help="다운스케일 최소 비율 (권장: 0.875, 기본: 0.875)",
     )
     parser.add_argument(
         "--scale-max", type=float, default=1.0,
         help="다운스케일 최대 비율 (기본: 1.0)",
     )
     parser.add_argument(
-        "--smooth-mask", action="store_true", default=False,
-        help="마스크 경계 가우시안 블러 적용 (기본: 비활성)",
+        "--smooth-mask", action="store_true", default=True,
+        help="마스크 경계 가우시안 블러 적용 (기본: 활성화, --no-smooth-mask로 비활성화)",
+    )
+    parser.add_argument(
+        "--no-smooth-mask", dest="smooth_mask", action="store_false",
+        help="마스크 경계 가우시안 블러 비활성화",
     )
     parser.add_argument(
         "--smooth-ksize", type=int, default=21,
@@ -1263,6 +1425,11 @@ def main():
     parser.add_argument(
         "--smooth-sigma", type=float, default=7.0,
         help="가우시안 시그마 (기본: 7.0)",
+    )
+    # ── 밝기 매칭 옵션 ──
+    parser.add_argument(
+        "--brightness-tolerance", type=float, default=30.0,
+        help="배경 밝기 매칭 허용 오차 ±N (0=비활성, 기본: 30.0, 권장: 25~40)",
     )
     
     args = parser.parse_args()
@@ -1304,6 +1471,7 @@ def main():
         use_smooth_mask=args.smooth_mask,
         smooth_ksize=args.smooth_ksize,
         smooth_sigma=args.smooth_sigma,
+        brightness_tolerance=args.brightness_tolerance,
     )
 
 

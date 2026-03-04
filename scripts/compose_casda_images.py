@@ -260,6 +260,23 @@ def _classify_single_background(args: Tuple[str, str]) -> Tuple[str, str, float]
     return (name, bg_type, brightness)
 
 
+def _compute_gen_brightness(img_path_str: str) -> Tuple[str, float]:
+    """
+    생성 이미지 1장의 평균 밝기를 계산하는 워커 함수 (멀티프로세싱용).
+    
+    Args:
+        img_path_str: 이미지 파일 절대경로 문자열
+        
+    Returns:
+        (filename, mean_brightness) 튜플.
+        로드 실패 시 밝기 128.0 (중간값) 반환.
+    """
+    img = cv2.imread(img_path_str, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return (Path(img_path_str).name, 128.0)
+    return (Path(img_path_str).name, float(np.mean(img)))
+
+
 def build_quality_map(
     summary: dict, quality_json_path: Optional[Path] = None
 ) -> Dict[str, float]:
@@ -962,6 +979,48 @@ def compose_all(
     out_img_dir.mkdir(parents=True, exist_ok=True)
     out_mask_dir.mkdir(parents=True, exist_ok=True)
     
+    # ── Step 4.5: 생성 이미지 밝기 사전 계산 ──
+    # 배경 밝기 매칭을 위해 모든 생성 이미지의 평균 밝기를 미리 계산한다.
+    # Step 5 루프에서 매번 cv2.imread를 호출하지 않도록 분리.
+    gen_brightness: Dict[str, float] = {}
+    
+    if brightness_tolerance > 0:
+        logger.info("=" * 60)
+        logger.info(f"Step 4.5: 생성 이미지 밝기 사전 계산 ({len(generated_images)}장)")
+        logger.info("=" * 60)
+        
+        brightness_start = time.time()
+        gen_paths_str = [str(p) for p in generated_images]
+        
+        if num_workers > 1 and len(generated_images) > 10:
+            # 멀티프로세싱 병렬 밝기 측정
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                brightness_results = list(tqdm(
+                    executor.map(_compute_gen_brightness, gen_paths_str, chunksize=32),
+                    total=len(gen_paths_str),
+                    desc=f"생성 이미지 밝기 측정 (workers={num_workers})",
+                ))
+        else:
+            # 순차 밝기 측정
+            brightness_results = [
+                _compute_gen_brightness(p) 
+                for p in tqdm(gen_paths_str, desc="생성 이미지 밝기 측정")
+            ]
+        
+        for fname, bval in brightness_results:
+            gen_brightness[fname] = bval
+        
+        brightness_elapsed = time.time() - brightness_start
+        bvals = list(gen_brightness.values())
+        logger.info(
+            f"밝기 사전 계산 완료: {len(gen_brightness)}장, "
+            f"{brightness_elapsed:.1f}초 소요, "
+            f"밝기 범위 [{min(bvals):.0f} ~ {max(bvals):.0f}], "
+            f"평균 {sum(bvals)/len(bvals):.1f}"
+        )
+    else:
+        logger.info("밝기 매칭 비활성 (brightness_tolerance=0) — 밝기 사전 계산 건너뜀")
+    
     # ── Step 5: 합성 작업 목록 사전 준비 ──
     # 메인 프로세스에서 메타데이터 조회 + 배경 선택을 수행하고,
     # 실제 합성(I/O + seamlessClone)은 워커로 분배한다.
@@ -982,7 +1041,7 @@ def compose_all(
         'class_counts': {},
     }
     
-    for img_path in generated_images:
+    for img_path in tqdm(generated_images, desc="합성 작업 준비"):
         filename = img_path.name
         sample_name = filename_to_sample_name(filename)
         
@@ -1021,9 +1080,8 @@ def compose_all(
                 continue
         
         # 호환 배경 이미지 선택 (밝기 매칭 포함)
-        # 생성 이미지의 밝기를 빠르게 측정하여 배경 매칭에 활용
-        gen_img_small = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
-        target_brightness = float(np.mean(gen_img_small)) if gen_img_small is not None else None
+        # Step 4.5에서 사전 계산된 밝기 dict에서 O(1) lookup
+        target_brightness = gen_brightness.get(filename)  # None이면 밝기 필터 비활성
         
         roi_x_center = (roi_bbox[0] + roi_bbox[2]) // 2
         bg_name = bg_pool.get_compatible_background(

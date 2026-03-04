@@ -173,7 +173,8 @@ evaluation:
     compute: true
     batch_size: 64
     dims: 2048  # InceptionV3 feature dimension
-    per_class: true  # class-wise FID
+    max_images: 1000  # 각 세트에서 랜덤 샘플링할 최대 이미지 수 (seeded)
+    per_class: true  # class-wise FID (metadata.json 필요)
 
 # ----------------------------------------------------------------------------
 # Results Reporting

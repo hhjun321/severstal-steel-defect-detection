@@ -1,0 +1,174 @@
+20260304 작업 일지 #6 - Step 5 멈춤 현상 수정 (밝기 사전 계산 분리)
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+Colab에서 compose_casda_images.py 실행 시 "Step 5: 합성 작업 준비" 로그 이후
+수 분간 무응답(멈춤처럼 보이는) 현상을 수정한다.
+
+
+2. 원인 분석
+================================================================================
+
+  2.1 핵심 원인 — Step 5 루프 내 순차 디스크 I/O (Line 1025)
+
+    A1 배경 밝기 매칭 구현 시, Step 5 task-prep 루프에서 매 생성 이미지마다
+    cv2.imread()로 512x512 PNG를 디스크에서 읽어 밝기를 측정했다:
+
+      # 기존 코드 (Line 1025-1026)
+      gen_img_small = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+      target_brightness = float(np.mean(gen_img_small)) ...
+
+    - 생성 이미지 ~5,000장 × 512x512 PNG 디코딩 = 수 분 소요
+    - 메인 프로세스에서 순차 실행 (병렬화 불가)
+    - 프로그레스바 없음 → 사용자에게 완전 무응답으로 보임
+
+  2.2 보조 원인 — Step 5 루프 프로그레스바 부재
+
+    Step 6는 tqdm(tasks, desc="Poisson 합성")으로 진행률 표시하지만,
+    Step 5의 for img_path in generated_images: 루프에는 tqdm이 없었다.
+    밝기 계산이 아니더라도 5,000회 반복 중 아무 출력 없는 것은 UX 문제.
+
+
+3. 코드 수정 내역
+================================================================================
+
+  변경 파일: scripts/compose_casda_images.py (1개)
+
+  3.1 _compute_gen_brightness() 워커 함수 신규 추가 (Line 263)
+
+    def _compute_gen_brightness(img_path_str: str) -> Tuple[str, float]:
+        """생성 이미지 1장의 평균 밝기를 계산하는 워커 함수 (멀티프로세싱용)."""
+        img = cv2.imread(img_path_str, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return (Path(img_path_str).name, 128.0)
+        return (Path(img_path_str).name, float(np.mean(img)))
+
+    - top-level 함수 (pickle 직렬화 필수 — ProcessPoolExecutor용)
+    - IMREAD_GRAYSCALE로 읽기 (3채널 변환 불필요 → 메모리 1/3)
+    - 로드 실패 시 128.0 중간값 반환 (방어 처리)
+
+
+  3.2 Step 4.5: 생성 이미지 밝기 사전 계산 단계 삽입 (Line 982)
+
+    Step 4 (출력 디렉토리 생성)와 Step 5 (합성 작업 준비) 사이에
+    새 단계를 삽입하여 모든 생성 이미지의 밝기를 미리 계산한다.
+
+    (a) brightness_tolerance > 0 일 때만 실행 (비활성 시 건너뜀)
+
+    (b) num_workers > 1이면 ProcessPoolExecutor로 병렬 처리
+        - chunksize=32로 IPC 오버헤드 최소화
+        - tqdm 프로그레스바 표시
+
+    (c) num_workers <= 1이면 순차 처리 + tqdm
+
+    (d) 결과를 gen_brightness: Dict[str, float]에 저장 (키: 파일명)
+
+    (e) 완료 후 소요 시간 + 밝기 통계(범위, 평균) 로깅
+
+    예상 로그 출력:
+      Step 4.5: 생성 이미지 밝기 사전 계산 (4744장)
+      생성 이미지 밝기 측정 (workers=8): 100%|████| 4744/4744 [00:12<00:00]
+      밝기 사전 계산 완료: 4744장, 12.3초 소요, 밝기 범위 [45 ~ 220], 평균 142.7
+
+
+  3.3 Step 5 루프 — cv2.imread 제거, dict lookup 교체 (Line 1082)
+
+    변경 전:
+      gen_img_small = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+      target_brightness = float(np.mean(gen_img_small)) if gen_img_small is not None else None
+
+    변경 후:
+      target_brightness = gen_brightness.get(filename)  # O(1) dict lookup
+
+
+  3.4 Step 5 루프 — tqdm 프로그레스바 추가 (Line 1044)
+
+    변경 전:
+      for img_path in generated_images:
+
+    변경 후:
+      for img_path in tqdm(generated_images, desc="합성 작업 준비"):
+
+
+4. 하위호환성
+================================================================================
+
+    | 조건                           | 동작                                  |
+    |--------------------------------|---------------------------------------|
+    | brightness_tolerance > 0       | Step 4.5 실행 → 병렬/순차 밝기 계산  |
+    | (기본값 30.0)                  | → Step 5에서 dict lookup              |
+    | brightness_tolerance = 0       | Step 4.5 건너뜀 → gen_brightness = {} |
+    |                                | → target_brightness = None (필터 비활성)|
+    | num_workers > 1                | Step 4.5 ProcessPoolExecutor 병렬     |
+    | num_workers <= 1               | Step 4.5 순차 + tqdm                  |
+
+  기존 동작과 완전 호환. 새 파라미터 없음.
+
+
+5. 성능 영향
+================================================================================
+
+    | 항목                | 변경 전                       | 변경 후                    |
+    |---------------------|-------------------------------|----------------------------|
+    | 밝기 계산 위치      | Step 5 루프 내 매 이미지      | Step 4.5 별도 단계         |
+    | 병렬화              | 불가 (메인 프로세스 순차)     | ProcessPoolExecutor 지원   |
+    | I/O 방식            | cv2.IMREAD_GRAYSCALE 순차     | 동일, 병렬 분배 가능       |
+    | Step 5 루프 속도    | ~수 분 (5K images, 순차 I/O) | ~수 초 (dict lookup only)  |
+    | 전체 추가 시간      | 0 (Step 5에 포함)             | ~10-20초 (8 workers 병렬)  |
+    | 진행률 표시         | 없음 (무응답)                 | tqdm 2개 (Step 4.5 + 5)   |
+
+
+6. 검증 결과
+================================================================================
+
+    | # | 검증 항목                                        | 결과 |
+    |---|--------------------------------------------------|------|
+    | 1 | compose_casda_images.py 문법 검증 (py_compile)   | PASS |
+
+
+7. Colab 실행 안내
+================================================================================
+
+  7.1 필수 패키지 설치
+
+    이미 설치되어 있을 가능성이 높으나, 누락 시 아래를 실행:
+
+      !pip install tqdm opencv-python-headless numpy pandas scipy
+
+    Colab에서 기본 제공되는 패키지:
+      - numpy, pandas, scipy, tqdm: 기본 설치됨
+      - opencv: pip install opencv-python-headless 권장
+        (opencv-python은 GUI 의존성 때문에 headless 권장)
+
+    프로젝트 의존성 전체 설치:
+
+      !pip install torch torchvision  # GPU 런타임이면 이미 설치됨
+      !pip install albumentations
+      !pip install ultralytics        # YOLO 벤치마크 사용 시
+      !pip install PyYAML
+
+  7.2 실행 커맨드
+
+    # 새 기본값 (A1~A4 적용, Step 4.5 밝기 사전 계산 포함)
+    !python scripts/compose_casda_images.py \
+      --generated-dir outputs/v5.1/test_results_v5.1/generated \
+      --hint-dir data/processed/controlnet_dataset/hints \
+      --metadata-csv data/processed/controlnet_dataset/packaged_roi_metadata.csv \
+      --summary-json outputs/v5.1/test_results_v5.1/generation_summary.json \
+      --clean-images-dir data/raw/train_images \
+      --train-csv data/raw/train.csv \
+      --output-dir data/augmented/casda_composed \
+      --workers 8 \
+      --bg-cache data/cache/bg_types.json
+
+  7.3 예상 실행 흐름
+
+    Step 1: 메타데이터 로딩                    (~1초)
+    Step 2: 생성 이미지 스캔                   (~1초)
+    Step 3: 배경 이미지 풀 구축                (~30초, 캐시 활용)
+    Step 4: 출력 디렉토리 생성                 (~0초)
+    Step 4.5: 생성 이미지 밝기 사전 계산       (~10-20초, 8 workers)  ← NEW
+    Step 5: 합성 작업 준비                     (~3-5초, dict lookup)   ← 기존 수 분 → 수 초
+    Step 6: Poisson Blending 합성              (~10-30분, 8 workers)
+    Step 7: metadata.json 저장                 (~1초)

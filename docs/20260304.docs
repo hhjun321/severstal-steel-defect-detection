@@ -1,0 +1,766 @@
+20260304 작업 일지 #1 - Poisson Blending 합성 파이프라인 설계 (casda_composed)
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+v5.3에서 발견된 근본적 파이프라인 결함을 해결하는 새로운 합성 파이프라인을 설계한다.
+ControlNet이 생성한 512x512 결함 ROI 이미지를 결함 없는 원본 이미지(1600x256)에
+Poisson Blending으로 합성하여, 크기/종횡비/맥락이 원본과 완전히 일치하는
+학습용 증강 이미지를 생성하는 구조를 확정한다.
+
+  배경:
+    v5.3에서 CASDA 합성 데이터가 Detection 성능을 -12.4%~-45.0% 하락시킴.
+    근본 원인으로 512x512 합성 이미지가 1600x256 원본과 함께 학습되는
+    크기/종횡비 불일치가 식별됨 (20260303_3.docs 섹션 6 참조).
+
+  이 문서의 범위:
+    (1) 기존 파이프라인의 근본 결함 정리
+    (2) 3개 좌표계 정의 및 변환 관계
+    (3) Poisson Blending 합성 파이프라인 상세 설계
+    (4) casda_pruning의 casda_composed 기반 동적 대체 설계
+    (5) 학습 파이프라인 통합 방식
+    (6) 구현 파일 목록 및 코드 변경 범위
+
+
+2. 기존 파이프라인의 근본 결함
+================================================================================
+
+  2-1. 문제 요약
+  ──────────────────────────────────
+
+    현재 파이프라인의 데이터 흐름:
+
+      roi_extraction.py → 1600x256에서 ~256x256 ROI 패치 추출
+          ↓
+      controlnet_packager.py → ROI 패치로 힌트 생성, 학습 데이터 구성
+          ↓
+      test_controlnet.py → 512x512 고정 해상도로 이미지 생성
+          ↓
+      package_casda_data.py → shutil.copy2()로 512x512 이미지 그대로 복사
+          ↓
+      dataset_yolo.py → 512x512 합성 이미지를 1600x256 원본과 같은 디렉토리에 심링크
+          ↓
+      Ultralytics → 모든 이미지를 640x640으로 리사이즈하여 학습
+
+    ※ 합성(composition) 또는 블렌딩이 전혀 수행되지 않음
+    ※ 512x512 정사각 이미지와 1600x256 직사각 이미지가 혼합 학습됨
+
+  2-2. 구체적 문제점
+  ──────────────────────────────────
+
+    | # | 문제                  | 코드 위치                           | 상세                               |
+    |---|----------------------|------------------------------------|------------------------------------|
+    | 1 | 합성 없음             | package_casda_data.py:316          | shutil.copy2() — 단순 파일 복사     |
+    | 2 | 크기 불일치           | test_controlnet.py:228-231         | resolution=512 고정, 정사각 생성     |
+    | 3 | 배경 맥락 부재        | test_controlnet.py:generate_single | ControlNet이 배경까지 합성 생성      |
+    | 4 | 종횡비 충돌           | dataset_yolo.py:_add_casda_to_training | 1600x256과 512x512 혼합 학습    |
+    | 5 | 무결함 이미지 미활용   | background_extraction.py:find_clean_images | ~5,902장 존재하지만 미사용   |
+
+  2-3. 성능 영향
+  ──────────────────────────────────
+
+    | 모델         | Baseline(Raw) | CASDA-Full | 변동       | CASDA-Pruning | 변동      |
+    |-------------|:------------:|:----------:|:----------:|:------------:|:---------:|
+    | EB-YOLOv8   | 0.5819       | 0.5100     | -12.4% ↓   | 0.0633       | -89.1% ↓  |
+    | YOLO-MFD    | 0.5546       | 0.3050     | -45.0% ↓   | 크래시       | N/A       |
+    | DeepLabV3+  | 0.6290       | 0.6254     | -0.6% ↓    | 0.6346       | +0.9% ↑   |
+
+
+3. 3개 좌표계 정의 및 변환 관계
+================================================================================
+
+  파이프라인에는 3개의 독립적 좌표계가 존재한다.
+  Poisson Blending 합성을 위해서는 이들 간의 정확한 변환이 필수적이다.
+
+  3-1. 좌표계 정의
+  ──────────────────────────────────
+
+    | 좌표계           | 크기        | 원점      | 사용처                              |
+    |-----------------|------------|----------|-------------------------------------|
+    | 원본 이미지 공간  | 1600 x 256 | 좌상단    | roi_bbox, defect_bbox, centroid     |
+    |                 |            |          | (메타데이터 CSV/JSON 전체)           |
+    | ROI 패치 공간    | ~256 x 256 | 좌상단    | 추출된 이미지/마스크/힌트 파일        |
+    |                 |            |          | (파일 내 픽셀 위치로만 존재)          |
+    | 생성 이미지 공간  | 512 x 512  | 좌상단    | ControlNet 출력 이미지               |
+    |                 |            |          | (좌표 메타데이터 없음)               |
+
+  3-2. 좌표 변환 공식
+  ──────────────────────────────────
+
+    [원본 → ROI 패치]
+      patch_x = original_x - roi_bbox_x1
+      patch_y = original_y - roi_bbox_y1
+
+    [ROI 패치 → 생성 이미지] (256→512, 2배 확대)
+      gen_x = patch_x * (512 / roi_w)    # roi_w = roi_bbox_x2 - roi_bbox_x1
+      gen_y = patch_y * (512 / roi_h)    # roi_h = roi_bbox_y2 - roi_bbox_y1
+
+    [생성 이미지 → ROI 패치] (512→256, 역변환)
+      patch_x = gen_x * (roi_w / 512)
+      patch_y = gen_y * (roi_h / 512)
+
+    [ROI 패치 → 원본] (역변환)
+      original_x = patch_x + roi_bbox_x1
+      original_y = patch_y + roi_bbox_y1
+
+  3-3. 메타데이터 연결 체인
+  ──────────────────────────────────
+
+    좌표 변환에 필요한 roi_bbox 정보는 다음 경로로 복원한다:
+
+      생성 이미지 파일명
+        예: adc257b59.jpg_class1_region4_gen0.png
+                    ↓
+      sample_name 추출 (파일명에서 _genN.png 제거)
+        → adc257b59.jpg_class1_region4
+                    ↓
+      packaged_roi_metadata.csv와 조인
+        조인 키: (image_id, class_id, region_id) 또는 sample_name 직접 매칭
+                    ↓
+      복원 가능한 필드:
+        - roi_bbox: "(x1, y1, x2, y2)" — 원본 1600x256 좌표
+        - defect_bbox: "(x1, y1, x2, y2)" — 원본 1600x256 좌표
+        - background_type: 배경 유형 (호환 매칭에 사용)
+        - defect_subtype: 결함 하위 유형
+        - stability_score: 배경 안정성 점수
+        - suitability_score: ROI 적합성 점수
+
+    메타데이터 파일 위치 (v5.1 기준):
+      - packaged_roi_metadata.csv:
+          outputs/v5.1/controlnet_dataset_v5.1/packaged_roi_metadata.csv
+          data/processed/controlnet_dataset/packaged_roi_metadata.csv
+      - generation_summary.json:
+          outputs/v5.1/test_results_v5.1/generation_summary.json
+
+  3-4. 중요 참고: Severstal 이미지의 ROI 특성
+  ──────────────────────────────────
+
+    Severstal 원본 이미지: 1600 x 256 (W x H)
+    ROI 추출 시: roi_side = min(roi_h, roi_w, image_height, image_width)
+                → image_height = 256이므로, ROI는 항상 256 x 256
+
+    따라서:
+      - ROI는 y축 전체(0~256)를 사용하고, x축에서만 위치가 달라짐
+      - roi_bbox는 항상 (x1, 0, x2, 256) 형태 (y_start=0, height=256)
+      - 512→256 다운스케일 시 정확히 2배 축소 (256/512 = 0.5)
+
+
+4. Poisson Blending 합성 파이프라인 설계
+================================================================================
+
+  4-1. 설계 결정 사항 (확정)
+  ──────────────────────────────────
+
+    | 항목            | 결정                                                    | 근거                           |
+    |----------------|--------------------------------------------------------|-------------------------------|
+    | 코드 위치       | src/preprocessing/poisson_blender.py (모듈)            | 재사용성, 모듈화               |
+    |                | + scripts/compose_casda_images.py (실행 스크립트)       | 기존 스크립트 구조 일관성       |
+    | 다운스케일 전략  | 512x512 → 256x256 리사이즈 (INTER_AREA)               | 원본 ROI 스케일 보존           |
+    | 블렌딩 영역     | 확장 마스크 (dilate 10-20px)                            | Poisson 경계 맥락 제공         |
+    | 배경 이미지 선택 | 호환성 매칭 + 동일 x-offset 유지                        | 물리적 현실성, 새 학습 샘플     |
+    | 통합 방식       | casda_composed 새 그룹 (기존 casda_full 대체)           | 기존 대비 비교 실험 가능        |
+
+  4-2. 전체 파이프라인 흐름
+  ──────────────────────────────────
+
+    [입력]
+      (A) 생성된 512x512 이미지   ← test_controlnet.py 출력
+      (B) 힌트 이미지              ← controlnet_packager.py 출력
+      (C) packaged_roi_metadata.csv ← roi_bbox, defect_bbox 좌표 정보
+      (D) generation_summary.json   ← sample_name → 생성 이미지 매핑
+      (E) 결함 없는 원본 이미지     ← find_clean_images()로 식별 (~5,902장)
+      (F) train.csv                ← 결함 이미지 식별용
+
+    [처리 흐름]
+
+      Step 1. 메타데이터 로딩 및 조인
+      ────────────────────
+        - generation_summary.json에서 생성 이미지 목록 로드
+        - sample_name으로 packaged_roi_metadata.csv와 조인
+        - 각 생성 이미지에 대해 roi_bbox, background_type 등 복원
+
+      Step 2. 결함 없는 배경 이미지 풀 구축
+      ────────────────────
+        - find_clean_images(train_csv, train_images_dir) 호출
+        - ~5,902장의 결함 없는 1600x256 이미지 목록 확보
+        - background_extraction.py로 각 이미지의 배경 유형 분석 (캐싱)
+
+      Step 3. 생성 이미지별 합성 처리
+      ────────────────────
+        각 생성 이미지에 대해:
+
+        (a) 마스크 추출
+            - 힌트 이미지의 Red 채널에서 이진 마스크 추출
+            - threshold=127, 출력: 512x512 이진 마스크 (0/255)
+            - 기존 extract_mask_from_hint() 함수 재사용
+
+        (b) 512→256 다운스케일
+            - cv2.resize(image_512, (256, 256), interpolation=cv2.INTER_AREA)
+            - cv2.resize(mask_512, (256, 256), interpolation=cv2.INTER_NEAREST)
+            - INTER_AREA: 축소 시 앨리어싱 방지에 최적
+            - INTER_NEAREST: 마스크의 이진 특성 보존
+
+        (c) 마스크 확장 (dilation)
+            - kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*d+1, 2*d+1))
+            - mask_dilated = cv2.dilate(mask_256, kernel, iterations=1)
+            - d = 15px 기본값 (타원 커널로 자연스러운 확장)
+            - Poisson Blending이 경계 맥락을 활용하여 자연스러운 전환 생성
+
+        (d) 호환 배경 이미지 선택
+            - COMPATIBILITY_MATRIX에서 defect_subtype-background_type 점수 조회
+            - min_compatibility >= 0.5 필터
+            - stability_score >= 0.6 필터
+            - 적합한 결함 없는 이미지 중 랜덤 선택
+
+        (e) 붙여넣기 위치 계산
+            - roi_bbox의 x-offset 동일하게 유지
+            - center_x = (roi_bbox_x1 + roi_bbox_x2) / 2
+            - center_y = (roi_bbox_y1 + roi_bbox_y2) / 2 = 128 (항상)
+            - Poisson Blending의 center 파라미터로 사용
+
+        (f) Poisson Blending 실행
+            - source: 256x256 다운스케일된 생성 이미지 (3채널)
+            - target: 1600x256 결함 없는 배경 이미지 (3채널)
+            - mask: 256x256 확장된 이진 마스크 (단채널)
+            - cv2.seamlessClone(source, target, mask, center, cv2.NORMAL_CLONE)
+            - NORMAL_CLONE: 그래디언트 보존으로 자연스러운 블렌딩
+
+        (g) 전체 크기 마스크 생성
+            - 1600x256 크기의 0-초기화 마스크 생성
+            - roi_bbox 위치에 원본(비확장) 256x256 마스크 배치
+            - 실제 결함 영역만 마킹 (확장 영역은 블렌딩 보조용이므로 제외)
+
+        (h) YOLO bbox 계산
+            - 전체 크기 마스크에서 cv2.findContours()
+            - contour → boundingRect → 정규화 (1600x256 기준)
+            - 출력: [cx, cy, w, h] 정규화 YOLO 좌표
+
+      Step 4. 출력 저장
+      ────────────────────
+        casda_composed/
+        ├── images/          # 1600x256 합성 이미지 (.png)
+        ├── masks/           # 1600x256 전체 크기 마스크 (.png)
+        └── metadata.json    # 메타데이터 (YOLO bbox 포함)
+
+  4-3. cv2.seamlessClone 기술 고려사항
+  ──────────────────────────────────
+
+    (a) 입력 요구사항
+        - source, target: 3채널 uint8 이미지 (그레이스케일이면 3채널로 변환 필요)
+        - mask: 단채널 uint8 (0 또는 255)
+        - center: (x, y) 정수 튜플 — source를 target에 붙일 중심점
+
+    (b) 경계 처리
+        - Severstal 이미지 높이=256, ROI 높이=256이므로 y축은 전체 사용
+        - seamlessClone의 source 마스크가 target 경계를 넘으면 실패할 수 있음
+        - 안전장치: center 좌표 클리핑, 마스크 경계 검증 필요
+
+    (c) 그레이스케일 이미지 처리
+        - ControlNet 생성 이미지는 그레이스케일→3채널 복제 형태
+        - Severstal 원본도 실질적으로 그레이스케일 (강판 이미지)
+        - seamlessClone은 3채널로 동작하므로, 입출력 모두 3채널 유지
+        - 필요 시 최종 출력을 그레이스케일로 변환
+
+    (d) NORMAL_CLONE vs MIXED_CLONE
+        - NORMAL_CLONE: source의 그래디언트를 target에 이식. 배경 밝기에 자연스럽게 적응
+        - MIXED_CLONE: source와 target 그래디언트 중 더 강한 것 선택. 텍스처 보존에 유리
+        - 기본값: NORMAL_CLONE (결함이 배경에 자연스럽게 녹아드는 것이 목표)
+
+  4-4. compose_casda_images.py CLI 인터페이스
+  ──────────────────────────────────
+
+    python scripts/compose_casda_images.py \
+      --generated-dir outputs/v5.1/test_results_v5.1/ \
+      --hint-dir data/processed/controlnet_dataset/hints/ \
+      --metadata-csv data/processed/controlnet_dataset/packaged_roi_metadata.csv \
+      --summary-json outputs/v5.1/test_results_v5.1/generation_summary.json \
+      --clean-images-dir data/raw/train_images/ \
+      --train-csv data/raw/train.csv \
+      --output-dir data/augmented/casda_composed/ \
+      --dilation-px 15 \
+      --blend-mode NORMAL_CLONE
+
+  4-5. metadata.json 출력 규격
+  ──────────────────────────────────
+
+    각 항목의 스키마:
+
+      {
+        "image_path": "images/composed_00001.png",
+        "class_id": 2,                                    # 0-indexed
+        "suitability_score": 0.85,                        # 생성 품질 점수
+        "mask_path": "masks/composed_00001_mask.png",
+        "bboxes": [[0.234, 0.410, 0.025, 0.156]],       # 정규화 YOLO [cx,cy,w,h]
+        "labels": [2],                                    # 0-indexed class_id
+        "bbox_format": "yolo",
+        "image_width": 1600,                              # 원본과 동일
+        "image_height": 256,                              # 원본과 동일
+        "source_generated": "adc257b59.jpg_class3_region2_gen0.png",
+        "source_background": "clean_image_0042.jpg",
+        "blend_method": "poisson_normal_clone",
+        "roi_bbox": [368, 0, 624, 256],
+        "defect_bbox_original": [420, 80, 480, 160],     # 원본 좌표계
+        "background_type": "smooth",
+        "defect_subtype": "compact_blob"
+      }
+
+    ※ bbox 좌표는 1600x256 기준 정규화 — 기존 _add_casda_to_training()의
+      Branch 1 (bbox_format=="yolo") 빠른 경로와 완전 호환
+    ※ suitability_score 필드 필수 — 동적 pruning에 사용됨
+
+
+5. casda_pruning의 casda_composed 기반 동적 대체 설계
+================================================================================
+
+  5-1. 현재 pruning 구조의 문제
+  ──────────────────────────────────
+
+    기존 구조:
+
+      [패키징 시점] package_casda_data.py
+        casda_full/ (전체 ~7,000장, 512x512)
+            ↓ suitability_score >= 0.63 필터
+            ↓ 클래스별 비례 할당 (stratified top-k)
+        casda_pruning/ (최대 2,000장, 512x512)  ← 별도 디렉토리 사전 생성
+
+      [학습 시점] dataset_yolo.py / dataset.py
+        casda_pruning/ 전체를 그대로 사용 (추가 필터링 없음)
+
+    문제점:
+      (1) 이미지 중복 저장 (casda_full과 casda_pruning에 동일 이미지 복사)
+      (2) pruning 기준(threshold, top_k) 변경 시 재패키징 필요
+      (3) 학습 시점 pruning(dataset_yolo.py:352-360)에 계층화 없음
+          → 특정 클래스가 top-k를 독점할 수 있음
+
+  5-2. 패키징 시점 vs 학습 시점 pruning 비교
+  ──────────────────────────────────
+
+    | 항목            | 패키징 시점 (package_casda_data.py) | 학습 시점 (dataset_yolo.py)      |
+    |----------------|------------------------------------|---------------------------------|
+    | 계층화          | ○ 클래스별 비례 할당                | × 단순 전체 top-k               |
+    | 누락 점수 기본값 | 0 (제외됨)                         | 1.0 (포함 + 최상위 랭크)         |
+    | 오버플로 보정    | ○ 큰 클래스 우선 축소               | × 없음                          |
+    | 잔여 슬롯 채움   | ○ 남은 슬롯을 점수순으로 채움        | × 없음                          |
+    | 임계값 기본값    | 0.63 (함수 인수) / 0.60 (YAML)     | 0.63 (하드코딩 폴백)             |
+    | 유연성          | 재패키징 필요                       | YAML/CLI로 즉시 변경 가능         |
+
+    ※ 패키징 시점의 계층화 로직이 학습 시점에는 없는 것이 핵심 차이
+
+  5-3. 새 구조: 단일 디렉토리 + 동적 pruning
+  ──────────────────────────────────
+
+    새 구조:
+
+      [합성 시점] compose_casda_images.py
+        casda_composed/               ← 단일 디렉토리 (전체 합성 이미지, 1600x256)
+          images/
+          masks/
+          metadata.json               (suitability_score 포함)
+
+      [학습 시점] 동적 필터링
+        casda_composed 그룹:          → 전체 이미지 사용
+        casda_composed_pruning 그룹:  → metadata.json에서 동적 필터링
+                                        suitability_score >= threshold
+                                        + stratified top-k 선택
+
+    장점:
+      (1) 디스크 공간 절약 (이미지 중복 없음)
+      (2) pruning 기준을 YAML에서 자유롭게 조절 (재패키징 불필요)
+      (3) ratio 실험과 자연스럽게 통합 가능
+
+  5-4. YAML 설정 구조
+  ──────────────────────────────────
+
+    casda:
+      composed_dir: "data/augmented/casda_composed"
+      suitability_threshold: 0.63
+      pruning_top_k: 2000
+
+    dataset_groups:
+      casda_composed:
+        name: "CASDA-Composed (Full)"
+        use_original: true
+        augmentation: "none"
+        casda_data: "composed"
+        # pruning 설정 없음 → 전체 사용
+
+      casda_composed_pruning:
+        name: "CASDA-Composed (Pruning)"
+        use_original: true
+        augmentation: "none"
+        casda_data: "composed"              # ← 같은 디렉토리 참조
+        casda_pruning:                       # ← pruning 설정 블록
+          enabled: true
+          suitability_threshold: 0.63
+          top_k: 2000
+          stratified: true                   # ← 클래스별 비례 할당 활성화
+
+    ※ 두 그룹이 같은 casda_composed/ 디렉토리를 참조
+    ※ casda_pruning 블록 유무로 동작 분기
+
+  5-5. 학습 시점 계층화 pruning 로직
+  ──────────────────────────────────
+
+    _add_casda_to_training()에서 casda_mode == "pruning"일 때:
+
+    (현재 — 단순 top-k)
+      all_samples.sort(key=score, reverse=True)
+      all_samples = all_samples[:top_k]
+
+    (변경 — 계층화 top-k)
+      1) threshold 필터: suitability_score >= threshold인 샘플만 선택
+         ※ 누락 점수 기본값을 0으로 통일 (패키징 시점과 일치)
+
+      2) 클래스별 그룹핑:
+         class_groups = {class_id: [samples...], ...}
+
+      3) 각 클래스 내 점수순 정렬:
+         class_groups[cid].sort(key=score, reverse=True)
+
+      4) 비례 할당:
+         total = sum(len(group) for group in class_groups.values())
+         for cid in class_groups:
+           ratio = len(class_groups[cid]) / total
+           quota = max(1, round(ratio * top_k))
+           quota = min(quota, len(class_groups[cid]))
+
+      5) 오버플로 보정:
+         while sum(quotas) > top_k:
+           largest_class의 quota -= 1
+
+      6) 선택:
+         for cid in class_groups:
+           result.extend(class_groups[cid][:quota[cid]])
+
+    이 로직은 package_casda_data.py (L414-472)의 계층화 코드와 동일하며,
+    _stratified_top_k() 유틸리티 함수로 분리하여 양쪽에서 재사용한다.
+
+  5-6. 디렉토리 구조 비교
+  ──────────────────────────────────
+
+    [기존]
+      data/augmented/
+      ├── casda_full/              # 전체 (~7,000장, 512x512)
+      │   ├── images/
+      │   ├── masks/
+      │   └── metadata.json
+      └── casda_pruning/           # 사전 필터링 복사본 (~2,000장, 512x512)
+          ├── images/              # ← casda_full과 이미지 중복!
+          ├── masks/
+          └── metadata.json
+
+    [새 구조]
+      data/augmented/
+      └── casda_composed/          # 단일 디렉토리 (1600x256, Poisson 블렌딩)
+          ├── images/
+          ├── masks/
+          └── metadata.json        # suitability_score 포함
+                                   # → 학습 시점에 동적 pruning
+
+
+6. 학습 파이프라인 통합 설계
+================================================================================
+
+  6-1. 기존 CASDA 데이터 학습 경로 (4가지)
+  ──────────────────────────────────
+
+    CASDA 데이터가 모델 학습에 도달하는 경로:
+
+    경로 A: UltralyticsTrainer._prepare_dataset() — 신규 변환
+      casda_dir/metadata.json
+        → prepare_yolo_dataset()
+          → _add_casda_to_training()
+            → yolo_dataset/images/train/casda_NNNNN_*.png (심링크)
+            → yolo_dataset/labels/train/casda_NNNNN_*.txt (YOLO 라벨)
+        → Ultralytics가 dataset.yaml 통해 학습
+
+    경로 B: run_benchmark.py inject 모드 — 기존 baseline_raw 재사용
+      casda_dir 식별 (CASDA_GROUP_TO_SUBDIR 매핑)
+        → inject_casda_to_baseline()
+          → _add_casda_to_training()
+            → baseline_raw/images/train/casda_*.png
+            → baseline_raw/labels/train/casda_*.txt
+        → effective_group = "baseline_raw"로 학습
+        → 학습 후 clean_casda_from_baseline()으로 정리
+
+    경로 C: create_data_loaders() — 세그멘테이션용 인메모리
+      casda_dir/metadata.json
+        → CASDASyntheticDataset.__init__()
+          → _load_metadata()
+        → ConcatDataset([SeverstalSegmentationDataset, CASDASyntheticDataset])
+        → PyTorch DataLoader가 런타임에 이미지 로드
+
+    경로 D: prepare_benchmark_data.py — 오프라인 사전 준비
+      casda_dir
+        → symlink_baseline_to_group()로 baseline 구조 복제
+        → _add_casda_to_training()로 CASDA 추가
+        → 사전 변환된 YOLO 디렉토리 생성
+        → validate_yolo_dataset()가 캐시 감지
+
+  6-2. casda_composed 통합 시 변경 사항
+  ──────────────────────────────────
+
+    핵심: casda_composed 이미지가 이미 1600x256이므로,
+    기존 _add_casda_to_training()이 그대로 동작한다.
+
+    metadata.json에 bbox_format="yolo"와 정규화 좌표가 포함되어 있으므로,
+    _add_casda_to_training()의 Branch 1 (빠른 경로)을 통해 처리된다.
+
+    | 경로 | 변경 필요 여부 | 상세                                         |
+    |------|:------------:|----------------------------------------------|
+    | A    | ○ 소규모    | ultralytics_trainer.py에 "composed" 분기 추가  |
+    | B    | ○ 소규모    | run_benchmark.py CASDA_GROUP_TO_SUBDIR 추가    |
+    | C    | ○ 소규모    | dataset.py에 "composed" 분기 추가              |
+    | D    | × 없음      | 기존 로직이 casda_dir만 변경하면 동작            |
+
+  6-3. Detection 모델 (YOLO) 학습 흐름 — casda_composed
+  ──────────────────────────────────
+
+    run_benchmark.py 실행:
+      --groups casda_composed casda_composed_pruning
+
+    casda_composed 그룹:
+      1. CASDA_GROUP_TO_SUBDIR["casda_composed"] → "casda_composed"
+      2. casda_dir = "data/augmented/casda_composed"
+      3. inject_casda_to_baseline(baseline_dir, casda_dir)
+         → _add_casda_to_training(casda_mode="full")
+         → 전체 이미지 심링크 (1600x256 → baseline_raw/images/train/)
+      4. 학습: effective_group = "baseline_raw"
+      5. 정리: clean_casda_from_baseline()
+
+    casda_composed_pruning 그룹:
+      1. CASDA_GROUP_TO_SUBDIR["casda_composed_pruning"] → "casda_composed"
+         (같은 디렉토리!)
+      2. casda_dir = "data/augmented/casda_composed"
+      3. inject_casda_to_baseline(baseline_dir, casda_dir,
+           suitability_threshold=0.63, max_samples=2000, stratified=True)
+         → _add_casda_to_training(casda_mode="pruning")
+         → 계층화 top-k 필터링 후 선택된 이미지만 심링크
+      4. 학습: effective_group = "baseline_raw"
+      5. 정리: clean_casda_from_baseline()
+
+  6-4. Segmentation 모델 (DeepLabV3+) 학습 흐름 — casda_composed
+  ──────────────────────────────────
+
+    create_data_loaders(dataset_group="casda_composed"):
+      1. group_config['casda_data'] == "composed"
+      2. casda_dir = config['casda']['composed_dir']
+      3. CASDASyntheticDataset(data_dir=casda_dir, mode="segmentation")
+         → _load_metadata(): metadata.json 로드, 전체 사용
+      4. ConcatDataset 병합
+
+    create_data_loaders(dataset_group="casda_composed_pruning"):
+      1. group_config['casda_data'] == "composed"
+      2. group_config['casda_pruning'] 존재 → pruning 활성화
+      3. CASDASyntheticDataset(
+           data_dir=casda_dir,
+           suitability_threshold=0.63,
+           max_samples=2000,
+           stratified=True
+         )
+         → _load_metadata(): 계층화 top-k 필터링
+      4. ConcatDataset 병합
+
+  6-5. 기존 이미지와의 호환성
+  ──────────────────────────────────
+
+    | 항목              | 기존 casda_full (512x512) | casda_composed (1600x256) |
+    |------------------|:------------------------:|:-------------------------:|
+    | 원본 이미지 크기   | 1600x256                 | 1600x256                 |
+    | 합성 이미지 크기   | 512x512                  | 1600x256                 |
+    | 종횡비            | 1:1 (불일치)             | 6.25:1 (일치)             |
+    | Ultralytics 리사이즈 | 640x640 (왜곡)         | 640x640 (동일 왜곡)       |
+    | YOLO 정규화 좌표   | 512x512 기준             | 1600x256 기준            |
+    | 배경 맥락          | 합성 (비현실적)          | 실제 강판 배경             |
+    | 라벨 호환성        | ○                       | ○ (bbox_format="yolo")   |
+    | _add_casda_to_training | Branch 1 사용         | Branch 1 사용             |
+
+    ※ _add_casda_to_training()은 이미지 크기에 무관하게 동작
+    ※ YOLO 라벨이 정규화 좌표([0,1])이므로 크기 변경에 자동 적응
+
+
+7. 구현 파일 목록 및 변경 범위
+================================================================================
+
+  7-1. 신규 생성 파일
+  ──────────────────────────────────
+
+    | 파일                                  | 유형   | 예상 줄수 | 역할                          |
+    |--------------------------------------|--------|----------|-------------------------------|
+    | src/preprocessing/poisson_blender.py  | 모듈   | ~250     | PoissonBlender 핵심 클래스     |
+    | scripts/compose_casda_images.py       | 스크립트 | ~400   | 합성 오케스트레이션             |
+
+  7-2. 수정 파일
+  ──────────────────────────────────
+
+    | 파일                              | 변경량   | 내용                                      |
+    |-----------------------------------|---------|-------------------------------------------|
+    | configs/benchmark_experiment.yaml | ~15줄   | casda_composed, casda_composed_pruning 추가 |
+    | scripts/run_benchmark.py          | ~10줄   | CASDA_GROUP_TO_SUBDIR 매핑, pruning 전달    |
+    | src/training/dataset.py           | ~15줄   | "composed" 분기, 계층화 pruning             |
+    | src/training/ultralytics_trainer.py| ~5줄    | "composed" 분기                            |
+    | src/training/dataset_yolo.py      | ~40줄   | _stratified_top_k() 함수 추가              |
+
+    총 변경량: 신규 ~650줄 + 수정 ~85줄
+
+  7-3. 변경 없는 파일 (기존 로직 그대로 사용)
+  ──────────────────────────────────
+
+    | 파일                              | 재사용 함수/클래스                     |
+    |----------------------------------|---------------------------------------|
+    | src/preprocessing/background_extraction.py | find_clean_images()          |
+    | src/preprocessing/background_library.py    | COMPATIBILITY_MATRIX,        |
+    |                                            | get_compatible_backgrounds() |
+    | scripts/package_casda_data.py              | extract_mask_from_hint()     |
+
+  7-4. PoissonBlender 클래스 설계
+  ──────────────────────────────────
+
+    class PoissonBlender:
+      """ControlNet 생성 결함 이미지를 결함 없는 원본 이미지에 Poisson 블렌딩"""
+
+      __init__(self, dilation_px=15, blend_mode=cv2.NORMAL_CLONE)
+        → 설정 초기화
+
+      extract_defect_from_generated(gen_image_512, mask_512)
+        → 512x512 생성 이미지에서 결함 영역과 마스크 추출
+        → 반환: (defect_image, defect_mask)
+
+      downscale_to_roi(image_512, mask_512, target_size=(256, 256))
+        → 512x512 → 256x256 리사이즈
+        → 이미지: INTER_AREA, 마스크: INTER_NEAREST
+        → 반환: (image_256, mask_256)
+
+      dilate_mask(mask, dilation_px=None)
+        → 마스크 확장 (타원 커널)
+        → 반환: dilated_mask
+
+      compute_paste_center(roi_bbox, target_shape)
+        → roi_bbox 중심점 계산 (1600x256 좌표계)
+        → 경계 클리핑 적용
+        → 반환: (center_x, center_y)
+
+      validate_blend_region(mask, center, target_shape)
+        → 블렌딩 영역이 target 경계 내에 있는지 검증
+        → 반환: bool
+
+      poisson_blend(source, mask, target, center)
+        → cv2.seamlessClone() 호출
+        → 실패 시 폴백: 단순 알파 블렌딩
+        → 반환: composited_image
+
+      generate_full_mask(defect_mask_roi, roi_bbox, target_shape)
+        → 1600x256 크기 전체 마스크 생성
+        → roi_bbox 위치에 결함 마스크 배치
+        → 반환: full_mask (1600x256)
+
+      compute_yolo_bbox(full_mask, class_id)
+        → 전체 마스크에서 contour 추출
+        → 정규화 YOLO bbox 계산
+        → 반환: (bboxes_list, labels_list)
+
+      compose_single(gen_path, hint_path, clean_bg_path, roi_bbox, ...)
+        → 위 메서드들의 체이닝 (단일 이미지 합성 전체 흐름)
+        → 반환: {composited_image, full_mask, bboxes, labels, metadata}
+
+
+8. 기대 효과 및 실험 계획
+================================================================================
+
+  8-1. 기대 효과
+  ──────────────────────────────────
+
+    | 항목              | 기존 (v5.3)          | casda_composed 적용 후 |
+    |------------------|---------------------|----------------------|
+    | 이미지 크기 일치   | × (512x512 vs 1600x256) | ○ (1600x256 통일)  |
+    | 배경 현실성        | × (합성 배경)        | ○ (실제 강판 배경)    |
+    | 블렌딩 품질        | × (없음)             | ○ (Poisson Blending) |
+    | FID 예상          | 156.31 (높음)        | 대폭 개선 예상        |
+    | Detection 성능     | -12.4%~-45.0%       | 개선 또는 무해 예상   |
+    | Segmentation 성능  | -0.6%~+0.9%         | 소폭 개선 예상        |
+
+  8-2. 실험 매트릭스
+  ──────────────────────────────────
+
+    3 모델 x 4 데이터셋 = 12회 실험
+
+    | 모델         | baseline_raw | baseline_trad | casda_composed | casda_composed_pruning |
+    |-------------|:------------:|:------------:|:--------------:|:---------------------:|
+    | EB-YOLOv8   | (v5.3 결과)  | 실행 필요     | 실행 필요       | 실행 필요              |
+    | YOLO-MFD    | (v5.3 결과)  | 실행 필요     | 실행 필요       | 실행 필요              |
+    | DeepLabV3+  | (v5.3 결과)  | 실행 필요     | 실행 필요       | 실행 필요              |
+
+    추가 실험 (ratio):
+    | 모델         | ratio=0.1 | ratio=0.2 | ratio=0.3 |
+    |-------------|:---------:|:---------:|:---------:|
+    | EB-YOLOv8   | 실행 필요  | 실행 필요  | 실행 필요  |
+    | YOLO-MFD    | 실행 필요  | 실행 필요  | 실행 필요  |
+
+  8-3. 구현 우선순위
+  ──────────────────────────────────
+
+    P0 (핵심):
+      1. src/preprocessing/poisson_blender.py — PoissonBlender 클래스
+      2. scripts/compose_casda_images.py — 합성 오케스트레이션
+
+    P1 (통합):
+      3. configs/benchmark_experiment.yaml — casda_composed 그룹 추가
+      4. src/training/dataset_yolo.py — _stratified_top_k() 추가
+      5. src/training/ultralytics_trainer.py — "composed" 분기
+      6. src/training/dataset.py — "composed" 분기, 계층화 pruning
+      7. scripts/run_benchmark.py — 매핑 추가
+
+    P2 (검증):
+      8. 단위 테스트 / 시각화 스크립트
+      9. 소규모 합성 테스트 (5-10장) → 품질 육안 확인
+
+
+9. 이전 작업과의 연속성
+================================================================================
+
+  이 설계는 다음 이전 작업 일지들의 연장선:
+
+    20260303_1.docs — v5.3 벤치마크 통합 분석 (문제 식별)
+    20260303_2.docs — v5.4 후속 실험 코드 준비 (ratio, bbox 검증)
+    20260303_3.docs — 전체 코드베이스 분석 + baseline_trad 구현
+                      섹션 6: 파이프라인 데이터 흐름 추적
+                      섹션 7: 핵심 발견 — 합성/블렌딩 부재
+                      섹션 8: ROI 좌표계 분석
+
+  이전 작업에서 식별된 4가지 근본 원인과 본 설계의 대응:
+
+    | 근본 원인                    | 본 설계의 해결책                    |
+    |----------------------------|------------------------------------|
+    | (A) Bbox 품질 손실           | 1600x256 전체 마스크에서 직접 계산   |
+    | (B) FID=156.31 도메인 갭     | Poisson Blending으로 배경 일치      |
+    | (C) 50:50 비율 문제          | 동적 pruning + ratio 실험 호환      |
+    | (D) MEFE 에지 민감성          | 자연스러운 블렌딩 경계로 완화        |
+
+
+10. 요약
+================================================================================
+
+  본 작업에서 확정한 내용:
+
+    (1) Poisson Blending 합성 파이프라인 전체 설계 완료
+        - 3개 좌표계(원본/ROI/생성) 정의 및 변환 공식
+        - cv2.seamlessClone 기반 합성 흐름 (7단계)
+        - PoissonBlender 클래스 API 설계
+
+    (2) casda_composed가 casda_full을 대체
+        - 512x512 → 1600x256 (원본과 동일 크기)
+        - 합성 배경 → 실제 결함 없는 강판 배경
+        - 파일 복사 → Poisson Blending
+
+    (3) casda_pruning의 동적 대체 방식 확정
+        - 별도 디렉토리 불필요 (단일 casda_composed/)
+        - 학습 시점 동적 계층화 top-k pruning
+        - YAML 설정으로 threshold/top_k/stratified 제어
+
+    (4) 학습 파이프라인 통합 방식 확정
+        - 기존 _add_casda_to_training() 그대로 활용
+        - YAML/코드 소규모 변경 (~85줄 수정)
+        - 하위 호환성 완전 보존
+
+  다음 단계:
+    → P0 코드 구현 시작 (poisson_blender.py, compose_casda_images.py)

@@ -1,6 +1,7 @@
 # ============================================================================
 # CASDA Benchmark Experiment Configuration
 # 3 models x 4 dataset groups = 12 training runs
+# Groups: baseline_raw, baseline_trad, casda_composed, casda_composed_pruning
 # ============================================================================
 
 experiment:
@@ -30,12 +31,12 @@ dataset:
     stratify: true  # stratify by class distribution
     seed: 42
 
-  # CASDA synthetic data paths (v5.1)
+  # CASDA synthetic data paths
+  # v5.4: Poisson Blending composition (512×512 → 1600×256 합성)
   # CLI --casda-dir 로 override 가능 (prepare_benchmark_data.py, run_benchmark.py)
   casda:
-    full_dir: "data/augmented/casda_full"         # ControlNet v5.1: 2,000 synthetic images (4-class)
-    pruning_dir: "data/augmented/casda_pruning"    # top-K by suitability (threshold >= 0.60)
-    suitability_threshold: 0.60
+    composed_dir: "data/augmented/casda_composed"   # Poisson Blending 합성 이미지
+    suitability_threshold: 0.63
     pruning_top_k: 2000
 
 # ----------------------------------------------------------------------------
@@ -63,19 +64,24 @@ dataset_groups:
       brightness_limit: 0.2
       contrast_limit: 0.2
 
-  casda_full:
-    name: "CASDA-Full"
-    description: "Original + all CASDA v5.1 synthetic images (2,000 images, 4-class)"
+  casda_composed:
+    name: "CASDA-Composed"
+    description: "Original + Poisson Blending 합성 CASDA 이미지 (전체)"
     use_original: true
     augmentation: "none"
-    casda_data: "full"
+    casda_data: "composed"
 
-  casda_pruning:
-    name: "CASDA-Pruning"
-    description: "Original + top CASDA images by suitability score (threshold >= 0.60)"
+  casda_composed_pruning:
+    name: "CASDA-Composed-Pruning"
+    description: "Original + Poisson Blending 합성 CASDA 이미지 (품질 pruning, stratified top-k)"
     use_original: true
     augmentation: "none"
-    casda_data: "pruning"
+    casda_data: "composed"
+    casda_pruning:
+      enabled: true
+      suitability_threshold: 0.63
+      top_k: 2000
+      stratified: true
 
 # ----------------------------------------------------------------------------
 # 3 Benchmark Models
@@ -180,20 +186,20 @@ reporting:
   hypothesis_tests:
     - name: "H1"
       description: "CASDA > Traditional augmentation (mAP)"
-      compare: ["casda_full", "baseline_trad"]
+      compare: ["casda_composed", "baseline_trad"]
       metric: "mAP@0.5"
     - name: "H2"
       description: "Pruning > Full (efficiency)"
-      compare: ["casda_pruning", "casda_full"]
+      compare: ["casda_composed_pruning", "casda_composed"]
       metric: "mAP@0.5"
     - name: "H3"
       description: "CASDA effect is architecture-independent"
-      compare: ["casda_pruning", "baseline_raw"]
+      compare: ["casda_composed_pruning", "baseline_raw"]
       metric: "mAP@0.5"
       across_models: true
     - name: "H4"
       description: "CASDA improves minority classes (3, 4)"
-      compare: ["casda_pruning", "baseline_raw"]
+      compare: ["casda_composed_pruning", "baseline_raw"]
       metric: "class_ap"
       focus_classes: [3, 4]
     - name: "H5"

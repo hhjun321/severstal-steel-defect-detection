@@ -1,0 +1,363 @@
+20260304 작업 일지 #2 - seamlessClone 안전성 수정 + casda_full/pruning 제거 + 실행 예제
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+(1) cv2.seamlessClone() 관련 우려사항 점검 및 코드 수정
+(2) benchmark_experiment.yaml에서 casda_full / casda_pruning 제거
+(3) compose_casda_images.py Colab 실행 예제 정리
+
+
+2. casda_full / casda_pruning 설정 제거
+--------------------------------------------------------------------------------
+기존 casda_full과 casda_pruning은 512x512 이미지를 그대로 사용하는
+근본적으로 결함이 있는 파이프라인이므로 연구에서 완전히 제외한다.
+
+  파일: configs/benchmark_experiment.yaml
+
+  변경 내역:
+
+  | 항목              | Before (v5.3)                    | After (v5.4)                      |
+  |-------------------|----------------------------------|-----------------------------------|
+  | casda 경로        | full_dir, pruning_dir            | composed_dir                      |
+  | threshold         | 0.60                             | 0.63 (전체 통일)                  |
+  | dataset_groups    | casda_full, casda_pruning        | casda_composed, casda_composed_pruning |
+  | 가설 검정 참조    | casda_full/casda_pruning         | casda_composed/casda_composed_pruning |
+
+  casda 섹션 변경:
+    Before:
+      casda:
+        full_dir: "data/augmented/casda_full"
+        pruning_dir: "data/augmented/casda_pruning"
+        suitability_threshold: 0.60
+        pruning_top_k: 2000
+
+    After:
+      casda:
+        composed_dir: "data/augmented/casda_composed"
+        suitability_threshold: 0.63
+        pruning_top_k: 2000
+
+  dataset_groups 변경:
+    삭제:
+      casda_full:      casda_data: "full"
+      casda_pruning:   casda_data: "pruning"
+
+    추가:
+      casda_composed:
+        name: "CASDA-Composed"
+        casda_data: "composed"
+
+      casda_composed_pruning:
+        name: "CASDA-Composed-Pruning"
+        casda_data: "composed"
+        casda_pruning:
+          enabled: true
+          suitability_threshold: 0.63
+          top_k: 2000
+          stratified: true
+
+  가설 검정 (H1~H5): casda_full → casda_composed, casda_pruning → casda_composed_pruning
+
+  판단 근거:
+    - 기존 코드(dataset_yolo.py, ultralytics_trainer.py 등)의 "full"/"pruning" 분기
+      로직은 하위호환을 위해 그대로 남겨둠
+    - yaml에서 그룹이 없으므로 해당 경로는 더 이상 실행되지 않음
+    - 최종 실험 그룹: baseline_raw, baseline_trad, casda_composed, casda_composed_pruning
+
+
+3. cv2.seamlessClone() 우려사항 점검
+--------------------------------------------------------------------------------
+
+  대상 파일: src/preprocessing/poisson_blender.py
+
+  3.1 점검 항목 5개
+
+  | # | 우려사항                          | 심각도   | 조치 |
+  |---|-----------------------------------|----------|------|
+  | 1 | dilated mask가 source 가장자리 도달 | CRITICAL | 수정 |
+  | 2 | 다운스케일 후 빈 마스크 → crash     | HIGH     | 수정 |
+  | 3 | source/mask 크기 불일치            | LOW      | 확인: 문제 없음 |
+  | 4 | ROI == target 높이일 때 center 불가 | CRITICAL | 수정 |
+  | 5 | NORMAL_CLONE 색상 번짐 (halo)     | MEDIUM   | 보류 (테스트 후 판단) |
+
+  3.2 상세 분석
+
+  [#1] 마스크 경계가 이미지 가장자리에 닿는 문제 (CRITICAL)
+
+    seamlessClone은 마스크의 비제로 픽셀이 source 이미지 가장자리에 닿으면
+    crash하거나 심한 아티팩트를 만든다. OpenCV 내부적으로 Poisson 방정식을 풀 때
+    경계 조건(Dirichlet boundary)을 마스크 외곽 = 0으로 가정하기 때문이다.
+
+    현재 코드에서 dilate_mask()가 15px 타원 커널로 마스크를 확장하는데,
+    결함이 ROI 256x256의 가장자리 근처에 있다면 dilation 후 마스크가
+    source 이미지 경계까지 확장되어 edge에 닿을 수 있다.
+
+    수정: dilate_mask() 반환 직전에 가장자리 1px을 강제 0 처리.
+
+  [#2] 다운스케일 후 빈 마스크 (HIGH)
+
+    512x512 마스크에서 결함이 존재해도, 512 → 256 INTER_NEAREST 다운스케일 시
+    아주 작은 결함(수 픽셀)이 사라질 수 있다. seamlessClone에 빈 마스크가
+    들어가면 crash한다.
+
+    수정: compose_single()에서 다운스케일 직후 count_nonzero == 0 체크 + 조기 리턴.
+
+  [#3] source와 mask 크기 불일치 (확인: 문제 없음)
+
+    seamlessClone(src, dst, mask, center, flags)에서 src와 mask는 동일 크기 필수.
+    현재 코드에서 image_roi와 mask_roi는 downscale_to_roi()에서 동일 크기로 생성되고,
+    mask_dilated는 dilation으로 in-place 크기 유지되므로 문제 없음.
+
+  [#4] ROI와 target 높이가 같을 때 center 계산 불가 (CRITICAL)
+
+    Severstal 이미지: 높이 256, ROI도 높이 256.
+    seamlessClone은 source 전체 영역(center +/- source_size/2)이 target 경계 안에
+    있어야 한다. source 높이 == target 높이이면 어떤 center 값을 잡아도
+    수직 방향으로 source가 target 밖으로 나간다.
+
+    _adjust_center_for_boundary()에서 half_h + 1 / target_h - half_h - 1 계산 시:
+      half_h = 256 // 2 = 128
+      cy = max(129, min(127, ...)) → min < max → 불가능한 값
+
+    수정: compose_single()에 Step 3.5 추가.
+    source가 target 이상 크기이면 상하좌우 1px씩 crop하여 seamlessClone에 전달.
+    이 crop은 dilate_mask의 edge margin(가장자리 0 처리)과 결합되어
+    결함 영역 자체에는 영향을 주지 않는다.
+
+    256x256 source → 254x254로 crop → target 256x256 안에 center=128로 배치 가능.
+
+  [#5] NORMAL_CLONE 색상 번짐 (보류)
+
+    NORMAL_CLONE은 source gradient를 보존하면서 target 색상에 맞추는데,
+    배경 texture가 매우 다른 경우 결함 주변에 부자연스러운 색상 halo가
+    생길 수 있다. MIXED_CLONE이 이런 경우 더 나을 수 있지만,
+    실제 합성 결과를 확인한 후 판단한다.
+
+    현재 기본값: NORMAL_CLONE (생성자 인자 blend_mode로 전환 가능).
+    CLI에서 --blend-mode MIXED_CLONE으로 대안 실행 가능.
+
+
+4. 코드 수정 내역
+--------------------------------------------------------------------------------
+
+  파일: src/preprocessing/poisson_blender.py
+
+  4.1 [#1 수정] dilate_mask() — 가장자리 1px 강제 0 (L193-198)
+
+    변경 전:
+      dilated = cv2.dilate(mask, kernel, iterations=1)
+      return dilated
+
+    변경 후:
+      dilated = cv2.dilate(mask, kernel, iterations=1)
+
+      # seamlessClone 요구사항: 마스크 비제로 픽셀이 source 가장자리에
+      # 닿으면 crash 또는 심한 아티팩트 발생 (Dirichlet 경계 조건 위반).
+      # 가장자리 1px을 강제로 0으로 설정하여 안전한 경계를 보장한다.
+      dilated[0, :] = 0
+      dilated[-1, :] = 0
+      dilated[:, 0] = 0
+      dilated[:, -1] = 0
+
+      return dilated
+
+  4.2 [#2 수정] compose_single() — 다운스케일 후 빈 마스크 체크 (L554-564)
+
+    Step 2 직후 추가:
+      # 다운스케일 후 마스크 검증: INTER_NEAREST로 축소 시
+      # 아주 작은 결함이 사라질 수 있음. seamlessClone에 빈 마스크가
+      # 들어가면 crash하므로 여기서 조기 리턴.
+      if np.count_nonzero(mask_roi) == 0:
+          return CompositionResult(
+              ..., success=False,
+              message="다운스케일 후 마스크에 결함 픽셀 없음 (결함이 너무 작음)"
+          )
+
+  4.3 [#4 수정] compose_single() — Step 3.5 source crop (L569-588)
+
+    Step 3 (마스크 확장) 직후, Step 4 (center 계산) 직전에 추가:
+
+      # Step 3.5: seamlessClone 크기 제약 처리
+      # Severstal에서 ROI 높이(256) == target 높이(256)이면
+      # 수직 방향 배치가 불가능하므로, source를 상하좌우 1px씩 crop한다.
+      blend_src = image_roi
+      blend_mask = mask_dilated
+      src_h, src_w = blend_mask.shape[:2]
+
+      needs_crop = (src_h >= target_h) or (src_w >= target_w)
+      if needs_crop:
+          crop_y = 1 if src_h >= target_h else 0
+          crop_x = 1 if src_w >= target_w else 0
+          blend_src = blend_src[crop_y:src_h - crop_y, crop_x:src_w - crop_x]
+          blend_mask = blend_mask[crop_y:src_h - crop_y, crop_x:src_w - crop_x]
+
+    Step 5, 6에서 mask_dilated → blend_mask, image_roi → blend_src로 변경.
+    Step 7에서는 원본 mask_roi를 사용 (crop이 라벨에 영향 주지 않음).
+
+  수정 영향 정리:
+    | 수정 | 영역 | 영향 범위 |
+    |------|------|-----------|
+    | #1 edge margin | dilate_mask() | 확장된 마스크만 (블렌딩 보조) |
+    | #2 빈 마스크 | compose_single() | 조기 리턴 (안전 가드) |
+    | #4 source crop | compose_single() | 블렌딩 입력만 (라벨/bbox 무관) |
+
+
+5. compose_casda_images.py Colab 실행 예제
+--------------------------------------------------------------------------------
+
+  5.1 입력 파일 위치 현황 (Colab Google Drive 기준)
+
+  | 입력             | Colab 경로                                                        | 상태 |
+  |------------------|-------------------------------------------------------------------|------|
+  | generated-dir    | ${DRIVE}/test_results_v5.1/phase1_basic/generated                 | 2,000장 (512x512 PNG) |
+  | hint-dir         | ${DRIVE}/controlnet_dataset_v5.1/hints                            | 2,000장 (hint PNG) |
+  | metadata-csv     | ${DRIVE}/controlnet_dataset_v5.1/packaged_roi_metadata.csv        | 2,000행 (23컬럼) |
+  | summary-json     | ${DRIVE}/test_results_v5.1/phase1_basic/generation_summary.json   | 822KB |
+  | clean-images-dir | ${DRIVE}/train_images                                             | 12,568장 (1600x256) |
+  | train-csv        | ${DRIVE}/train.csv                                                | 7,095행 |
+  | quality-json     | (미생성)                                                          | 선택 사항 |
+  | output-dir       | ${DRIVE}/data/augmented/casda_composed                            | 출력 |
+
+  DRIVE = /content/drive/MyDrive/data/Severstal
+
+  참고: 로컬(Windows)에는 generated images, hints, train_images가 없음.
+  합성 작업은 반드시 Colab에서 실행해야 한다.
+
+  5.2 기본 실행 (NORMAL_CLONE)
+
+    DRIVE="/content/drive/MyDrive/data/Severstal"
+    PROJ="/content/severstal-steel-defect-detection"
+
+    python ${PROJ}/scripts/compose_casda_images.py \
+      --generated-dir    ${DRIVE}/test_results_v5.1/phase1_basic/generated \
+      --hint-dir         ${DRIVE}/controlnet_dataset_v5.1/hints \
+      --metadata-csv     ${DRIVE}/controlnet_dataset_v5.1/packaged_roi_metadata.csv \
+      --summary-json     ${DRIVE}/test_results_v5.1/phase1_basic/generation_summary.json \
+      --clean-images-dir ${DRIVE}/train_images \
+      --train-csv        ${DRIVE}/train.csv \
+      --output-dir       ${DRIVE}/data/augmented/casda_composed
+
+  5.3 MIXED_CLONE 모드 (색상 번짐 우려 시 대안)
+
+    python ${PROJ}/scripts/compose_casda_images.py \
+      --generated-dir    ${DRIVE}/test_results_v5.1/phase1_basic/generated \
+      --hint-dir         ${DRIVE}/controlnet_dataset_v5.1/hints \
+      --metadata-csv     ${DRIVE}/controlnet_dataset_v5.1/packaged_roi_metadata.csv \
+      --summary-json     ${DRIVE}/test_results_v5.1/phase1_basic/generation_summary.json \
+      --clean-images-dir ${DRIVE}/train_images \
+      --train-csv        ${DRIVE}/train.csv \
+      --output-dir       ${DRIVE}/data/augmented/casda_composed_mixed \
+      --blend-mode MIXED_CLONE
+
+  5.4 품질 점수 포함 (있을 경우)
+
+    python ${PROJ}/scripts/compose_casda_images.py \
+      --generated-dir    ${DRIVE}/test_results_v5.1/phase1_basic/generated \
+      --hint-dir         ${DRIVE}/controlnet_dataset_v5.1/hints \
+      --metadata-csv     ${DRIVE}/controlnet_dataset_v5.1/packaged_roi_metadata.csv \
+      --summary-json     ${DRIVE}/test_results_v5.1/phase1_basic/generation_summary.json \
+      --quality-json     ${DRIVE}/test_results_v5.1/phase1_basic/quality_scores.json \
+      --clean-images-dir ${DRIVE}/train_images \
+      --train-csv        ${DRIVE}/train.csv \
+      --output-dir       ${DRIVE}/data/augmented/casda_composed
+
+  5.5 출력 구조
+
+    casda_composed/
+    +-- images/                    # 1600x256 합성 이미지 (.png)
+    |   +-- adc257b59.jpg_class1_region4_gen0.png
+    |   +-- 268f0fa63.jpg_class1_region0_gen0.png
+    |   +-- ...
+    +-- masks/                     # 1600x256 전체 크기 이진 마스크 (.png)
+    |   +-- adc257b59.jpg_class1_region4_gen0_mask.png
+    |   +-- ...
+    +-- metadata.json              # YOLO bbox + suitability_score
+    +-- composition_report.json    # 합성 통계 리포트
+
+  5.6 metadata.json 엔트리 예시
+
+    {
+      "image_path": "images/adc257b59.jpg_class1_region4_gen0.png",
+      "class_id": 0,
+      "suitability_score": 0.723456,
+      "mask_path": "masks/adc257b59.jpg_class1_region4_gen0_mask.png",
+      "bboxes": [[0.234375, 0.5, 0.046875, 0.15625]],
+      "labels": [0],
+      "bbox_format": "yolo",
+      "image_width": 1600,
+      "image_height": 256,
+      "source_generated": "adc257b59.jpg_class1_region4_gen0.png",
+      "source_background": "a1b2c3d4e.jpg",
+      "blend_method": "poisson_normal_clone",
+      "roi_bbox": [320, 0, 576, 256]
+    }
+
+  5.7 CLI 전체 옵션
+
+    | 옵션                   | 필수 | 기본값       | 설명                              |
+    |------------------------|------|--------------|-----------------------------------|
+    | --generated-dir        | Y    | -            | 생성 이미지 디렉토리 (512x512)    |
+    | --hint-dir             | Y    | -            | 힌트 이미지 디렉토리              |
+    | --metadata-csv         | Y    | -            | packaged_roi_metadata.csv         |
+    | --summary-json         | Y    | -            | generation_summary.json           |
+    | --clean-images-dir     | Y    | -            | 원본 이미지 디렉토리 (1600x256)   |
+    | --train-csv            | Y    | -            | train.csv (결함 이미지 식별용)    |
+    | --output-dir           | Y    | -            | 출력 디렉토리                     |
+    | --quality-json         | N    | None         | 품질 점수 JSON                    |
+    | --dilation-px          | N    | 15           | 마스크 확장 픽셀 수               |
+    | --blend-mode           | N    | NORMAL_CLONE | NORMAL_CLONE 또는 MIXED_CLONE     |
+    | --mask-threshold       | N    | 127          | 힌트 Red 채널 이진화 임계값       |
+    | --seed                 | N    | 42           | 랜덤 시드                         |
+    | --max-backgrounds      | N    | 5000         | 배경 유형 분석 최대 이미지 수     |
+    | --default-quality-score| N    | 0.5          | 품질 점수 없을 때 기본값          |
+
+  5.8 실행 참고사항
+
+    - GPU 불필요: Poisson Blending은 순수 CPU 작업
+    - 예상 소요 시간: 2,000장 x (이미지 로드 + Poisson 풀기) = 10~30분 (Drive I/O 의존)
+    - metadata-csv가 Colab Drive에 없으면 로컬에서 업로드 필요
+      (로컬 경로: outputs/v5.1/controlnet_dataset_v5.1/packaged_roi_metadata.csv, 2,000행)
+    - quality_scores.json은 아직 미생성 상태 — 생략 시 기본값 0.5로 대체
+
+
+6. 파일 생성 이름 규칙 참조
+--------------------------------------------------------------------------------
+
+  test_controlnet.py의 생성 파일명 규칙 (L463-467):
+
+    배치 모드 (JSONL 입력):
+      {sample_name}_gen{j}.png
+      예: adc257b59.jpg_class1_region4_gen0.png
+
+    sample_name 구성:
+      힌트 파일명에서 _hint 제거
+      예: adc257b59.jpg_class1_region4_hint.png → adc257b59.jpg_class1_region4
+
+  compose_casda_images.py의 filename_to_sample_name():
+    {filename}에서 _gen{N}.png 제거 → sample_name
+    예: adc257b59.jpg_class1_region4_gen0.png → adc257b59.jpg_class1_region4
+
+  이 sample_name으로 packaged_roi_metadata.csv와 조인:
+    sample_name = f"{image_id}_class{class_id}_region{region_id}"
+
+
+7. 현재 진행 상태 정리
+--------------------------------------------------------------------------------
+
+  완료:
+    [v] poisson_blender.py 작성 (680줄 → 722줄, seamlessClone 수정 반영)
+    [v] compose_casda_images.py 작성 (875줄)
+    [v] benchmark_experiment.yaml에서 casda_full/pruning 제거, casda_composed 추가
+    [v] seamlessClone 우려사항 3건 수정 (#1, #2, #4)
+
+  남은 P1 통합 작업:
+    [ ] dataset_yolo.py — _stratified_top_k() 함수 추가 + pruning 수정
+    [ ] ultralytics_trainer.py — "composed" 분기 추가
+    [ ] dataset.py — "composed" 분기 추가
+    [ ] run_benchmark.py — CASDA_GROUPS에 casda_composed 추가
+
+  P2 검증:
+    [ ] Colab에서 compose_casda_images.py 소규모 테스트 (5~10장)
+    [ ] 합성 이미지 시각적 품질 확인
+    [ ] NORMAL_CLONE vs MIXED_CLONE 비교

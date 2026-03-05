@@ -9,6 +9,7 @@ Creates:
 
 Output format matches standard ControlNet training requirements.
 """
+import ast
 import json
 import pandas as pd
 import cv2
@@ -45,7 +46,9 @@ class ControlNetDatasetPackager:
                      edge_margin_x: float = 0.1,
                      edge_margin_y: float = 0.05,
                      rare_class_margin: float = 0.02,
-                     rare_class_threshold: int = 50) -> pd.DataFrame:
+                     rare_class_threshold: int = 50,
+                     class_margin_overrides: Optional[Dict[int, Dict[str, float]]] = None,
+                     ) -> pd.DataFrame:
         """
         ROI 경계에 너무 가까운 결함을 가진 샘플을 제외합니다.
 
@@ -65,12 +68,22 @@ class ControlNetDatasetPackager:
           클래스는 마진을 rare_class_margin(2%)으로 더 완화하여
           학습 데이터 최소 확보를 보장 (v5에서 Class 2가 10개로 감소한 문제).
 
+        B2 개선사항 (v5.4):
+        - class_margin_overrides: 클래스별 마진 개별 지정.
+          Class 4 결함은 Severstal 이미지 전체 높이(256px)를 차지하는 것이
+          형태학적으로 정상이므로, Y-margin을 0으로 설정하여 불필요한 제외를 방지.
+          예: {4: {'x': 0.05, 'y': 0.0}}
+
         Args:
             df: ROI metadata DataFrame (roi_bbox, defect_bbox 컬럼 필요)
             edge_margin_x: 좌우 마진 비율 (기본 0.1 = 10%, ROI 너비 기준)
             edge_margin_y: 상하 마진 비율 (기본 0.05 = 5%, ROI 높이 기준)
             rare_class_margin: 희소 클래스에 적용할 완화 마진 (기본 0.02 = 2%)
             rare_class_threshold: 이 수 이하인 클래스를 희소로 간주 (기본 50)
+            class_margin_overrides: 클래스별 마진 오버라이드 dict.
+                키: class_id (1-based, train.csv ClassId와 동일)
+                값: {'x': float, 'y': float} (미지정 키는 기본 마진 사용)
+                예: {4: {'x': 0.05, 'y': 0.0}}  → Class 4는 Y 마진 없음
 
         Returns:
             edge-flagged 샘플이 제거된 DataFrame
@@ -91,6 +104,10 @@ class ControlNetDatasetPackager:
                       f"{dict(class_counts[class_counts <= rare_class_threshold])} "
                       f"-> edge margin relaxed to {rare_class_margin}")
 
+        # B2: 클래스별 마진 오버라이드 로그
+        if class_margin_overrides:
+            print(f"  Class margin overrides: {class_margin_overrides}")
+
         original_len = len(df)
         exclude_indices = []
         skipped_identical = 0
@@ -99,11 +116,11 @@ class ControlNetDatasetPackager:
             roi_bbox = row['roi_bbox']
             defect_bbox = row['defect_bbox']
 
-            # Convert string tuples if needed
+            # Convert string tuples if needed (안전한 리터럴 파싱)
             if isinstance(roi_bbox, str):
-                roi_bbox = eval(roi_bbox)
+                roi_bbox = ast.literal_eval(roi_bbox)
             if isinstance(defect_bbox, str):
-                defect_bbox = eval(defect_bbox)
+                defect_bbox = ast.literal_eval(defect_bbox)
 
             # roi_bbox == defect_bbox이면 ROI 최적화 실패로 결함 bbox를
             # 그대로 사용한 것이므로 edge 검사가 무의미 (margin 항상 0).
@@ -123,9 +140,14 @@ class ControlNetDatasetPackager:
                 exclude_indices.append(idx)
                 continue
 
-            # 희소 클래스이면 마진 완화 적용
+            # 마진 결정 우선순위: class_margin_overrides > rare_classes > 기본값
             class_id = row.get('class_id', None)
-            if class_id in rare_classes:
+            if class_margin_overrides and class_id in class_margin_overrides:
+                # B2: 클래스별 개별 마진 (예: Class 4 → y=0.0)
+                overrides = class_margin_overrides[class_id]
+                mx = overrides.get('x', edge_margin_x)
+                my = overrides.get('y', edge_margin_y)
+            elif class_id in rare_classes:
                 mx = rare_class_margin
                 my = rare_class_margin
             else:
@@ -154,7 +176,8 @@ class ControlNetDatasetPackager:
         print(f"Edge filter: {original_len} -> {len(df)} "
               f"({removed} removed, {removed/max(original_len,1)*100:.1f}%)")
         print(f"  Margins: x={edge_margin_x}, y={edge_margin_y}, "
-              f"rare={rare_class_margin}")
+              f"rare={rare_class_margin}"
+              f"{' (+ class overrides active)' if class_margin_overrides else ''}")
         if skipped_identical > 0:
             print(f"  ({skipped_identical} samples with roi_bbox==defect_bbox, "
                   f"edge check skipped)")
@@ -514,9 +537,9 @@ class ControlNetDatasetPackager:
             jsonl_lines.append(entry)
         
         # Write JSONL file
-        with open(output_path, 'w') as f:
+        with open(output_path, 'w', encoding='utf-8') as f:
             for entry in jsonl_lines:
-                f.write(json.dumps(entry) + '\n')
+                f.write(json.dumps(entry, ensure_ascii=False) + '\n')
         
         print(f"Created train.jsonl with {len(jsonl_lines)} entries at: {output_path}")
     
@@ -542,8 +565,8 @@ class ControlNetDatasetPackager:
             'samples': roi_metadata
         }
         
-        with open(output_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=2, ensure_ascii=False)
         
         print(f"Created metadata.json at: {output_path}")
     
@@ -558,7 +581,11 @@ class ControlNetDatasetPackager:
                        min_stability: float = 0.3,
                        min_matching: float = 0.5,
                        per_class_cap: Optional[int] = None,
-                       rare_class_threshold_count: int = 200) -> Path:
+                       rare_class_threshold_count: int = 200,
+                       class_margin_overrides: Optional[Dict[int, Dict[str, float]]] = None,
+                       edge_margin_x: float = 0.1,
+                       edge_margin_y: float = 0.05,
+                       ) -> Path:
         """
         Package complete dataset for ControlNet training.
         
@@ -579,6 +606,14 @@ class ControlNetDatasetPackager:
                 지정 시 희소 클래스는 전수 포함, 풍부한 클래스는 cap까지만 선택.
             rare_class_threshold_count: 이 수 이하인 클래스를 희소로 간주 (기본 200).
                 per_class_cap 모드에서만 사용.
+            class_margin_overrides: B2 클래스별 엣지 마진 오버라이드.
+                키: class_id (1-based), 값: {'x': float, 'y': float}.
+                예: {4: {'x': 0.05, 'y': 0.0}} → Class 4는 Y 마진 없음.
+                기본 None이면 기존 동작 유지.
+            edge_margin_x: 좌우 엣지 마진 비율 (기본 0.1 = 10%).
+                _edge_filter의 기본 마진을 외부에서 조정 가능.
+            edge_margin_y: 상하 엣지 마진 비율 (기본 0.05 = 5%).
+                _edge_filter의 기본 마진을 외부에서 조정 가능.
             
         Returns:
             Path to output directory
@@ -594,11 +629,13 @@ class ControlNetDatasetPackager:
         print(f"Quality filter: {quality_filter}")
         print("="*80)
         
-        # Load train.csv for mask decoding
-        train_df = pd.read_csv(train_csv)
-        
         # Edge proximity 필터 적용 (결함이 ROI 경계에 너무 가까운 샘플 제외)
-        roi_metadata_df = self._edge_filter(roi_metadata_df)
+        roi_metadata_df = self._edge_filter(
+            roi_metadata_df,
+            edge_margin_x=edge_margin_x,
+            edge_margin_y=edge_margin_y,
+            class_margin_overrides=class_margin_overrides,
+        )
 
         # 품질 필터 적용
         if quality_filter:
@@ -608,6 +645,15 @@ class ControlNetDatasetPackager:
                 min_stability=min_stability,
                 min_matching=min_matching,
             )
+        
+        # 필터 후 빈 DataFrame 방어
+        if len(roi_metadata_df) == 0:
+            print("\nWARNING: 모든 ROI가 필터링되었습니다. 패키징할 샘플이 없습니다.")
+            print("  - edge_margin_x/y 값을 낮추거나")
+            print("  - quality_filter=False로 설정하거나")
+            print("  - class_margin_overrides로 특정 클래스 마진을 완화해 보세요.")
+            # 빈 출력 디렉토리라도 반환하여 파이프라인 중단 방지
+            return output_dir
         
         # Limit samples: class-aware capping (v5.2) 또는 균등 분배 (v3~v5.1)
         if per_class_cap is not None:
@@ -644,6 +690,9 @@ class ControlNetDatasetPackager:
                 continue
             
             roi_image = cv2.imread(str(roi_image_path))
+            if roi_image is None:
+                print(f"Warning: Failed to read image (corrupt?): {roi_image_path}")
+                continue
             roi_image_rgb = cv2.cvtColor(roi_image, cv2.COLOR_BGR2RGB)
             
             # Load ROI mask
@@ -653,6 +702,9 @@ class ControlNetDatasetPackager:
                 continue
             
             roi_mask = cv2.imread(str(roi_mask_path), cv2.IMREAD_GRAYSCALE)
+            if roi_mask is None:
+                print(f"Warning: Failed to read mask (corrupt?): {roi_mask_path}")
+                continue
             roi_mask = (roi_mask > 0).astype(np.uint8)
             
             # Package this ROI
@@ -712,7 +764,7 @@ class ControlNetDatasetPackager:
         }
         
         summary_path = output_dir / 'packaging_summary.txt'
-        with open(summary_path, 'w') as f:
+        with open(summary_path, 'w', encoding='utf-8') as f:
             f.write("ControlNet Dataset Packaging Summary\n")
             f.write("="*80 + "\n\n")
             for key, value in summary.items():

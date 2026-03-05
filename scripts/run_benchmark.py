@@ -44,6 +44,8 @@ import random
 import shutil
 import time
 import json
+import traceback
+import threading
 import yaml
 import torch
 import numpy as np
@@ -299,6 +301,9 @@ def inject_casda_to_baseline(
 def clean_casda_from_baseline(
     baseline_dir: str,
     prefix: str = CASDA_PREFIX,
+    expected_count: int = 0,
+    max_retries: int = 3,
+    retry_delay: float = 5.0,
 ) -> int:
     """
     baseline_raw YOLO 데이터셋에서 CASDA prefix 파일을 모두 삭제한다.
@@ -306,27 +311,280 @@ def clean_casda_from_baseline(
     images/train/casda_* 와 labels/train/casda_* 를 삭제.
     baseline 원본 파일은 prefix가 다르므로 절대 삭제되지 않음.
 
+    A7 강화: 디렉토리 접근 불가 시 경고 + Drive 헬스체크 + 재시도.
+    expected_count > 0 인데 삭제 수가 0이면 마운트 이상으로 판단하고 재시도.
+
     Args:
         baseline_dir: baseline_raw YOLO 데이터셋 경로
         prefix: 삭제할 파일 접두사
+        expected_count: 기대 삭제 파일 수 (이미지+라벨 합계). 0이면 검증 생략.
+        max_retries: 마운트 이상 시 재시도 횟수
+        retry_delay: 재시도 간 대기 시간(초)
 
     Returns:
         삭제된 파일 수 (이미지 + 라벨 합계)
     """
     baseline_path = Path(baseline_dir)
-    removed = 0
 
-    for subdir in ["images/train", "labels/train"]:
-        target_dir = baseline_path / subdir
-        if not target_dir.exists():
-            continue
-        for f in target_dir.iterdir():
-            if f.name.startswith(prefix):
-                f.unlink(missing_ok=True)
-                removed += 1
+    removed = 0
+    for attempt in range(1, max_retries + 1):
+        removed = 0
+        dirs_missing = []
+
+        for subdir in ["images/train", "labels/train"]:
+            target_dir = baseline_path / subdir
+            if not target_dir.exists():
+                dirs_missing.append(str(target_dir))
+                continue
+            for f in target_dir.iterdir():
+                if f.name.startswith(prefix):
+                    try:
+                        f.unlink(missing_ok=True)
+                        removed += 1
+                    except (PermissionError, OSError) as e:
+                        logging.warning(f"[Clean] 파일 삭제 실패: {f.name}: {e}")
+
+        # 디렉토리 자체가 없는 경우 — Drive 마운트 문제 가능성
+        if dirs_missing:
+            logging.warning(
+                f"[Clean] 디렉토리 접근 불가 (시도 {attempt}/{max_retries}): "
+                f"{dirs_missing}"
+            )
+            if attempt < max_retries:
+                # Drive 헬스체크 후 재시도
+                healthy = _check_drive_health(str(baseline_path))
+                if not healthy:
+                    logging.warning(
+                        f"[Clean] Drive 마운트 비정상 — {retry_delay}초 후 재시도"
+                    )
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    # Drive는 정상이지만 디렉토리가 실제로 없음 → 재시도 무의미
+                    logging.warning(
+                        "[Clean] Drive 정상이나 디렉토리 부재 — 실제로 존재하지 않는 경로"
+                    )
+                    break
+            else:
+                logging.error(
+                    f"[Clean] {max_retries}회 시도 후에도 디렉토리 접근 불가"
+                )
+                break
+
+        # 삭제 수와 기대값 비교
+        if expected_count > 0 and removed == 0 and not dirs_missing:
+            # 기대값이 있는데 삭제 0 → 마운트가 stale하여 iterdir()이 빈 결과일 가능성
+            if attempt < max_retries:
+                healthy = _check_drive_health(str(baseline_path))
+                if not healthy:
+                    logging.warning(
+                        f"[Clean] 기대 삭제 수={expected_count}이나 실제 삭제=0, "
+                        f"Drive 비정상 — {retry_delay}초 후 재시도 "
+                        f"(시도 {attempt}/{max_retries})"
+                    )
+                    time.sleep(retry_delay)
+                    continue
+            # Drive 정상이거나 재시도 소진 → 실제로 파일이 없는 것으로 판단
+            logging.warning(
+                f"[Clean] 기대 삭제 수={expected_count}이나 실제 삭제=0 "
+                f"— CASDA 파일이 이미 없거나 prefix 불일치"
+            )
+        elif expected_count > 0 and abs(removed - expected_count) > expected_count * 0.1:
+            logging.warning(
+                f"[Clean] 삭제 수 불일치: 기대={expected_count}, 실제={removed} "
+                f"(차이 {abs(removed - expected_count)})"
+            )
+
+        # 성공적으로 완료
+        break
 
     logging.info(f"  Cleaned {removed} CASDA files from {baseline_path}")
     return removed
+
+
+# ============================================================================
+# Drive Mount Health Check & Inject Validation  (A6 / A8)
+# ============================================================================
+
+def _check_drive_health(base_path: str, timeout: float = 10.0) -> bool:
+    """
+    Google Drive FUSE 마운트가 정상인지 확인한다.
+
+    base_path 에 임시 파일을 write → read → delete 하여 마운트 활성 여부를 판단.
+    Colab 환경이 아닌 경우 (/content/drive 가 아닌 경로) 에는 항상 True 를 반환.
+
+    timeout 초 내에 I/O가 완료되지 않으면 마운트 비정상으로 간주 (FUSE hung 방어).
+
+    Args:
+        base_path: 확인할 디렉토리 경로 (예: yolo_dir)
+        timeout:   write/read 를 기다리는 최대 초 (기본 10초)
+
+    Returns:
+        True 이면 마운트 정상, False 이면 비정상
+    """
+    bp = Path(base_path)
+
+    # 로컬 환경 (Drive 마운트가 아닌 경우) 은 항상 통과
+    if not str(bp).startswith("/content/drive"):
+        return True
+
+    # 부모 디렉토리 존재 여부 먼저 확인
+    if not bp.exists():
+        logging.warning(f"[DriveHealth] 경로 자체가 존재하지 않음: {bp}")
+        return False
+
+    health_file = bp / f".drive_health_{int(time.time())}"
+    token = f"health_check_{time.time()}"
+    result = [False]  # threading 에서 결과 반환용
+
+    def _io_check():
+        try:
+            health_file.write_text(token, encoding="utf-8")
+            readback = health_file.read_text(encoding="utf-8")
+            if readback != token:
+                logging.warning(
+                    f"[DriveHealth] read-back 불일치: wrote={token!r}, read={readback!r}"
+                )
+                return
+            result[0] = True
+        except OSError as e:
+            logging.warning(f"[DriveHealth] I/O 오류 — 마운트 비정상 가능: {e}")
+        finally:
+            try:
+                health_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    t = threading.Thread(target=_io_check, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+
+    if t.is_alive():
+        logging.warning(
+            f"[DriveHealth] I/O 작업이 {timeout}초 내에 완료되지 않음 — FUSE 마운트 hung 가능"
+        )
+        return False
+
+    return result[0]
+
+
+def _wait_for_drive(base_path: str, max_retries: int = 6, delay: float = 10.0) -> bool:
+    """
+    Drive 마운트가 복구될 때까지 대기한다.
+
+    Args:
+        base_path: 확인할 디렉토리 경로
+        max_retries: 최대 재시도 횟수 (기본 6 → 최대 60초 대기)
+        delay: 재시도 간 대기 시간(초)
+
+    Returns:
+        True 이면 복구됨, False 이면 max_retries 소진
+    """
+    for attempt in range(1, max_retries + 1):
+        if _check_drive_health(base_path):
+            if attempt > 1:
+                logging.info(f"[DriveHealth] 마운트 복구 확인 (시도 {attempt}/{max_retries})")
+            return True
+        logging.warning(
+            f"[DriveHealth] 마운트 비정상 — {delay}초 후 재시도 ({attempt}/{max_retries})"
+        )
+        time.sleep(delay)
+    logging.error(f"[DriveHealth] {max_retries}회 재시도 후에도 마운트 복구 실패")
+    return False
+
+
+def _validate_injected_files(
+    baseline_dir: str,
+    inject_count: int,
+    prefix: str = CASDA_PREFIX,
+    sample_size: int = 100,
+) -> tuple:
+    """
+    CASDA 주입 후 심링크/파일이 실제로 접근 가능한지 검증한다.
+
+    1) images/train 과 labels/train 모두에서 prefix 파일 수를 inject_count 와 대조
+    2) sample_size 만큼 랜덤 샘플링하여 접근 가능 여부 확인
+    3) 깨진 심링크 발견 시 경고 로그 + 추정 전체 깨진 수 반환
+
+    Args:
+        baseline_dir: baseline_raw YOLO 데이터셋 경로
+        inject_count: inject_casda_to_baseline() 이 반환한 주입 이미지 수
+        prefix: CASDA 파일 접두사
+        sample_size: 검증할 랜덤 샘플 수
+
+    Returns:
+        (total_found, estimated_broken)
+        total_found: images/train 에서 prefix 매칭 파일 수
+        estimated_broken: 전체 추정 깨진 파일 수 (샘플 비율 기반 추정)
+    """
+    baseline_path = Path(baseline_dir)
+
+    # images/train 검증
+    images_dir = baseline_path / "images" / "train"
+    if not images_dir.exists():
+        logging.error(f"[Validate] images/train 디렉토리 없음: {images_dir}")
+        return (0, 0)
+
+    casda_files = [f for f in images_dir.iterdir() if f.name.startswith(prefix)]
+    total_found = len(casda_files)
+
+    if total_found != inject_count:
+        logging.warning(
+            f"[Validate] CASDA 이미지 수 불일치: 주입={inject_count}, 발견={total_found}"
+        )
+
+    # labels/train 검증
+    labels_dir = baseline_path / "labels" / "train"
+    if labels_dir.exists():
+        casda_labels = [f for f in labels_dir.iterdir() if f.name.startswith(prefix)]
+        label_count = len(casda_labels)
+        if label_count != inject_count:
+            logging.warning(
+                f"[Validate] CASDA 라벨 수 불일치: 주입={inject_count}, 발견={label_count}"
+            )
+    else:
+        logging.warning(f"[Validate] labels/train 디렉토리 없음: {labels_dir}")
+
+    if total_found == 0:
+        return (0, 0)
+
+    # 랜덤 샘플링으로 접근 가능 여부 확인
+    rng = random.Random(42)
+    sample = rng.sample(casda_files, min(sample_size, total_found))
+
+    broken = 0
+    broken_files = []
+    for f in sample:
+        # 심링크인 경우: 타겟 존재 여부 확인
+        if f.is_symlink():
+            target = f.resolve()
+            if not target.exists():
+                broken += 1
+                broken_files.append(f.name)
+        else:
+            # 일반 파일: 읽기 가능 여부 확인 (os.access로 실제 읽기 테스트)
+            if not os.access(str(f), os.R_OK):
+                broken += 1
+                broken_files.append(f.name)
+
+    # 깨진 비율을 전체로 추정
+    estimated_broken = int(broken / len(sample) * total_found) if broken > 0 else 0
+
+    if broken > 0:
+        logging.warning(
+            f"[Validate] 샘플 {len(sample)}개 중 {broken}개 접근 불가: "
+            f"{broken_files[:5]}{'...' if broken > 5 else ''}"
+        )
+        logging.warning(
+            f"[Validate] 전체 추정 깨진 파일: ~{estimated_broken}/{total_found}"
+        )
+    else:
+        logging.info(
+            f"[Validate] CASDA 검증 통과: {total_found}개 이미지 발견, "
+            f"샘플 {len(sample)}개 모두 정상"
+        )
+
+    return (total_found, estimated_broken)
 
 
 # ============================================================================
@@ -547,13 +805,15 @@ def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda')
     # ── CASDA 합성 이미지 수집 ──
     raw_casda_dir = casda_config.get('full_dir', 'data/augmented/casda_full')
     casda_full_dir = Path(raw_casda_dir) if os.path.isabs(raw_casda_dir) else PROJECT_ROOT / raw_casda_dir
-    casda_images = []
+    casda_images_set: set = set()
     if casda_full_dir.exists():
         for subdir in [casda_full_dir, casda_full_dir / "images"]:
             if subdir.exists():
-                casda_images.extend(sorted(subdir.glob("*.png")))
-                casda_images.extend(sorted(subdir.glob("*.jpg")))
-    casda_images = [str(p) for p in casda_images]
+                for p in subdir.glob("*.png"):
+                    casda_images_set.add(str(p.resolve()))
+                for p in subdir.glob("*.jpg"):
+                    casda_images_set.add(str(p.resolve()))
+    casda_images = sorted(casda_images_set)
 
     results = {}
     if casda_images:
@@ -588,7 +848,7 @@ def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda')
             casda_metadata_path = casda_full_dir / "metadata.json"
             if casda_metadata_path.exists():
                 logging.info("Computing per-class FID using metadata.json...")
-                with open(casda_metadata_path, 'r') as f:
+                with open(casda_metadata_path, 'r', encoding='utf-8') as f:
                     casda_metadata = json.load(f)
 
                 # CASDA 이미지를 class_id별로 그룹핑
@@ -602,22 +862,79 @@ def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda')
                     if os.path.exists(img_abs):
                         gen_by_class.setdefault(cls_id, []).append(img_abs)
 
-                # 실제 이미지는 전체 세트 사용 (결함 클래스 구분 불가 → 동일 세트 재사용)
-                # 참고: 실제 이미지에는 클래스 라벨이 파일명에 없으므로
-                #       모든 클래스에 동일한 real 이미지 세트를 사용
-                real_by_class: dict = {}
-                for cls_id in gen_by_class.keys():
-                    # real 이미지는 max_images 개로 샘플링
-                    real_by_class[cls_id] = real_sampled
-
-                per_class_results = fid_calc.compute_fid_per_class(
-                    real_by_class,
-                    gen_by_class,
-                    batch_size=batch_size,
+                # B1: 실제 이미지를 클래스별로 분류 (train.csv 기반)
+                # 기존 문제: 혼합 클래스 real 이미지를 모든 클래스에 동일하게 사용
+                #   → FID가 "같은 분포 vs 같은 분포" 비교가 아니라
+                #     "혼합 분포 vs 단일 클래스 분포" 비교가 되어 인위적으로 부풀려짐
+                # 수정: train.csv에서 클래스별 이미지 ID를 추출하여 real_by_class 구성
+                annotation_csv = ds_config.get('annotation_csv', 'train.csv')
+                annotation_path = (
+                    Path(annotation_csv) if os.path.isabs(annotation_csv)
+                    else PROJECT_ROOT / annotation_csv
                 )
-                results.update(per_class_results)
-                for key, val in sorted(per_class_results.items()):
-                    logging.info(f"  {key}: {val:.2f}")
+
+                # 재현성: per-class 샘플링은 별도 RNG 사용 (overall 샘플링과 독립)
+                per_class_rng = random.Random(fid_seed + 1)
+
+                real_by_class: dict = {}
+                if annotation_path.exists():
+                    ann_df = pd.read_csv(annotation_path)
+                    # train.csv: ImageId, ClassId, EncodedPixels
+                    # ClassId는 1-based (1~4), 내부적으로 0-based 사용
+                    for cls_id in gen_by_class.keys():
+                        cls_label = cls_id + 1  # 0-based → 1-based
+                        # 해당 클래스의 결함이 있는 이미지 ID 추출
+                        cls_rows = ann_df[
+                            (ann_df['ClassId'] == cls_label) &
+                            (ann_df['EncodedPixels'].notna())
+                        ]
+                        cls_image_ids = cls_rows['ImageId'].unique().tolist()
+                        cls_real_paths = [
+                            str(image_dir / img_id) for img_id in cls_image_ids
+                            if (image_dir / img_id).exists()
+                        ]
+                        # 클래스별 real 이미지도 max_images로 샘플링
+                        if len(cls_real_paths) > max_images:
+                            cls_real_paths = per_class_rng.sample(cls_real_paths, max_images)
+                        real_by_class[cls_id] = cls_real_paths
+                        logging.info(
+                            f"  Class {cls_label}: {len(cls_real_paths)} real, "
+                            f"{len(gen_by_class.get(cls_id, []))} synthetic"
+                        )
+                else:
+                    # train.csv가 없으면 기존 방식 (혼합 세트) 으로 fallback
+                    logging.warning(
+                        f"annotation_csv not found: {annotation_path} "
+                        f"— per-class FID will use mixed real images (less accurate)"
+                    )
+                    for cls_id in gen_by_class.keys():
+                        real_by_class[cls_id] = real_sampled
+
+                # 빈 클래스 제거 (real 또는 synthetic 이미지가 없는 클래스)
+                empty_classes = [
+                    cls_id for cls_id in gen_by_class
+                    if not real_by_class.get(cls_id) or not gen_by_class[cls_id]
+                ]
+                for cls_id in empty_classes:
+                    cls_label = cls_id + 1
+                    logging.warning(
+                        f"  Class {cls_label}: real={len(real_by_class.get(cls_id, []))}, "
+                        f"synthetic={len(gen_by_class.get(cls_id, []))} — FID 계산 건너뜀"
+                    )
+                    real_by_class.pop(cls_id, None)
+                    gen_by_class.pop(cls_id, None)
+
+                if gen_by_class:
+                    per_class_results = fid_calc.compute_fid_per_class(
+                        real_by_class,
+                        gen_by_class,
+                        batch_size=batch_size,
+                    )
+                    results.update(per_class_results)
+                    for key, val in sorted(per_class_results.items()):
+                        logging.info(f"  {key}: {val:.2f}")
+                else:
+                    logging.warning("모든 클래스가 빈 상태 — per-class FID 계산 건너뜀")
             else:
                 logging.warning(
                     f"per_class FID requested but metadata.json not found: {casda_metadata_path}"
@@ -1069,9 +1386,20 @@ Examples:
                             f"inject/clean will be skipped for CASDA groups")
             baseline_yolo_dir = None
 
+    # A8: 벤치마크 시작 전 Drive 마운트 헬스체크
+    if baseline_yolo_dir:
+        if not _check_drive_health(baseline_yolo_dir):
+            logging.warning("[DriveHealth] 벤치마크 시작 전 Drive 마운트 비정상 감지")
+            if not _wait_for_drive(baseline_yolo_dir):
+                logging.error("[DriveHealth] Drive 복구 실패 — 벤치마크를 계속 진행하지만 "
+                              "CASDA inject/clean이 실패할 수 있음")
+            else:
+                logging.info("[DriveHealth] Drive 마운트 정상 확인 — 벤치마크 시작")
+
     for group_key in group_keys:
         is_casda = group_key in CASDA_GROUPS
         casda_injected = False
+        inject_count = 0
 
         # --- Inject CASDA if needed ---
         if is_casda and baseline_yolo_dir:
@@ -1113,6 +1441,18 @@ Examples:
                 )
                 casda_injected = True
                 logging.info(f"  → {inject_count} images injected")
+
+                # A6: 주입된 파일 검증
+                if inject_count > 0:
+                    total_found, broken = _validate_injected_files(
+                        baseline_dir=baseline_yolo_dir,
+                        inject_count=inject_count,
+                    )
+                    if broken > 0:
+                        logging.warning(
+                            f"[Validate] 깨진 심링크 {broken}개 발견 "
+                            f"— Drive 마운트 상태를 확인하세요"
+                        )
             else:
                 logging.error(f"CASDA data dir not found: {casda_data_dir}")
                 logging.error(f"  Skipping all models for group: {group_key}")
@@ -1125,6 +1465,18 @@ Examples:
             logging.info(f"Run {run_idx}/{total_runs}: {model_key} + {group_key}")
             logging.info(f"{'='*70}")
 
+            # A8: 각 모델 학습 전 Drive 마운트 확인 (CASDA 주입 상태인 경우)
+            if is_casda and casda_injected and baseline_yolo_dir:
+                if not _check_drive_health(baseline_yolo_dir):
+                    logging.warning(
+                        f"[DriveHealth] {model_key} 학습 전 Drive 비정상 감지 — 복구 대기"
+                    )
+                    if not _wait_for_drive(baseline_yolo_dir):
+                        logging.error(
+                            f"[DriveHealth] Drive 복구 실패 — {model_key} 건너뜀"
+                        )
+                        continue
+
             try:
                 # For CASDA groups with detection models:
                 # Use baseline_raw (which now contains injected CASDA) as dataset_group
@@ -1134,7 +1486,6 @@ Examples:
                 effective_yolo_dir = args.yolo_dir
                 if is_casda and model_key in ULTRALYTICS_MODELS and casda_injected:
                     effective_group = "baseline_raw"
-                    effective_yolo_dir = args.yolo_dir
 
                 test_metrics = run_single_experiment(
                     model_key=model_key,
@@ -1154,16 +1505,29 @@ Examples:
 
             except Exception as e:
                 logging.error(f"Experiment failed: {model_key} + {group_key}: {e}")
-                import traceback
                 logging.error(traceback.format_exc())
                 continue
 
         # --- Clean CASDA after all models are done ---
         if casda_injected and baseline_yolo_dir:
+            # A8: Clean 전 Drive 헬스체크
+            if not _check_drive_health(baseline_yolo_dir):
+                logging.warning("[DriveHealth] Clean 전 Drive 비정상 감지 — 복구 대기")
+                if not _wait_for_drive(baseline_yolo_dir):
+                    logging.error(
+                        "[DriveHealth] Clean 전 Drive 복구 실패 — "
+                        "CASDA 파일이 남아있을 수 있음. 수동 정리 필요."
+                    )
+
             logging.info(f"\n{'='*70}")
             logging.info(f"CLEAN: Removing {group_key} files from baseline_raw")
             logging.info(f"{'='*70}")
-            removed = clean_casda_from_baseline(baseline_dir=baseline_yolo_dir)
+            # A7: expected_count = inject_count(이미지) + inject_count(라벨) = 2배
+            expected_clean = inject_count * 2
+            removed = clean_casda_from_baseline(
+                baseline_dir=baseline_yolo_dir,
+                expected_count=expected_clean,
+            )
             logging.info(f"  → {removed} files removed")
 
     total_time = time.time() - start_time

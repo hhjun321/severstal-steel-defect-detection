@@ -24,6 +24,75 @@ from src.preprocessing.hint_generator import HintImageGenerator
 from src.preprocessing.prompt_generator import PromptGenerator
 from src.utils.dataset_validator import DatasetValidator
 
+from typing import Dict, Optional
+
+
+def parse_class_edge_overrides(raw: Optional[str]) -> Optional[Dict[int, Dict[str, float]]]:
+    """
+    CLI 문자열을 class_margin_overrides dict로 변환.
+
+    형식: "CLASS:X,Y;CLASS:X,Y"
+      - CLASS: 1-based class_id (int)
+      - X: x-margin 비율 (float)
+      - Y: y-margin 비율 (float)
+
+    예: "4:0.05,0.0"         → {4: {'x': 0.05, 'y': 0.0}}
+        "3:0.08,0.03;4:0.05,0.0" → {3: {'x': 0.08, 'y': 0.03}, 4: {'x': 0.05, 'y': 0.0}}
+
+    Returns:
+        None if raw is None or empty, otherwise parsed dict.
+    Raises:
+        ValueError: 형식 오류 시.
+    """
+    if not raw:
+        return None
+
+    overrides: Dict[int, Dict[str, float]] = {}
+    for entry in raw.split(';'):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ':' not in entry:
+            raise ValueError(
+                f"잘못된 형식 '{entry}'. 올바른 형식: CLASS:X,Y (예: 4:0.05,0.0)"
+            )
+        cls_str, margins_str = entry.split(':', 1)
+        try:
+            cls_id = int(cls_str.strip())
+        except ValueError:
+            raise ValueError(f"CLASS는 정수여야 합니다: '{cls_str}'")
+        # class_id 범위 검증 (Severstal 데이터셋: 1~4)
+        if cls_id < 1 or cls_id > 4:
+            raise ValueError(
+                f"CLASS는 1~4 범위여야 합니다: {cls_id}. "
+                f"Severstal 데이터셋의 ClassId는 1-based (1,2,3,4)입니다."
+            )
+        # 중복 class_id 검출
+        if cls_id in overrides:
+            raise ValueError(
+                f"Class {cls_id}가 중복 지정되었습니다. "
+                f"이전 값: {overrides[cls_id]}, 새 값을 파싱 중: '{margins_str}'"
+            )
+        parts = margins_str.strip().split(',')
+        if len(parts) != 2:
+            raise ValueError(
+                f"Class {cls_id}: X,Y 두 값이 필요합니다 ('{margins_str}')"
+            )
+        try:
+            mx = float(parts[0].strip())
+            my = float(parts[1].strip())
+        except ValueError:
+            raise ValueError(
+                f"Class {cls_id}: X/Y는 실수여야 합니다 ('{margins_str}')"
+            )
+        if not (0.0 <= mx <= 1.0) or not (0.0 <= my <= 1.0):
+            raise ValueError(
+                f"Class {cls_id}: X/Y는 0.0~1.0 범위여야 합니다 (x={mx}, y={my})"
+            )
+        overrides[cls_id] = {'x': mx, 'y': my}
+
+    return overrides if overrides else None
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -93,6 +162,16 @@ def main():
              '--per_class_cap과 함께 사용.'
     )
     parser.add_argument(
+        '--class_edge_override',
+        type=str,
+        default=None,
+        help='B2 클래스별 엣지 마진 오버라이드. 형식: "CLASS:X,Y;CLASS:X,Y". '
+             'CLASS는 1-based class_id, X/Y는 마진 비율. '
+             '예: "4:0.05,0.0" → Class 4는 좌우 5%%, 상하 0%% 마진. '
+             '"3:0.08,0.03;4:0.05,0.0" → Class 3/4 각각 개별 설정. '
+             'Class 4 결함은 이미지 전체 높이(256px)를 차지하므로 Y=0 권장.'
+    )
+    parser.add_argument(
         '--validation_samples',
         type=int,
         default=16,
@@ -111,11 +190,20 @@ def main():
     if not roi_metadata_path.exists():
         print(f"Error: ROI metadata not found: {roi_metadata_path}")
         print("Please run extract_rois.py first to generate ROI metadata.")
-        return
+        sys.exit(1)
     
     if not train_csv.exists():
         print(f"Error: Training CSV not found: {train_csv}")
-        return
+        sys.exit(1)
+    
+    # B2: 클래스별 엣지 마진 오버라이드 파싱
+    class_margin_overrides = None
+    if args.class_edge_override:
+        try:
+            class_margin_overrides = parse_class_edge_overrides(args.class_edge_override)
+        except ValueError as e:
+            print(f"Error: --class_edge_override 파싱 실패: {e}")
+            sys.exit(1)
     
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -134,6 +222,8 @@ def main():
         print(f"Max samples: {args.max_samples}")
     if args.per_class_cap:
         print(f"Per-class cap: {args.per_class_cap} (rare threshold: {args.rare_class_threshold})")
+    if class_margin_overrides:
+        print(f"Edge margin overrides: {class_margin_overrides}")
     print("="*80)
     
     # Load ROI metadata
@@ -157,7 +247,7 @@ def main():
             response = input("\nDo you want to continue anyway? (y/n): ")
             if response.lower() != 'y':
                 print("Aborting. Please address the issues and try again.")
-                return
+                sys.exit(1)
         else:
             print("\n[PASS] Dataset validation passed!")
     else:
@@ -189,7 +279,8 @@ def main():
         create_hints=not args.skip_hints,
         max_samples=args.max_samples,
         per_class_cap=args.per_class_cap,
-        rare_class_threshold_count=args.rare_class_threshold
+        rare_class_threshold_count=args.rare_class_threshold,
+        class_margin_overrides=class_margin_overrides,
     )
     
     # Print final summary

@@ -610,3 +610,75 @@ v5.4 벤치마크 실행 중 발생한 Google Drive FUSE 마운트 불안정으�
     | 8 | iterrows() → 벡터화          | 성능 개선이나 위험 대비 이득 작음         |
     | 24| CLI vs 내부 변수명 불일치      | 기능에 영향 없으며 리팩토링 범위 초과     |
     | 25| input() 비대화형 차단          | 기존 동작이며 --skip_validation으로 우회  |
+
+================================================================================
+18. FID 계산 성능 최적화 (O1+O2+O3)
+================================================================================
+
+  18.1 문제
+
+    v5.4 벤치마크에서 FID 계산에 ~1시간 소요 (1000 real vs 1000 synthetic).
+    원인: FIDCalculator가 overall FID + per-class FID(4클래스)를 독립적으로 계산하여
+    InceptionV3 feature 추출을 총 10회 수행 (2 overall + 2×4 per-class).
+    같은 이미지가 여러 번 InceptionV3를 통과하며, 이미지 I/O도 단일 스레드.
+
+  18.2 병목 분석
+
+    | 순위 | 병목                        | 심각도 | 위치                          |
+    |------|-----------------------------|--------|-------------------------------|
+    | 1    | Feature 중복 추출 (10회)     | 심각   | metrics.py:444-461            |
+    | 2    | 단일 스레드 cv2.imread       | 중간   | metrics.py:366-378            |
+    | 3    | 디스크 캐시 없음             | 중간   | 재실행 시 매번 재추출          |
+
+  18.3 적용된 최적화
+
+    | ID | 최적화                              | 파일                  | 예상 효과     |
+    |----|-------------------------------------|-----------------------|---------------|
+    | O1 | Feature 일괄 추출 + 메모리 캐시      | metrics.py            | ~5x (10→2회)  |
+    |    | - 모든 unique 이미지 한 번에 추출    |                       |               |
+    |    | - {path: feature} dict로 캐싱       |                       |               |
+    |    | - overall/per-class 모두 dict에서    |                       |               |
+    |    |   슬라이싱하여 stats 계산            |                       |               |
+    | O2 | DataLoader + num_workers=4           | metrics.py            | ~2-3x I/O    |
+    |    | - _InceptionImageDataset 클래스 추가 |                       |               |
+    |    | - pin_memory, prefetch_factor=2      |                       |               |
+    |    | - Windows 자동 감지 (workers=0)      |                       |               |
+    | O3 | 디스크 캐시 (.npy)                   | metrics.py            | 재실행 즉시   |
+    |    | - 이미지 경로 해시 기반 캐시 키       |                       |               |
+    |    | - experiment_dir/fid_cache/ 저장     | run_benchmark.py      |               |
+
+  18.4 수정 파일
+
+    | 파일                              | 변경 내용                                      |
+    |-----------------------------------|-------------------------------------------------|
+    | src/training/metrics.py           | FIDCalculator 전면 리팩토링                      |
+    |   - _InceptionImageDataset        | DataLoader용 Dataset 클래스 추가                 |
+    |   - _fid_collate_fn               | 로딩 실패 필터링 collate 함수                    |
+    |   - _extract_features()           | DataLoader + 메모리캐시 + 디스크캐시             |
+    |   - compute_fid_with_preextract() | 일괄 추출 → overall+per-class 동시 계산 (신규)   |
+    |   - clear_cache()                 | 메모리 캐시 초기화 메서드 (신규)                  |
+    |   - _gather_cached_features()     | 캐시에서 feature 슬라이싱 (신규)                  |
+    | scripts/run_benchmark.py          | run_fid_evaluation() 수정                        |
+    |   - compute_fid_with_preextract() 호출로 전환                                  |
+    |   - num_workers, cache_dir 전달                                                |
+    |   - per-class 그룹핑을 FID 호출 전에 미리 수행                                  |
+    | configs/benchmark_experiment.yaml | fid.num_workers: 4 추가                          |
+
+  18.5 하위 호환성
+
+    - compute_fid() / compute_fid_per_class() 기존 시그니처 유지
+    - 새 파라미터(num_workers, cache_dir)는 기본값이 기존 동작과 동일
+    - num_workers 기본값 4, cache_dir 기본값 None (디스크 캐시 비활성)
+
+  18.6 예상 성능 개선
+
+    | 구간              | 변경 전 (v5.4) | 변경 후 (v5.5) | 개선 배수 |
+    |-------------------|----------------|----------------|-----------|
+    | Feature 추출 횟수  | 10회            | 1회             | 10x       |
+    | 이미지 I/O         | 단일 스레드     | 4 workers       | ~2-3x     |
+    | 재실행 시           | 처음부터        | 디스크 캐시 로드 | ~즉시     |
+    | 총 FID 시간 (예상)  | ~60분           | ~6-10분         | ~6-10x    |
+
+  18.7 py_compile 결과
+
+    metrics.py, run_benchmark.py 모두 py_compile 통과.

@@ -175,6 +175,7 @@ evaluation:
     dims: 2048  # InceptionV3 feature dimension
     max_images: 1000  # 각 세트에서 랜덤 샘플링할 최대 이미지 수 (seeded)
     per_class: true  # class-wise FID (metadata.json 필요)
+    num_workers: 4  # DataLoader worker 수 (이미지 I/O 병렬화, Windows에서는 자동 0)
 
 # ----------------------------------------------------------------------------
 # Results Reporting

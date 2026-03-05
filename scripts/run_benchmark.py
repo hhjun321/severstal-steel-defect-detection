@@ -777,6 +777,11 @@ def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda')
       - [:1000] 하드코딩 대신 seeded random sampling
       - 로그에 실제 사용 이미지 수 표시 (misleading 방지)
       - per_class FID 계산 활성화 (metadata.json 기반 클래스 그룹핑)
+
+    v5.5 성능 최적화:
+      - compute_fid_with_preextract()로 overall + per-class를 한 번의 추출로 수행
+      - DataLoader num_workers로 이미지 I/O 병렬화
+      - 디스크 캐시로 재실행 시 즉시 로드
     """
     logging.info(f"\n{'#'*70}")
     logging.info(f"# FID Score Evaluation")
@@ -790,7 +795,11 @@ def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda')
     batch_size = fid_config.get('batch_size', 64)
     max_images = fid_config.get('max_images', 1000)
     per_class = fid_config.get('per_class', False)
+    num_workers = fid_config.get('num_workers', 4)
     fid_seed = 42  # 재현성을 위한 고정 시드
+
+    # 디스크 캐시 디렉토리 (experiment_dir 하위)
+    cache_dir = experiment_dir / "fid_cache"
 
     # ── 실제 이미지 수집 ──
     raw_image_dir = ds_config['image_dir']
@@ -832,27 +841,22 @@ def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda')
 
         logging.info(
             f"Computing FID: {len(real_sampled)} real vs {len(casda_sampled)} synthetic"
-            f" (max_images={max_images}, seed={fid_seed})"
+            f" (max_images={max_images}, seed={fid_seed}, workers={num_workers})"
         )
 
-        overall_fid = fid_calc.compute_fid(
-            real_sampled,
-            casda_sampled,
-            batch_size=batch_size,
-        )
-        results['fid_overall'] = overall_fid
-        logging.info(f"FID Score (overall): {overall_fid:.2f}")
+        # ── Per-class 그룹핑 준비 (overall과 함께 일괄 추출) ──
+        real_by_class: Optional[dict] = None
+        gen_by_class: Optional[dict] = None
 
-        # ── Per-class FID (metadata.json 기반) ──
         if per_class:
             casda_metadata_path = casda_full_dir / "metadata.json"
             if casda_metadata_path.exists():
-                logging.info("Computing per-class FID using metadata.json...")
+                logging.info("Preparing per-class FID groups using metadata.json...")
                 with open(casda_metadata_path, 'r', encoding='utf-8') as f:
                     casda_metadata = json.load(f)
 
                 # CASDA 이미지를 class_id별로 그룹핑
-                gen_by_class: dict = {}
+                gen_by_class = {}
                 for entry in casda_metadata:
                     cls_id = entry.get('class_id')
                     if cls_id is None:
@@ -863,10 +867,6 @@ def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda')
                         gen_by_class.setdefault(cls_id, []).append(img_abs)
 
                 # B1: 실제 이미지를 클래스별로 분류 (train.csv 기반)
-                # 기존 문제: 혼합 클래스 real 이미지를 모든 클래스에 동일하게 사용
-                #   → FID가 "같은 분포 vs 같은 분포" 비교가 아니라
-                #     "혼합 분포 vs 단일 클래스 분포" 비교가 되어 인위적으로 부풀려짐
-                # 수정: train.csv에서 클래스별 이미지 ID를 추출하여 real_by_class 구성
                 annotation_csv = ds_config.get('annotation_csv', 'train.csv')
                 annotation_path = (
                     Path(annotation_csv) if os.path.isabs(annotation_csv)
@@ -876,14 +876,11 @@ def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda')
                 # 재현성: per-class 샘플링은 별도 RNG 사용 (overall 샘플링과 독립)
                 per_class_rng = random.Random(fid_seed + 1)
 
-                real_by_class: dict = {}
+                real_by_class = {}
                 if annotation_path.exists():
                     ann_df = pd.read_csv(annotation_path)
-                    # train.csv: ImageId, ClassId, EncodedPixels
-                    # ClassId는 1-based (1~4), 내부적으로 0-based 사용
                     for cls_id in gen_by_class.keys():
                         cls_label = cls_id + 1  # 0-based → 1-based
-                        # 해당 클래스의 결함이 있는 이미지 ID 추출
                         cls_rows = ann_df[
                             (ann_df['ClassId'] == cls_label) &
                             (ann_df['EncodedPixels'].notna())
@@ -893,7 +890,6 @@ def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda')
                             str(image_dir / img_id) for img_id in cls_image_ids
                             if (image_dir / img_id).exists()
                         ]
-                        # 클래스별 real 이미지도 max_images로 샘플링
                         if len(cls_real_paths) > max_images:
                             cls_real_paths = per_class_rng.sample(cls_real_paths, max_images)
                         real_by_class[cls_id] = cls_real_paths
@@ -902,7 +898,6 @@ def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda')
                             f"{len(gen_by_class.get(cls_id, []))} synthetic"
                         )
                 else:
-                    # train.csv가 없으면 기존 방식 (혼합 세트) 으로 fallback
                     logging.warning(
                         f"annotation_csv not found: {annotation_path} "
                         f"— per-class FID will use mixed real images (less accurate)"
@@ -924,21 +919,26 @@ def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda')
                     real_by_class.pop(cls_id, None)
                     gen_by_class.pop(cls_id, None)
 
-                if gen_by_class:
-                    per_class_results = fid_calc.compute_fid_per_class(
-                        real_by_class,
-                        gen_by_class,
-                        batch_size=batch_size,
-                    )
-                    results.update(per_class_results)
-                    for key, val in sorted(per_class_results.items()):
-                        logging.info(f"  {key}: {val:.2f}")
-                else:
+                if not gen_by_class:
                     logging.warning("모든 클래스가 빈 상태 — per-class FID 계산 건너뜀")
+                    gen_by_class = None
+                    real_by_class = None
             else:
                 logging.warning(
                     f"per_class FID requested but metadata.json not found: {casda_metadata_path}"
                 )
+
+        # ── FID 계산: 일괄 feature 추출 → overall + per-class 동시 처리 ──
+        fid_results = fid_calc.compute_fid_with_preextract(
+            all_real_paths=real_sampled,
+            all_gen_paths=casda_sampled,
+            real_by_class=real_by_class,
+            gen_by_class=gen_by_class,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            cache_dir=cache_dir,
+        )
+        results.update(fid_results)
     else:
         logging.warning("No CASDA images found for FID computation")
         results['fid_overall'] = float('inf')

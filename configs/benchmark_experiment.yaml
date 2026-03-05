@@ -176,6 +176,11 @@ evaluation:
     max_images: 1000  # 각 세트에서 랜덤 샘플링할 최대 이미지 수 (seeded)
     per_class: true  # class-wise FID (metadata.json 필요)
     num_workers: 4  # DataLoader worker 수 (이미지 I/O 병렬화, Windows에서는 자동 0)
+    fid_mode: both  # "roi" | "composed" | "both"
+    #   roi: real ROI patches vs casda_full (ControlNet 생성 품질)
+    #   composed: real 전체 이미지 vs casda_composed (Poisson Blending 최종 품질)
+    #   both: 두 메트릭 모두 계산
+    roi_metadata_csv: ""  # roi_metadata.csv 경로 (빈 문자열이면 --casda-dir에서 자동 탐색)
 
 # ----------------------------------------------------------------------------
 # Results Reporting

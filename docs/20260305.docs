@@ -682,3 +682,81 @@ v5.4 벤치마크 실행 중 발생한 Google Drive FUSE 마운트 불안정으�
   18.7 py_compile 결과
 
     metrics.py, run_benchmark.py 모두 py_compile 통과.
+
+================================================================================
+19. FID 비교 대상 수정 — fid_roi + fid_composed 이중 메트릭
+================================================================================
+
+  19.1 문제
+
+    기존 FID 계산이 잘못된 대상을 비교하고 있었음:
+      - Real: train_images/ (1600x256 전체 강판)
+      - Synthetic: casda_full/images/ (512x512 ControlNet ROI 출력)
+    두 세트는 해상도와 공간적 내용이 근본적으로 다름:
+      - Real은 대부분 배경인 전체 강판 이미지
+      - Synthetic은 확대된 결함 영역만
+    InceptionV3가 299x299로 리사이즈하므로 런타임 에러는 없지만,
+    FID 점수가 이미지 품질과 무관하게 인위적으로 부풀려짐.
+
+  19.2 수정 내용
+
+    FID를 2개 독립 메트릭으로 분리:
+
+    | 메트릭          | Real                      | Synthetic                   | 목적                      |
+    |-----------------|---------------------------|-----------------------------|---------------------------|
+    | fid_roi         | roi_patches/ (256x256)    | casda_full/ (512x512)       | ControlNet 생성 품질 평가  |
+    | fid_composed    | train_images/ (1600x256)  | casda_composed/ (1600x256)  | Poisson Blending 최종 품질 |
+
+    하위 호환: fid_overall = fid_composed_overall
+
+  19.3 새 config 옵션
+
+    | 키                         | 기본값  | 설명                                           |
+    |----------------------------|---------|------------------------------------------------|
+    | evaluation.fid.fid_mode    | "both"  | "roi", "composed", "both" 중 택 1              |
+    | evaluation.fid.roi_metadata_csv | ""  | roi_metadata.csv 경로. 빈 문자열이면 자동 탐색  |
+
+  19.4 결과 키 변경
+
+    | 기존 키          | 새 키                   | 비고                                    |
+    |-----------------|-------------------------|-----------------------------------------|
+    | fid_overall     | fid_composed_overall    | 동일 (backward compat: fid_overall 유지) |
+    | Class1_FID      | Class1_FID_composed     | composed 기반                            |
+    | (없음)          | fid_roi_overall         | 신규                                     |
+    | (없음)          | Class1_FID_roi          | 신규                                     |
+
+  19.5 수정 파일
+
+    | 파일                              | 변경 내용                                      |
+    |-----------------------------------|-------------------------------------------------|
+    | scripts/run_benchmark.py          | run_fid_evaluation() 전면 리팩토링               |
+    |   - _collect_images_from_dir()    | 디렉토리 이미지 수집 유틸 (신규)                  |
+    |   - _group_gen_images_by_class()  | metadata.json 기반 클래스 그룹핑 (신규)           |
+    |   - _build_real_by_class_from_csv | train.csv 기반 real 클래스 그룹핑 (신규)          |
+    |   - _build_real_roi_by_class_from_csv | roi_metadata.csv 기반 ROI 클래스 그룹핑 (신규)|
+    |   - _remove_empty_classes()       | 빈 클래스 제거 유틸 (신규)                        |
+    |   - _sample_images()              | seeded 랜덤 샘플링 유틸 (신규)                    |
+    |   - --casda-dir CLI 처리          | roi_metadata_csv 자동 탐색 로직 추가              |
+    | configs/benchmark_experiment.yaml | fid_mode, roi_metadata_csv 키 추가               |
+
+  19.6 ROI 자동 탐색 로직
+
+    --casda-dir 지정 시 다음 순서로 roi_metadata.csv 탐색:
+      1) {casda_dir}/../roi_patches/roi_metadata.csv
+      2) {casda_dir}/../roi_patches_v5.1/roi_metadata.csv
+      3) {casda_dir}/../roi_patches_v5/roi_metadata.csv
+    발견되면 evaluation.fid.roi_metadata_csv에 자동 설정.
+    미발견 시 fid_roi 건너뜀 (경고 로그).
+
+  19.7 실행 예시 (변경 없음)
+
+    # 기존과 동일한 명령으로 fid_roi + fid_composed 모두 계산
+    python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml
+
+    # ROI FID만 계산
+    # configs에서 fid_mode: roi 로 변경하거나:
+    # (CLI 오버라이드는 없음 — config 파일에서 설정)
+
+  19.8 py_compile 결과
+
+    run_benchmark.py, metrics.py 모두 py_compile 통과.

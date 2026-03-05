@@ -766,19 +766,154 @@ def run_single_experiment(
 
 
 # ============================================================================
-# FID Evaluation
+# FID Evaluation  — fid_roi (ROI vs ROI) + fid_composed (1600x256 vs 1600x256)
 # ============================================================================
 
-def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda') -> dict:
-    """Compute FID scores between real and CASDA-generated images.
-    
-    Improvements over original:
-      - max_images를 config에서 읽어서 사용 (기본 1000)
-      - [:1000] 하드코딩 대신 seeded random sampling
-      - 로그에 실제 사용 이미지 수 표시 (misleading 방지)
-      - per_class FID 계산 활성화 (metadata.json 기반 클래스 그룹핑)
+def _collect_images_from_dir(directory: Path) -> list:
+    """디렉토리에서 이미지 파일 경로를 수집 (중복 제거)."""
+    imgs: set = set()
+    for subdir in [directory, directory / "images"]:
+        if subdir.exists():
+            for ext in ("*.png", "*.jpg"):
+                for p in subdir.glob(ext):
+                    imgs.add(str(p.resolve()))
+    return sorted(imgs)
 
-    v5.5 성능 최적화:
+
+def _group_gen_images_by_class(
+    metadata_path: Path,
+    base_dir: Path,
+) -> Optional[dict]:
+    """metadata.json에서 합성 이미지를 class_id(0-based)별로 그룹핑.
+
+    Returns:
+        {cls_id: [abs_path, ...]} 또는 metadata가 없으면 None
+    """
+    if not metadata_path.exists():
+        return None
+    with open(metadata_path, 'r', encoding='utf-8') as f:
+        metadata = json.load(f)
+    by_class: dict = {}
+    for entry in metadata:
+        cls_id = entry.get('class_id')
+        if cls_id is None:
+            continue
+        img_rel = entry.get('image_path', '')
+        img_abs = str(base_dir / img_rel)
+        if os.path.exists(img_abs):
+            by_class.setdefault(cls_id, []).append(img_abs)
+    return by_class if by_class else None
+
+
+def _build_real_by_class_from_csv(
+    annotation_path: Path,
+    image_dir: Path,
+    class_ids: list,
+    max_images: int,
+    rng: random.Random,
+) -> dict:
+    """train.csv에서 클래스별 real 이미지 경로를 구성한다.
+
+    Args:
+        annotation_path: train.csv 경로
+        image_dir: train_images/ 디렉토리
+        class_ids: 대상 cls_id 리스트 (0-based)
+        max_images: 클래스당 최대 이미지 수
+        rng: 샘플링용 Random 인스턴스
+
+    Returns:
+        {cls_id: [abs_path, ...]}
+    """
+    ann_df = pd.read_csv(annotation_path)
+    real_by_class: dict = {}
+    for cls_id in class_ids:
+        cls_label = cls_id + 1  # 0-based → 1-based
+        cls_rows = ann_df[
+            (ann_df['ClassId'] == cls_label) &
+            (ann_df['EncodedPixels'].notna())
+        ]
+        cls_image_ids = cls_rows['ImageId'].unique().tolist()
+        cls_real_paths = [
+            str(image_dir / img_id) for img_id in cls_image_ids
+            if (image_dir / img_id).exists()
+        ]
+        if len(cls_real_paths) > max_images:
+            cls_real_paths = rng.sample(cls_real_paths, max_images)
+        real_by_class[cls_id] = cls_real_paths
+    return real_by_class
+
+
+def _build_real_roi_by_class_from_csv(
+    roi_metadata_path: Path,
+    class_ids: list,
+    max_images: int,
+    rng: random.Random,
+) -> dict:
+    """roi_metadata.csv에서 클래스별 real ROI 이미지 경로를 구성한다.
+
+    roi_metadata.csv 컬럼: class_id(1-based), roi_image_path(절대경로)
+
+    Args:
+        roi_metadata_path: roi_metadata.csv 경로
+        class_ids: 대상 cls_id 리스트 (0-based)
+        max_images: 클래스당 최대 이미지 수
+        rng: 샘플링용 Random 인스턴스
+
+    Returns:
+        {cls_id: [abs_path, ...]}
+    """
+    roi_df = pd.read_csv(roi_metadata_path)
+    real_by_class: dict = {}
+    for cls_id in class_ids:
+        cls_label = cls_id + 1  # 0-based → 1-based
+        cls_rows = roi_df[roi_df['class_id'] == cls_label]
+        cls_paths = [
+            str(p) for p in cls_rows['roi_image_path'].tolist()
+            if os.path.exists(str(p))
+        ]
+        if len(cls_paths) > max_images:
+            cls_paths = rng.sample(cls_paths, max_images)
+        real_by_class[cls_id] = cls_paths
+    return real_by_class
+
+
+def _remove_empty_classes(
+    real_by_class: dict,
+    gen_by_class: dict,
+) -> None:
+    """real 또는 gen 이미지가 부족한 클래스를 양쪽 dict에서 제거 (in-place)."""
+    empty = [
+        cid for cid in gen_by_class
+        if len(real_by_class.get(cid, [])) < 2 or len(gen_by_class[cid]) < 2
+    ]
+    for cid in empty:
+        logging.warning(
+            f"  Class {cid + 1}: real={len(real_by_class.get(cid, []))}, "
+            f"synthetic={len(gen_by_class.get(cid, []))} — FID 계산 건너뜀"
+        )
+        real_by_class.pop(cid, None)
+        gen_by_class.pop(cid, None)
+
+
+def _sample_images(images: list, max_images: int, rng: random.Random) -> list:
+    """max_images 이하로 seeded 랜덤 샘플링."""
+    if len(images) > max_images:
+        return rng.sample(images, max_images)
+    return images
+
+
+def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda') -> dict:
+    """FID 평가: fid_roi (ROI vs ROI) + fid_composed (전체 이미지 vs 전체 이미지).
+
+    v5.5 변경:
+      - fid_roi: real ROI 크롭(roi_patches) vs ControlNet 생성 ROI(casda_full)
+        → ControlNet 생성 품질 직접 비교 (동일 스케일)
+      - fid_composed: real 전체 이미지(train_images) vs Poisson Blending 합성(casda_composed)
+        → 최종 합성 이미지 품질 평가 (동일 해상도 1600x256)
+      - fid_mode: "both"(기본), "roi", "composed" 선택 가능
+      - 하위 호환: fid_overall = fid_composed_overall
+
+    성능 최적화 (이전 커밋):
       - compute_fid_with_preextract()로 overall + per-class를 한 번의 추출로 수행
       - DataLoader num_workers로 이미지 I/O 병렬화
       - 디스크 캐시로 재실행 시 즉시 로드
@@ -787,7 +922,6 @@ def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda')
     logging.info(f"# FID Score Evaluation")
     logging.info(f"{'#'*70}")
 
-    fid_calc = FIDCalculator(device=device)
     ds_config = config['dataset']
     casda_config = ds_config.get('casda', {})
     fid_config = config.get('evaluation', {}).get('fid', {})
@@ -796,157 +930,245 @@ def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda')
     max_images = fid_config.get('max_images', 1000)
     per_class = fid_config.get('per_class', False)
     num_workers = fid_config.get('num_workers', 4)
+    fid_mode = fid_config.get('fid_mode', 'both')  # "roi", "composed", "both"
     fid_seed = 42  # 재현성을 위한 고정 시드
 
     # 디스크 캐시 디렉토리 (experiment_dir 하위)
     cache_dir = experiment_dir / "fid_cache"
 
-    # ── 실제 이미지 수집 ──
+    # 공통 경로 해석
     raw_image_dir = ds_config['image_dir']
     image_dir = Path(raw_image_dir) if os.path.isabs(raw_image_dir) else PROJECT_ROOT / raw_image_dir
-    real_images = sorted(image_dir.glob("*.jpg")) + sorted(image_dir.glob("*.png"))
-    real_images = [str(p) for p in real_images]
 
-    if not real_images:
-        logging.warning("No real images found for FID computation")
-        return {'fid_overall': float('inf')}
+    annotation_csv = ds_config.get('annotation_csv', 'train.csv')
+    annotation_path = (
+        Path(annotation_csv) if os.path.isabs(annotation_csv)
+        else PROJECT_ROOT / annotation_csv
+    )
 
-    # ── CASDA 합성 이미지 수집 ──
-    raw_casda_dir = casda_config.get('full_dir', 'data/augmented/casda_full')
-    casda_full_dir = Path(raw_casda_dir) if os.path.isabs(raw_casda_dir) else PROJECT_ROOT / raw_casda_dir
-    casda_images_set: set = set()
-    if casda_full_dir.exists():
-        for subdir in [casda_full_dir, casda_full_dir / "images"]:
-            if subdir.exists():
-                for p in subdir.glob("*.png"):
-                    casda_images_set.add(str(p.resolve()))
-                for p in subdir.glob("*.jpg"):
-                    casda_images_set.add(str(p.resolve()))
-    casda_images = sorted(casda_images_set)
+    results: dict = {}
+    fid_calc = FIDCalculator(device=device)
 
-    results = {}
-    if casda_images:
-        logging.info(f"Found images: {len(real_images)} real, {len(casda_images)} synthetic")
+    # ==================================================================
+    # fid_roi: ROI vs ROI (real ROI crops vs ControlNet 512x512 outputs)
+    # ==================================================================
+    if fid_mode in ('roi', 'both'):
+        logging.info(f"\n{'─'*50}")
+        logging.info(f"  FID-ROI: real ROI patches vs CASDA ROI outputs")
+        logging.info(f"{'─'*50}")
 
-        # ── Seeded random sampling (편향 없는 서브셋 선택) ──
-        rng = random.Random(fid_seed)
-        if len(real_images) > max_images:
-            real_sampled = rng.sample(real_images, max_images)
-        else:
-            real_sampled = real_images
-        if len(casda_images) > max_images:
-            casda_sampled = rng.sample(casda_images, max_images)
-        else:
-            casda_sampled = casda_images
+        # ── Real ROI 수집 (roi_metadata.csv 기반) ──
+        raw_roi_csv = fid_config.get('roi_metadata_csv', '')
+        if not raw_roi_csv:
+            # CLI --casda-dir 사용 시 자동 탐색:
+            #   casda_dir/../roi_patches_*/roi_metadata.csv
+            #   또는 data/processed/roi_patches/roi_metadata.csv
+            for candidate in [
+                Path(casda_config.get('full_dir', '')) / '..' / 'roi_patches' / 'roi_metadata.csv',
+                PROJECT_ROOT / 'data' / 'processed' / 'roi_patches' / 'roi_metadata.csv',
+            ]:
+                candidate = candidate.resolve()
+                if candidate.exists():
+                    raw_roi_csv = str(candidate)
+                    break
 
-        logging.info(
-            f"Computing FID: {len(real_sampled)} real vs {len(casda_sampled)} synthetic"
-            f" (max_images={max_images}, seed={fid_seed}, workers={num_workers})"
+        roi_metadata_path = (
+            Path(raw_roi_csv) if raw_roi_csv and os.path.isabs(raw_roi_csv)
+            else (PROJECT_ROOT / raw_roi_csv if raw_roi_csv else None)
         )
 
-        # ── Per-class 그룹핑 준비 (overall과 함께 일괄 추출) ──
-        real_by_class: Optional[dict] = None
-        gen_by_class: Optional[dict] = None
+        if roi_metadata_path and roi_metadata_path.exists():
+            roi_df = pd.read_csv(roi_metadata_path)
+            roi_real_paths = [
+                str(p) for p in roi_df['roi_image_path'].tolist()
+                if os.path.exists(str(p))
+            ]
+            logging.info(f"  Real ROI patches: {len(roi_real_paths)} "
+                         f"(from {roi_metadata_path.name})")
+        else:
+            roi_real_paths = []
+            logging.warning(
+                f"  roi_metadata_csv not found: {roi_metadata_path} "
+                f"— fid_roi 건너뜀"
+            )
 
-        if per_class:
-            casda_metadata_path = casda_full_dir / "metadata.json"
-            if casda_metadata_path.exists():
-                logging.info("Preparing per-class FID groups using metadata.json...")
-                with open(casda_metadata_path, 'r', encoding='utf-8') as f:
-                    casda_metadata = json.load(f)
+        # ── Synthetic ROI 수집 (casda_full) ──
+        raw_casda_full = casda_config.get('full_dir', 'data/augmented/casda_full')
+        casda_full_dir = (
+            Path(raw_casda_full) if os.path.isabs(raw_casda_full)
+            else PROJECT_ROOT / raw_casda_full
+        )
+        casda_full_images = _collect_images_from_dir(casda_full_dir)
+        logging.info(f"  Synthetic ROI (casda_full): {len(casda_full_images)}")
 
-                # CASDA 이미지를 class_id별로 그룹핑
-                gen_by_class = {}
-                for entry in casda_metadata:
-                    cls_id = entry.get('class_id')
-                    if cls_id is None:
-                        continue
-                    img_rel = entry.get('image_path', '')
-                    img_abs = str(casda_full_dir / img_rel)
-                    if os.path.exists(img_abs):
-                        gen_by_class.setdefault(cls_id, []).append(img_abs)
+        if roi_real_paths and casda_full_images:
+            rng_roi = random.Random(fid_seed)
+            roi_real_sampled = _sample_images(roi_real_paths, max_images, rng_roi)
+            roi_gen_sampled = _sample_images(casda_full_images, max_images, rng_roi)
 
-                # B1: 실제 이미지를 클래스별로 분류 (train.csv 기반)
-                annotation_csv = ds_config.get('annotation_csv', 'train.csv')
-                annotation_path = (
-                    Path(annotation_csv) if os.path.isabs(annotation_csv)
-                    else PROJECT_ROOT / annotation_csv
-                )
+            logging.info(
+                f"  Computing FID-ROI: {len(roi_real_sampled)} real vs "
+                f"{len(roi_gen_sampled)} synthetic"
+            )
 
-                # 재현성: per-class 샘플링은 별도 RNG 사용 (overall 샘플링과 독립)
-                per_class_rng = random.Random(fid_seed + 1)
+            # Per-class 그룹핑
+            roi_real_by_class: Optional[dict] = None
+            roi_gen_by_class: Optional[dict] = None
+            if per_class:
+                roi_gen_by_class = _group_gen_images_by_class(
+                    casda_full_dir / "metadata.json", casda_full_dir)
 
-                real_by_class = {}
-                if annotation_path.exists():
-                    ann_df = pd.read_csv(annotation_path)
-                    for cls_id in gen_by_class.keys():
-                        cls_label = cls_id + 1  # 0-based → 1-based
-                        cls_rows = ann_df[
-                            (ann_df['ClassId'] == cls_label) &
-                            (ann_df['EncodedPixels'].notna())
-                        ]
-                        cls_image_ids = cls_rows['ImageId'].unique().tolist()
-                        cls_real_paths = [
-                            str(image_dir / img_id) for img_id in cls_image_ids
-                            if (image_dir / img_id).exists()
-                        ]
-                        if len(cls_real_paths) > max_images:
-                            cls_real_paths = per_class_rng.sample(cls_real_paths, max_images)
-                        real_by_class[cls_id] = cls_real_paths
+                if roi_gen_by_class and roi_metadata_path and roi_metadata_path.exists():
+                    pc_rng = random.Random(fid_seed + 1)
+                    roi_real_by_class = _build_real_roi_by_class_from_csv(
+                        roi_metadata_path,
+                        list(roi_gen_by_class.keys()),
+                        max_images, pc_rng,
+                    )
+                    for cid in sorted(roi_gen_by_class.keys()):
                         logging.info(
-                            f"  Class {cls_label}: {len(cls_real_paths)} real, "
-                            f"{len(gen_by_class.get(cls_id, []))} synthetic"
+                            f"    Class {cid + 1}: "
+                            f"{len(roi_real_by_class.get(cid, []))} real ROI, "
+                            f"{len(roi_gen_by_class.get(cid, []))} synthetic ROI"
                         )
+                    _remove_empty_classes(roi_real_by_class, roi_gen_by_class)
+                    if not roi_gen_by_class:
+                        roi_gen_by_class = None
+                        roi_real_by_class = None
+
+            # FID 계산 (feature 일괄 추출)
+            fid_calc.clear_cache()  # ROI와 composed의 feature 공간이 다르므로 초기화
+            roi_results = fid_calc.compute_fid_with_preextract(
+                all_real_paths=roi_real_sampled,
+                all_gen_paths=roi_gen_sampled,
+                real_by_class=roi_real_by_class,
+                gen_by_class=roi_gen_by_class,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                cache_dir=cache_dir,
+            )
+
+            # 키 이름에 _roi 접미사 추가
+            for k, v in roi_results.items():
+                if k == 'fid_overall':
+                    results['fid_roi_overall'] = v
                 else:
-                    logging.warning(
-                        f"annotation_csv not found: {annotation_path} "
-                        f"— per-class FID will use mixed real images (less accurate)"
-                    )
-                    for cls_id in gen_by_class.keys():
-                        real_by_class[cls_id] = real_sampled
+                    # "Class1_FID" → "Class1_FID_roi"
+                    results[f"{k}_roi"] = v
+        else:
+            logging.warning("  fid_roi 계산 불가: real ROI 또는 synthetic ROI 부족")
+            results['fid_roi_overall'] = float('inf')
 
-                # 빈 클래스 제거 (real 또는 synthetic 이미지가 없는 클래스)
-                empty_classes = [
-                    cls_id for cls_id in gen_by_class
-                    if not real_by_class.get(cls_id) or not gen_by_class[cls_id]
-                ]
-                for cls_id in empty_classes:
-                    cls_label = cls_id + 1
-                    logging.warning(
-                        f"  Class {cls_label}: real={len(real_by_class.get(cls_id, []))}, "
-                        f"synthetic={len(gen_by_class.get(cls_id, []))} — FID 계산 건너뜀"
-                    )
-                    real_by_class.pop(cls_id, None)
-                    gen_by_class.pop(cls_id, None)
+    # ==================================================================
+    # fid_composed: 전체 이미지 vs 전체 이미지
+    #   real: train_images/ (1600x256)
+    #   synthetic: casda_composed/ (1600x256 Poisson Blending)
+    # ==================================================================
+    if fid_mode in ('composed', 'both'):
+        logging.info(f"\n{'─'*50}")
+        logging.info(f"  FID-Composed: real full images vs CASDA composed")
+        logging.info(f"{'─'*50}")
 
-                if not gen_by_class:
-                    logging.warning("모든 클래스가 빈 상태 — per-class FID 계산 건너뜀")
-                    gen_by_class = None
-                    real_by_class = None
-            else:
-                logging.warning(
-                    f"per_class FID requested but metadata.json not found: {casda_metadata_path}"
+        # ── Real 전체 이미지 수집 ──
+        real_images = sorted(image_dir.glob("*.jpg")) + sorted(image_dir.glob("*.png"))
+        real_images = [str(p) for p in real_images]
+
+        if not real_images:
+            logging.warning("  No real images found for FID-composed computation")
+            results['fid_composed_overall'] = float('inf')
+            results['fid_overall'] = float('inf')
+        else:
+            # ── Synthetic composed 이미지 수집 ──
+            raw_composed_dir = casda_config.get('composed_dir', 'data/augmented/casda_composed')
+            composed_dir = (
+                Path(raw_composed_dir) if os.path.isabs(raw_composed_dir)
+                else PROJECT_ROOT / raw_composed_dir
+            )
+            composed_images = _collect_images_from_dir(composed_dir)
+            logging.info(f"  Real images: {len(real_images)}, "
+                         f"Composed synthetic: {len(composed_images)}")
+
+            if composed_images:
+                rng_comp = random.Random(fid_seed + 10)  # ROI와 다른 시드
+                real_sampled = _sample_images(real_images, max_images, rng_comp)
+                comp_sampled = _sample_images(composed_images, max_images, rng_comp)
+
+                logging.info(
+                    f"  Computing FID-Composed: {len(real_sampled)} real vs "
+                    f"{len(comp_sampled)} synthetic"
                 )
 
-        # ── FID 계산: 일괄 feature 추출 → overall + per-class 동시 처리 ──
-        fid_results = fid_calc.compute_fid_with_preextract(
-            all_real_paths=real_sampled,
-            all_gen_paths=casda_sampled,
-            real_by_class=real_by_class,
-            gen_by_class=gen_by_class,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            cache_dir=cache_dir,
-        )
-        results.update(fid_results)
-    else:
-        logging.warning("No CASDA images found for FID computation")
-        results['fid_overall'] = float('inf')
+                # Per-class 그룹핑
+                comp_real_by_class: Optional[dict] = None
+                comp_gen_by_class: Optional[dict] = None
+                if per_class:
+                    comp_gen_by_class = _group_gen_images_by_class(
+                        composed_dir / "metadata.json", composed_dir)
 
+                    if comp_gen_by_class and annotation_path.exists():
+                        pc_rng = random.Random(fid_seed + 11)
+                        comp_real_by_class = _build_real_by_class_from_csv(
+                            annotation_path, image_dir,
+                            list(comp_gen_by_class.keys()),
+                            max_images, pc_rng,
+                        )
+                        for cid in sorted(comp_gen_by_class.keys()):
+                            logging.info(
+                                f"    Class {cid + 1}: "
+                                f"{len(comp_real_by_class.get(cid, []))} real, "
+                                f"{len(comp_gen_by_class.get(cid, []))} composed"
+                            )
+                        _remove_empty_classes(comp_real_by_class, comp_gen_by_class)
+                        if not comp_gen_by_class:
+                            comp_gen_by_class = None
+                            comp_real_by_class = None
+                    elif comp_gen_by_class and not annotation_path.exists():
+                        logging.warning(
+                            f"  annotation_csv not found: {annotation_path} "
+                            f"— per-class FID-composed will use mixed real images"
+                        )
+                        for cid in comp_gen_by_class.keys():
+                            comp_real_by_class = comp_real_by_class or {}
+                            comp_real_by_class[cid] = real_sampled
+
+                # FID 계산 (feature 일괄 추출)
+                fid_calc.clear_cache()
+                comp_results = fid_calc.compute_fid_with_preextract(
+                    all_real_paths=real_sampled,
+                    all_gen_paths=comp_sampled,
+                    real_by_class=comp_real_by_class,
+                    gen_by_class=comp_gen_by_class,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    cache_dir=cache_dir,
+                )
+
+                # 키 이름에 _composed 접미사 추가
+                for k, v in comp_results.items():
+                    if k == 'fid_overall':
+                        results['fid_composed_overall'] = v
+                    else:
+                        results[f"{k}_composed"] = v
+
+                # 하위 호환: fid_overall = fid_composed_overall
+                results['fid_overall'] = results.get('fid_composed_overall', float('inf'))
+            else:
+                logging.warning("  No composed images found — fid_composed 건너뜀")
+                results['fid_composed_overall'] = float('inf')
+                results['fid_overall'] = float('inf')
+
+    # ==================================================================
+    # 결과 저장
+    # ==================================================================
     fid_path = experiment_dir / "fid_results.json"
     with open(fid_path, 'w') as f:
         json.dump(results, f, indent=2, default=str)
-    logging.info(f"FID results saved to: {fid_path}")
+    logging.info(f"\nFID results saved to: {fid_path}")
+
+    # 요약 로그
+    for key in ['fid_roi_overall', 'fid_composed_overall']:
+        if key in results:
+            logging.info(f"  {key}: {results[key]:.2f}")
 
     return results
 
@@ -1203,6 +1425,18 @@ Examples:
         config['dataset']['casda']['pruning_dir'] = os.path.join(casda_base, 'casda_pruning')
         config['dataset']['casda']['composed_dir'] = os.path.join(casda_base, 'casda_composed')
         print(f"[INFO] casda paths overridden: {casda_base}/casda_full, {casda_base}/casda_pruning, {casda_base}/casda_composed")
+
+        # FID-ROI용 roi_metadata.csv 자동 탐색
+        # casda_dir 상위에 roi_patches*/roi_metadata.csv가 있는지 확인
+        fid_cfg = config.setdefault('evaluation', {}).setdefault('fid', {})
+        if not fid_cfg.get('roi_metadata_csv'):
+            casda_parent = Path(casda_base).parent
+            for candidate_name in ['roi_patches', 'roi_patches_v5.1', 'roi_patches_v5']:
+                candidate = casda_parent / candidate_name / 'roi_metadata.csv'
+                if candidate.exists():
+                    fid_cfg['roi_metadata_csv'] = str(candidate)
+                    print(f"[INFO] roi_metadata_csv auto-detected: {candidate}")
+                    break
 
     # Override split CSV if specified
     if args.split_csv:

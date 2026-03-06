@@ -183,6 +183,18 @@ evaluation:
     roi_metadata_csv: ""  # roi_metadata.csv 경로 (빈 문자열이면 --casda-dir에서 자동 탐색)
 
 # ----------------------------------------------------------------------------
+# CASDA Ratio Experiment Presets (P3)
+# CLI: --casda-ratio 0.1 0.2 0.3 0.5 --casda-ratio-source composed
+# 아래 설정은 YAML 기반 ratio 프리셋 (CLI 없이도 ratio 실험 가능)
+# CLI --casda-ratio가 지정되면 이 섹션은 무시됨
+# ----------------------------------------------------------------------------
+casda_ratio:
+  enabled: false  # true로 변경하면 아래 비율들이 자동으로 그룹 생성
+  source: "composed"  # "full" | "composed" (CLI --casda-ratio-source와 동일)
+  ratios: [0.10, 0.20, 0.30, 0.50]  # 실험할 비율 목록
+  include_baseline: true  # baseline_raw 자동 포함 (비교 기준선)
+
+# ----------------------------------------------------------------------------
 # Results Reporting
 # ----------------------------------------------------------------------------
 reporting:
@@ -212,3 +224,8 @@ reporting:
     - name: "H5"
       description: "CASDA images are physically plausible (FID)"
       metric: "fid_score"
+    - name: "H6"
+      description: "Optimal CASDA ratio exists (non-monotonic)"
+      compare: ["casda_ratio_10", "casda_ratio_20", "casda_ratio_30", "casda_ratio_50", "baseline_raw"]
+      metric: "mAP@0.5"
+      analysis: "find_optimal"  # 최적 비율 탐색 (peak detection)

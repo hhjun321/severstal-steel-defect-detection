@@ -411,8 +411,12 @@ v5.4 벤치마크 실행 중 발생한 Google Drive FUSE 마운트 불안정으�
     | P1-b | Class 3 | subtype 균형 샘플링           | 178 → ~160         |
 
 
-14. Colab 실행 가이드 — v5.5 파이프라인
+14. [DEPRECATED] Colab 실행 가이드 — v5.5 파이프라인 (구 버전)
 ================================================================================
+
+  ⚠ 이 섹션은 CLI 인자명·스크립트명에 오류가 있음. 섹션 20 참조.
+  (--dataset_dir→--data_dir, generate_casda_images.py 미존재,
+   --casda_full_dir/--casda_composed_dir 미존재 등)
 
   v5.5 벤치마크를 실행하기 위한 Colab 단계별 명령어.
   B1(FID 방법론 수정) + B2(Class 4 엣지 필터) + A6/A7/A8(견고성) 모두 반영.
@@ -760,3 +764,327 @@ v5.4 벤치마크 실행 중 발생한 Google Drive FUSE 마운트 불안정으�
   19.8 py_compile 결과
 
     run_benchmark.py, metrics.py 모두 py_compile 통과.
+
+
+================================================================================
+20. [정정] v5.5 Colab 실행 가이드 (섹션 14 대체)
+================================================================================
+
+  섹션 14의 가이드에 다음 오류가 있어 전면 재작성:
+    (1) Step 2: --per_class_cap, --train_images, --train_csv 누락
+    (2) Step 3: --dataset_dir → --data_dir (잘못된 인자명)
+    (3) Step 4: generate_casda_images.py (미존재) →
+        test_controlnet.py + package_casda_data.py + compose_casda_images.py
+    (4) Step 5: --casda_full_dir, --casda_composed_dir (미존재) → --casda-dir
+    (5) Step 6: FID 결과 키 변경 (fid_roi + fid_composed)
+
+  v5.5 변경 사항:
+    - 섹션 18: FID 성능 최적화 (O1+O2+O3)
+    - 섹션 19: FID 비교 대상 수정 (fid_roi + fid_composed)
+    - 섹션 17: 코드 품질 개선 (A6/A7/A8, B1, B2 포함)
+
+  ──────────────────────────────────────────────────────────
+  20.0 환경 변수 설정 (Colab 셀 상단에서 1회 실행)
+  ──────────────────────────────────────────────────────────
+
+    DRIVE="/content/drive/MyDrive/data/Severstal"
+    PROJ="/content/severstal_project"       # git clone 또는 Drive 내 프로젝트 경로
+    VER="v5.5"
+
+    # 공통 데이터 경로
+    TRAIN_IMAGES="${DRIVE}/train_images"
+    TRAIN_CSV="${DRIVE}/train.csv"
+    ROI_DIR="${DRIVE}/roi_patches_v5.1"
+    ROI_META="${ROI_DIR}/roi_metadata.csv"
+
+    # v5.5 출력 경로
+    CTRLNET_DATA="${DRIVE}/controlnet_dataset_${VER}"
+    CTRLNET_MODEL="${DRIVE}/controlnet_training_${VER}"
+    TEST_RESULTS="${DRIVE}/test_results_${VER}"
+    AUGMENTED="${DRIVE}/augmented_dataset_${VER}"
+
+    # 벤치마크 경로
+    SPLIT_CSV="${DRIVE}/casda/splits/split_70_15_15_seed42.csv"
+    YOLO_DIR="/content/yolo_datasets"
+    BENCHMARK_OUT="${DRIVE}/casda/${VER}"
+
+  ──────────────────────────────────────────────────────────
+  20.1 Step 0: 코드 업데이트
+  ──────────────────────────────────────────────────────────
+
+    %cd ${PROJ}
+    !git pull origin main
+
+    # 또는 수동 업로드 시:
+    #   src/training/metrics.py
+    #   scripts/run_benchmark.py
+    #   configs/benchmark_experiment.yaml
+    # 이 3개 파일이 v5.5 최신인지 확인
+
+  ──────────────────────────────────────────────────────────
+  20.2 Step 1: ROI 추출 (이전에 완료했다면 건너뜀)
+  ──────────────────────────────────────────────────────────
+
+    # v5.1에서 이미 roi_patches_v5.1/ 생성했다면 건너뜀
+    # 처음이라면:
+    !python scripts/extract_rois.py \
+      --image_dir ${TRAIN_IMAGES} \
+      --train_csv ${TRAIN_CSV} \
+      --output_dir ${ROI_DIR} \
+      --roi_size 256
+
+    확인: ${ROI_DIR}/roi_metadata.csv 존재, ~2,000+ 행
+
+  ──────────────────────────────────────────────────────────
+  20.3 Step 2: ControlNet 데이터 준비 (B2 엣지 필터 적용)
+  ──────────────────────────────────────────────────────────
+
+    !python scripts/prepare_controlnet_data.py \
+      --roi_metadata ${ROI_META} \
+      --train_images ${TRAIN_IMAGES} \
+      --train_csv ${TRAIN_CSV} \
+      --output_dir ${CTRLNET_DATA} \
+      --per_class_cap 1200 \
+      --rare_class_threshold 200 \
+      --class_edge_override "4:0.05,0.0"
+
+    인자 설명:
+    | 인자                   | 값             | 설명                                    |
+    |------------------------|----------------|----------------------------------------|
+    | --per_class_cap        | 1200           | 풍부한 클래스 최대 샘플 수 (v5.2+)      |
+    | --rare_class_threshold | 200            | 이하 클래스는 전수 포함 (Class 2,4 보호) |
+    | --class_edge_override  | "4:0.05,0.0"  | B2: Class 4 좌우 5%, 상하 0% 마진       |
+
+    확인 사항:
+    - packaging_summary.txt에서 Class 4 수가 477 → 700+ 로 증가했는지
+    - 로그에 "Class margin overrides: {4: {'x': 0.05, 'y': 0.0}}" 출력 확인
+    - ${CTRLNET_DATA}/train.jsonl 존재
+    - ${CTRLNET_DATA}/hints/ 디렉토리에 힌트 이미지 존재
+
+  ──────────────────────────────────────────────────────────
+  20.4 Step 3: ControlNet 학습
+  ──────────────────────────────────────────────────────────
+
+    !python scripts/train_controlnet.py \
+      --data_dir ${CTRLNET_DATA} \
+      --output_dir ${CTRLNET_MODEL} \
+      --resolution 512 \
+      --num_train_epochs 20 \
+      --learning_rate 1e-5 \
+      --train_batch_size 1 \
+      --gradient_accumulation_steps 4 \
+      --gradient_checkpointing \
+      --mixed_precision fp16 \
+      --save_fp16 \
+      --skip_save_pipeline
+
+    주요 인자:
+    | 인자                     | 값   | 설명                                   |
+    |--------------------------|------|---------------------------------------|
+    | --data_dir (⚠ 섹션14 오류) | …  | train.jsonl이 있는 데이터셋 디렉토리    |
+    | --gradient_checkpointing | flag | GPU 메모리 절약 (~40%)                  |
+    | --save_fp16              | flag | 모델 저장 크기 50% 감소                 |
+    | --skip_save_pipeline     | flag | base model 재다운로드 방식 (디스크 절약) |
+
+    예상 시간: T4 GPU 기준 ~3-4시간 (20 epochs)
+    확인: ${CTRLNET_MODEL}/best_model/ 디렉토리 존재
+
+  ──────────────────────────────────────────────────────────
+  20.5 Step 4: 합성 이미지 생성 (512x512 ROI)
+  ──────────────────────────────────────────────────────────
+
+    ⚠ 섹션 14에서 generate_casda_images.py로 기재했으나 해당 스크립트는 미존재.
+    올바른 스크립트: test_controlnet.py (batch generation 모드)
+
+    !python scripts/test_controlnet.py \
+      --model_path ${CTRLNET_MODEL}/best_model \
+      --jsonl_path ${CTRLNET_DATA}/train.jsonl \
+      --image_root ${CTRLNET_DATA} \
+      --output_dir ${TEST_RESULTS} \
+      --resolution 512 \
+      --num_inference_steps 30 \
+      --guidance_scale 7.5 \
+      --controlnet_conditioning_scale 0.7 \
+      --num_images_per_class '{"1":2,"2":10,"3":1,"4":2}'
+
+    인자 설명:
+    | 인자                        | 값            | 설명                                     |
+    |-----------------------------|---------------|------------------------------------------|
+    | --model_path                | .../best_model| 학습된 ControlNet 가중치                  |
+    | --jsonl_path                | .../train.jsonl| 전체 샘플 목록 (배치 생성)               |
+    | --num_images_per_class      | JSON          | 클래스별 생성 수 (희소 클래스 오버샘플링) |
+    | --controlnet_conditioning_scale | 0.7       | v3+ 기본값 (neon 아티팩트 방지)          |
+
+    예상 시간: T4 GPU 기준 ~1-2시간
+    확인: ${TEST_RESULTS}/generated/ 디렉토리에 512x512 PNG 존재
+
+  ──────────────────────────────────────────────────────────
+  20.6 Step 5: CASDA 데이터 패키징 (casda_full + casda_pruning)
+  ──────────────────────────────────────────────────────────
+
+    !python scripts/package_casda_data.py \
+      --generated-dir ${TEST_RESULTS}/generated \
+      --summary-json ${TEST_RESULTS}/generation_summary.json \
+      --hint-dir ${CTRLNET_DATA}/hints \
+      --output-dir ${AUGMENTED}
+
+    출력 구조:
+      ${AUGMENTED}/
+      ├── casda_full/images/       (512x512, 전체)
+      ├── casda_full/masks/
+      ├── casda_full/metadata.json
+      ├── casda_pruning/images/    (suitability ≥ 0.63 필터)
+      ├── casda_pruning/masks/
+      ├── casda_pruning/metadata.json
+      └── packaging_report.json
+
+    확인: casda_full/metadata.json에 class_id(0-based) 존재
+
+  ──────────────────────────────────────────────────────────
+  20.7 Step 6: Poisson Blending 합성 (casda_composed)
+  ──────────────────────────────────────────────────────────
+
+    !python scripts/compose_casda_images.py \
+      --generated-dir ${TEST_RESULTS}/generated \
+      --hint-dir ${CTRLNET_DATA}/hints \
+      --metadata-csv ${CTRLNET_DATA}/packaged_roi_metadata.csv \
+      --summary-json ${TEST_RESULTS}/generation_summary.json \
+      --clean-images-dir ${TRAIN_IMAGES} \
+      --train-csv ${TRAIN_CSV} \
+      --output-dir ${AUGMENTED}/casda_composed \
+      --dilation-px 8 \
+      --blend-mode NORMAL_CLONE \
+      --jitter-range 100 \
+      --smooth-mask \
+      --brightness-tolerance 30.0
+
+    출력 구조:
+      ${AUGMENTED}/casda_composed/
+      ├── images/    (1600x256, Poisson Blending 합성)
+      ├── masks/
+      └── metadata.json
+
+    확인: casda_composed/images/ 에 1600x256 PNG 존재
+
+  ──────────────────────────────────────────────────────────
+  20.8 Step 7: 벤치마크 실행 (FID + 모델 학습)
+  ──────────────────────────────────────────────────────────
+
+    ⚠ 섹션 14에서 --casda_full_dir, --casda_composed_dir 로 기재했으나
+    이 인자들은 존재하지 않음. 올바른 인자: --casda-dir (상위 디렉토리)
+
+    # (A) FID만 빠르게 확인 (모델 학습 없이)
+    !python scripts/run_benchmark.py \
+      --config ${PROJ}/configs/benchmark_experiment.yaml \
+      --data-dir ${TRAIN_IMAGES} \
+      --csv ${TRAIN_CSV} \
+      --casda-dir ${AUGMENTED} \
+      --split-csv ${SPLIT_CSV} \
+      --output-dir ${BENCHMARK_OUT}/fid_check \
+      --fid-only
+
+    # (B) 전체 벤치마크 (3 models x groups)
+    !python scripts/run_benchmark.py \
+      --config ${PROJ}/configs/benchmark_experiment.yaml \
+      --data-dir ${TRAIN_IMAGES} \
+      --csv ${TRAIN_CSV} \
+      --casda-dir ${AUGMENTED} \
+      --split-csv ${SPLIT_CSV} \
+      --yolo-dir ${YOLO_DIR} \
+      --output-dir ${BENCHMARK_OUT}/full
+
+    # (C) Ratio 실험 (10%, 20%, 30%)
+    !python scripts/run_benchmark.py \
+      --config ${PROJ}/configs/benchmark_experiment.yaml \
+      --data-dir ${TRAIN_IMAGES} \
+      --csv ${TRAIN_CSV} \
+      --casda-dir ${AUGMENTED} \
+      --split-csv ${SPLIT_CSV} \
+      --yolo-dir ${YOLO_DIR} \
+      --output-dir ${BENCHMARK_OUT}/ratio \
+      --casda-ratio 0.1 0.2 0.3 \
+      --casda-ratio-source composed
+
+    --casda-dir 자동 동작:
+    | 설정                | 자동 값                                    |
+    |---------------------|--------------------------------------------|
+    | casda.full_dir      | ${AUGMENTED}/casda_full                    |
+    | casda.pruning_dir   | ${AUGMENTED}/casda_pruning                 |
+    | casda.composed_dir  | ${AUGMENTED}/casda_composed                |
+    | roi_metadata_csv    | ${AUGMENTED}/../roi_patches*/roi_metadata.csv (자동 탐색) |
+
+    ※ roi_metadata_csv 자동 탐색:
+      --casda-dir의 상위 디렉토리에서 다음 순서로 탐색:
+        (1) roi_patches/roi_metadata.csv
+        (2) roi_patches_v5.1/roi_metadata.csv
+        (3) roi_patches_v5/roi_metadata.csv
+      위 경로에서 환경 변수 기준:
+        ${DRIVE}/roi_patches_v5.1/roi_metadata.csv → 자동 발견됨 ✓
+      발견되면 fid_roi 계산 가능. 미발견 시 fid_roi 건너뜀 (경고).
+
+  ──────────────────────────────────────────────────────────
+  20.9 Step 8: 결과 확인
+  ──────────────────────────────────────────────────────────
+
+    # FID 결과 (v5.5 새 형식)
+    !cat ${BENCHMARK_OUT}/fid_check/*/fid_results.json
+
+    기대 출력 형식 (v5.5):
+    {
+      "fid_roi_overall": 85.xx,       ← 신규: ControlNet 생성 품질
+      "fid_composed_overall": 14x.xx, ← 신규: Poisson Blending 최종 품질
+      "fid_overall": 14x.xx,          ← 하위 호환 (= fid_composed_overall)
+      "Class1_FID_roi": ...,          ← 클래스별 ROI FID
+      "Class2_FID_roi": ...,
+      "Class3_FID_roi": ...,
+      "Class4_FID_roi": ...,
+      "Class1_FID_composed": ...,     ← 클래스별 composed FID
+      "Class2_FID_composed": ...,
+      "Class3_FID_composed": ...,
+      "Class4_FID_composed": ...
+    }
+
+    핵심 확인 지표:
+    | 메트릭               | v5.4 참고값 | v5.5 기대      | 비고                        |
+    |----------------------|------------|-----------------|----------------------------|
+    | fid_composed_overall | 150.29     | ≤150 (유지/개선) | 비교 대상 수정으로 변동 가능 |
+    | fid_roi_overall      | (없었음)   | 80~120 (신규)    | ROI끼리 비교하므로 더 낮을 것 |
+    | Class4_FID_composed  | 235.39     | <200 (개선)      | B2 엣지 필터 효과 확인       |
+    | Class4_FID_roi       | (없었음)   | <150 (신규)      | ControlNet 생성 품질 직접 측정 |
+
+    # 벤치마크 전체 결과
+    !cat ${BENCHMARK_OUT}/full/*/benchmark_results.json
+
+    # 로컬로 복사할 파일들:
+    #   - fid_results.json
+    #   - benchmark_results.json
+    #   - benchmark.log
+    #   - config.yaml (자동 저장됨)
+
+  ──────────────────────────────────────────────────────────
+  20.10 v5.4 대비 변경 요약
+  ──────────────────────────────────────────────────────────
+
+    | 항목          | v5.4                           | v5.5                                  |
+    |---------------|--------------------------------|---------------------------------------|
+    | FID 비교 대상  | 1600x256 vs 512x512 (잘못됨)   | fid_roi + fid_composed (올바름)       |
+    | FID 성능      | ~60분                           | ~6-10분 (O1+O2+O3)                   |
+    | FID 캐시      | 없음                            | 디스크 캐시 (.npy, 재실행 즉시)       |
+    | Class 4 엣지  | 기본 마진 (477개)               | 완화 마진 "4:0.05,0.0" (700+개 기대)  |
+    | per-class FID | 혼합 real 이미지                | 클래스별 real 이미지 분리              |
+    | 결과 키       | fid_overall, ClassN_FID         | fid_roi_overall, fid_composed_overall |
+
+  ──────────────────────────────────────────────────────────
+  20.11 빠른 참조: 섹션 14 vs 섹션 20 정오표
+  ──────────────────────────────────────────────────────────
+
+    | 섹션 14 (오류)                          | 섹션 20 (정정)                                   |
+    |----------------------------------------|--------------------------------------------------|
+    | --dataset_dir data/controlnet_dataset… | --data_dir ${CTRLNET_DATA}                       |
+    | generate_casda_images.py               | test_controlnet.py + package_casda_data.py       |
+    |   + compose_casda_images.py (2개 합쳐짐)| + compose_casda_images.py (3개 순차)             |
+    | --casda_full_dir outputs/…             | --casda-dir ${AUGMENTED} (상위 디렉토리 1개)     |
+    | --casda_composed_dir outputs/…         | (위와 동일, 자동 해석)                            |
+    | --per_class_cap 누락                   | --per_class_cap 1200 --rare_class_threshold 200  |
+    | --train_images 누락                    | --train_images ${TRAIN_IMAGES}                   |
+    | fid_overall만 확인                     | fid_roi_overall + fid_composed_overall           |

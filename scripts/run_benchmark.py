@@ -1508,10 +1508,30 @@ Examples:
     # --groups 미지정 + --casda-ratio 지정 시: ratio 그룹만 실행
     # --groups 지정 + --casda-ratio 지정 시: 기존 그룹 + ratio 그룹 병행
     casda_ratio_map = {}  # group_key → (ratio, max_samples)
+
+    # YAML casda_ratio 프리셋 지원: CLI --casda-ratio 미지정 시 YAML에서 읽기
+    # CLI가 지정되면 YAML 프리셋은 무시됨 (CLI 우선)
+    yaml_ratio_cfg = config.get('casda_ratio', {})
+    if args.casda_ratio is None and yaml_ratio_cfg.get('enabled', False):
+        args.casda_ratio = yaml_ratio_cfg.get('ratios', [])
+        yaml_source = yaml_ratio_cfg.get('source', 'full')
+        if getattr(args, 'casda_ratio_source', 'full') == 'full':
+            # CLI --casda-ratio-source가 기본값이면 YAML 소스로 override
+            args.casda_ratio_source = yaml_source
+        yaml_include_baseline = yaml_ratio_cfg.get('include_baseline', True)
+        logging.info(f"Using YAML casda_ratio presets: ratios={args.casda_ratio}, "
+                     f"source={args.casda_ratio_source}, include_baseline={yaml_include_baseline}")
+
     if args.casda_ratio:
-        # --groups가 없으면 ratio 그룹만 실행하도록 기존 그룹 비우기
+        # --groups가 없으면 baseline_raw + ratio 그룹만 실행
+        # baseline_raw를 자동 포함하여 비교 기준선 확보
         if args.groups is None:
-            group_keys = []
+            include_baseline = yaml_ratio_cfg.get('include_baseline', True)
+            if include_baseline and 'baseline_raw' in available_groups:
+                group_keys = ['baseline_raw']
+                logging.info("  Auto-including baseline_raw for ratio comparison")
+            else:
+                group_keys = []
 
         # ratio 소스 결정
         ratio_source = getattr(args, 'casda_ratio_source', 'full')
@@ -1563,8 +1583,9 @@ Examples:
     logging.info(f"Dataset groups: {group_keys}")
     if args.groups:
         logging.info(f"  (resolved from CLI: {args.groups})")
-    if args.casda_ratio:
-        logging.info(f"  (casda-ratio groups added: {list(casda_ratio_map.keys())})")
+    if casda_ratio_map:
+        ratio_source_info = "CLI" if not yaml_ratio_cfg.get('enabled', False) else "YAML preset"
+        logging.info(f"  (casda-ratio groups [{ratio_source_info}]: {list(casda_ratio_map.keys())})")
     logging.info(f"Total experiments: {len(model_keys) * len(group_keys)}")
 
     # Log training pipeline info

@@ -1,0 +1,321 @@
+20260306 작업 일지 #8 - P3: CASDA 비율별 실험 지원 완성 + v5.4(2) 분석 정리
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+CASDA 합성 데이터의 최적 주입 비율을 탐색하기 위한 P3 (비율별 실험) 기능을
+완성한다. 기존 CLI 기반 casda_ratio 구현을 검증하고, 누락된 기능/편의성을
+보완하며, 실행 가이드를 작성한다.
+
+  우선순위 맥락:
+  - P0 (EB-YOLOv8+CASDA), P1 (Class2 품질), P2 (Pruning threshold)는
+    v5.5 결과를 본 후 진행
+  - P3은 v5.5 실행 시 바로 사용해야 하므로 선행 작성
+
+
+2. v5.4(2) 실험 결과 분석 요약 (이전 세션에서 완료)
+================================================================================
+
+  2.1 실험 구성
+
+    데이터: augmented_dataset_v5.3 합성 데이터 사용
+    모델: YOLO-MFD (detection)
+    Test set: 1,000장
+
+  2.2 핵심 결과
+
+    | 구성                           | mAP@0.5 | vs Baseline | 판정       |
+    |--------------------------------|---------|-------------|------------|
+    | Baseline (Raw)                 | 0.5546  | —           | 기준선     |
+    | CASDA-Composed (전체, 4049장)  | 0.5299  | -2.5%p      | 악화       |
+    | CASDA-Ratio-30% (1999장)       | 0.5650  | +1.0%p      | 소폭 개선  |
+
+  2.3 클래스별 AP
+
+    | 클래스  | Baseline | Composed | Ratio-30% | 비고                    |
+    |---------|----------|----------|-----------|-------------------------|
+    | Class1  | 0.5576   | 0.5530   | 0.5488    | 유사                    |
+    | Class2  | 0.4525   | 0.4050   | 0.4578    | Composed에서 -4.8%p 폭락|
+    | Class3  | 0.6319   | 0.6316   | 0.5990    | 유사 / Ratio에서 소폭 감|
+    | Class4  | 0.5764   | 0.5299   | 0.6074    | Ratio에서 +3.1%p 개선   |
+
+  2.4 Val vs Test 괴리 (일반화 분석)
+
+    | 구성       | Val mAP | Test mAP | Gap     | 해석                |
+    |------------|---------|----------|---------|---------------------|
+    | Baseline   | 0.6154  | 0.5546   | -6.1%p  | 보통                |
+    | Composed   | 0.5919  | 0.5299   | -6.2%p  | 과적합 (best=ep63)  |
+    | Ratio-30%  | 0.5895  | 0.5650   | -2.5%p  | 일반화 최선         |
+
+  2.5 핵심 인사이트
+
+    (1) CASDA 전체 주입은 해로움 → 노이즈가 시그널을 압도
+    (2) 30% 비율 제한이 mAP +1.0%p, val-test gap 최소화
+    (3) Class2 (최소 클래스, 247장)가 가장 취약 → P1의 근거
+    (4) 최적 비율 탐색 (10%, 20%, 30%, 50%)이 필수 → P3의 근거
+
+  2.6 Baseline 모델 비교
+
+    | 모델         | 메트릭    | 값     |
+    |--------------|-----------|--------|
+    | YOLO-MFD     | mAP@0.5   | 0.5546 |
+    | EB-YOLOv8    | mAP@0.5   | 0.5819 |
+    | DeepLabV3+   | Dice Mean | 0.6290 |
+
+
+3. P3 기존 구현 분석 결과
+================================================================================
+
+  3.1 이미 구현된 기능 (변경 불필요)
+
+    (a) CLI 인자
+        --casda-ratio: float nargs='+', 복수 비율 지정 가능
+        --casda-ratio-source: full | composed (기본: full)
+
+    (b) 동적 그룹 생성
+        casda_ratio_{pct} 키로 자동 생성 (예: casda_ratio_10)
+        max_samples = int(num_train * ratio / (1 - ratio))
+
+    (c) YOLO injection path
+        inject_casda_to_baseline(max_samples=...) →
+        _add_casda_to_training(pruning_top_k=max_samples, threshold=0.0) →
+        suitability 내림차순 정렬 후 top-k 선택
+
+    (d) Segmentation path
+        _casda_max_samples key → CASDASyntheticDataset(max_samples=...) →
+        _load_metadata에서 suitability 내림차순 정렬 후 max_samples 선택
+
+    (e) 결과 수집
+        ratio 그룹은 기존 그룹과 동일하게 benchmark_results.json,
+        benchmark_comparison.csv에 자동 포함 (특별한 처리 없음)
+
+    (f) 그룹 간 정리
+        각 그룹 실행 후 clean_casda_from_baseline() 호출
+        casda_injected 플래그가 그룹 루프 상단에서 매번 초기화
+        → 그룹 간 오염 없음 (안전)
+
+  3.2 발견된 개선점
+
+    (a) baseline_raw 미포함 문제 (Critical)
+        --casda-ratio만 지정하면 --groups=None이 되어 ratio 그룹만 실행
+        → 비교 기준인 baseline_raw가 누락되어 결과 해석 불가
+
+    (b) YAML 프리셋 미지원 (Convenience)
+        CLI 전용이라 매번 --casda-ratio 0.1 0.2 0.3 0.5 타이핑 필요
+        YAML에 프리셋을 두면 편의성 향상
+
+    (c) 가설 검정 미비 (Analysis)
+        H1-H5에 ratio 관련 가설 없음
+        최적 비율 탐색을 위한 H6 필요
+
+  3.3 예상 max_samples (train=4,666장 기준)
+
+    | 비율 | max_samples | 총 학습 데이터 | 비고             |
+    |------|-------------|----------------|------------------|
+    | 10%  | 518         | 5,184          | 보수적           |
+    | 20%  | 1,166       | 5,832          | 중간             |
+    | 30%  | 1,999       | 6,665          | v5.4(2) 최선     |
+    | 50%  | 4,666       | 9,332          | 공격적 (1:1)     |
+
+
+4. 코드 수정 내역
+================================================================================
+
+  변경 파일: 2개
+
+  4.1 scripts/run_benchmark.py — 3가지 개선
+
+    (a) baseline_raw 자동 포함 (L1528-1534)
+        --casda-ratio 지정 + --groups 미지정 시:
+        기존: group_keys = []  (ratio 그룹만)
+        변경: group_keys = ['baseline_raw']  (비교 기준선 포함)
+        include_baseline 설정으로 제어 가능
+
+    (b) YAML casda_ratio 프리셋 지원 (L1512-1523)
+        CLI --casda-ratio 미지정 시 YAML casda_ratio 섹션에서 읽기:
+        - casda_ratio.enabled: true → 자동 활성화
+        - casda_ratio.ratios: [0.10, 0.20, 0.30, 0.50]
+        - casda_ratio.source: "composed" | "full"
+        - casda_ratio.include_baseline: true
+        CLI 지정 시 YAML 프리셋 무시 (CLI 우선)
+
+    (c) 로깅 개선 (L1586-1588)
+        ratio 그룹 소스 표시 (CLI vs YAML preset)
+
+  4.2 configs/benchmark_experiment.yaml — 2가지 추가
+
+    (a) casda_ratio 프리셋 섹션 (L186-196)
+        enabled: false (기본 비활성, 명시적 활성화 필요)
+        source: "composed" (v5.4(2) 실험에서 composed가 실용적)
+        ratios: [0.10, 0.20, 0.30, 0.50]
+        include_baseline: true
+
+    (b) H6 가설 검정 추가 (L229-233)
+        "Optimal CASDA ratio exists (non-monotonic)"
+        5개 그룹 비교: casda_ratio_10/20/30/50 + baseline_raw
+        analysis: "find_optimal" (최적 비율 탐색)
+
+
+5. 하위 호환성 검증
+================================================================================
+
+    | 변경 사항              | 기존 동작              | 변경 후 동작            |
+    |------------------------|------------------------|-------------------------|
+    | YAML casda_ratio 없음  | 영향 없음              | config.get → {} → 패스  |
+    | YAML enabled: false    | 영향 없음              | if False → 패스         |
+    | CLI --casda-ratio 지정 | ratio 그룹만 실행      | baseline_raw 자동 포함  |
+    | --groups all + ratio   | all + ratio            | 동일 (변경 없음)        |
+    | --groups baseline + r  | baseline + ratio       | 동일 (변경 없음)        |
+    | H6 가설 (ratio 미실행) | —                      | ratio 그룹 없으면 스킵  |
+
+  ※ baseline_raw 자동 포함은 기존 대비 동작 변경이지만,
+    기존 동작이 "비교 기준선 없이 ratio만 실행"으로 사실상 버그에 가까움.
+    include_baseline: false로 기존 동작 복원 가능.
+
+
+6. Colab 실행 가이드 — CASDA 비율별 실험
+================================================================================
+
+  6.1 방법 A: CLI 직접 지정 (일회성)
+
+    python scripts/run_benchmark.py \
+      --config configs/benchmark_experiment.yaml \
+      --models yolo_mfd \
+      --casda-dir ${AUGMENTED} \
+      --yolo-dir ${YOLO_DATA} \
+      --casda-ratio 0.1 0.2 0.3 0.5 \
+      --casda-ratio-source composed \
+      --output-dir ${BENCHMARK_OUT}/ratio
+
+    → 실행되는 그룹: baseline_raw, casda_ratio_10, casda_ratio_20,
+                      casda_ratio_30, casda_ratio_50
+    → 총 실험: 1 model × 5 groups = 5 runs
+
+  6.2 방법 B: YAML 프리셋 활용 (반복 실행)
+
+    # YAML에서 casda_ratio.enabled를 true로 변경:
+    import yaml
+    with open('configs/benchmark_experiment.yaml') as f:
+        cfg = yaml.safe_load(f)
+    cfg['casda_ratio']['enabled'] = True
+    with open('configs/benchmark_experiment.yaml', 'w') as f:
+        yaml.dump(cfg, f, default_flow_style=False)
+
+    # 실행 (--casda-ratio 불필요):
+    python scripts/run_benchmark.py \
+      --config configs/benchmark_experiment.yaml \
+      --models yolo_mfd \
+      --casda-dir ${AUGMENTED} \
+      --yolo-dir ${YOLO_DATA} \
+      --output-dir ${BENCHMARK_OUT}/ratio
+
+  6.3 방법 C: 특정 비율만 실행 (디버깅)
+
+    python scripts/run_benchmark.py \
+      --config configs/benchmark_experiment.yaml \
+      --models yolo_mfd \
+      --casda-dir ${AUGMENTED} \
+      --yolo-dir ${YOLO_DATA} \
+      --casda-ratio 0.3 \
+      --casda-ratio-source composed \
+      --output-dir ${BENCHMARK_OUT}/ratio_30_only
+
+    → 실행되는 그룹: baseline_raw, casda_ratio_30
+    → 총 실험: 2 runs
+
+  6.4 기존 그룹과 병행 실행
+
+    python scripts/run_benchmark.py \
+      --config configs/benchmark_experiment.yaml \
+      --models yolo_mfd \
+      --groups baseline composed \
+      --casda-dir ${AUGMENTED} \
+      --yolo-dir ${YOLO_DATA} \
+      --casda-ratio 0.1 0.3 \
+      --output-dir ${BENCHMARK_OUT}/full
+
+    → 실행되는 그룹: baseline_raw, casda_composed, casda_ratio_10, casda_ratio_30
+    → 총 실험: 4 runs
+
+  6.5 예상 실행 시간 (T4 GPU 기준)
+
+    | 그룹             | YOLO-MFD 예상 | 비고                  |
+    |------------------|---------------|-----------------------|
+    | baseline_raw     | ~2.5h         | 4,666장               |
+    | casda_ratio_10   | ~2.7h         | 5,184장               |
+    | casda_ratio_20   | ~3.0h         | 5,832장               |
+    | casda_ratio_30   | ~3.3h         | 6,665장               |
+    | casda_ratio_50   | ~4.0h         | 9,332장               |
+    | 합계 (5 groups)  | ~15.5h        | early stopping 적용   |
+
+    ※ Colab Pro T4 기준. 실제 early stopping으로 단축 가능.
+    ※ 모든 모델 3종 실행 시: ~15.5h × 2 (detection) + ~10h (seg) ≈ ~40h
+
+  6.6 결과 확인
+
+    # 비교 테이블 (자동 생성)
+    cat ${BENCHMARK_OUT}/ratio/benchmark_comparison.csv
+
+    # JSON 결과
+    cat ${BENCHMARK_OUT}/ratio/benchmark_results.json
+
+    # 가설 검정 (H6: 최적 비율)
+    cat ${BENCHMARK_OUT}/ratio/hypothesis_results.json
+
+    # 기대되는 결과 형태:
+    #   Model       | Dataset          | mAP@0.5 | ...
+    #   YOLO-MFD    | Baseline (Raw)   | 0.55xx  |
+    #   YOLO-MFD    | CASDA-Ratio-10%  | 0.5xxx  |
+    #   YOLO-MFD    | CASDA-Ratio-20%  | 0.5xxx  |
+    #   YOLO-MFD    | CASDA-Ratio-30%  | 0.56xx  | ← v5.4(2)에서 최선
+    #   YOLO-MFD    | CASDA-Ratio-50%  | 0.5xxx  |
+
+
+7. 검증
+================================================================================
+
+  7.1 py_compile
+
+    python -m py_compile scripts/run_benchmark.py  → OK
+
+  7.2 YAML 문법
+
+    configs/benchmark_experiment.yaml — 수동 검증 완료 (YAML lint)
+
+  7.3 하위 호환성 시나리오
+
+    | 시나리오                                | 기대 동작                       | 확인 |
+    |-----------------------------------------|---------------------------------|------|
+    | --casda-ratio 없음, YAML enabled=false  | 기존과 동일                     | O    |
+    | --casda-ratio 0.3                       | baseline_raw + ratio_30         | O    |
+    | --casda-ratio 0.1 0.3 --groups baseline | baseline_raw + ratio_10/30      | O    |
+    | --groups all --casda-ratio 0.3          | all 그룹 + ratio_30             | O    |
+    | YAML enabled=true, CLI 없음             | baseline_raw + ratio_10/20/30/50| O    |
+    | YAML enabled=true, CLI --casda-ratio 0.3| CLI 우선: baseline + ratio_30   | O    |
+
+
+8. 다음 단계 (미완료)
+================================================================================
+
+  8.1 v5.5 벤치마크 실행 (Colab)
+      - 섹션 20 가이드 따라 전체 파이프라인 실행
+      - FID 이중 메트릭 (roi + composed) 결과 확인
+
+  8.2 P3 ratio 실험 실행 (Colab)
+      - 방법 A 또는 B로 4개 비율 실험
+      - 최적 비율 탐색
+
+  8.3 결과 분석 후 결정
+      - P0: EB-YOLOv8 + CASDA (ratio 적용)
+      - P1: Class2 품질 개선 (FID, 합성 전략 변경)
+      - P2: Pruning threshold 조정 (FID roi 결과 기반)
+
+
+9. 변경 파일 요약
+================================================================================
+
+    | 파일                                  | 변경 유형 | 주요 내용                      |
+    |---------------------------------------|-----------|--------------------------------|
+    | scripts/run_benchmark.py              | 수정      | YAML 프리셋, baseline 자동 포함 |
+    | configs/benchmark_experiment.yaml     | 수정      | casda_ratio 섹션, H6 가설 추가  |
+    | docs/20260306.docs                    | 신규      | P3 작업 일지 + 실행 가이드       |

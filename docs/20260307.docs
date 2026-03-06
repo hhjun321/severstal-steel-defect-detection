@@ -1,0 +1,193 @@
+20260307 작업 일지 #9 - FID 평가 코드 분리: run_benchmark.py → run_fid.py
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+run_benchmark.py에서 FID 평가 관련 코드(~745줄, 전체의 34%)를 독립 스크립트
+scripts/run_fid.py로 분리하여 단일 책임 원칙(SRP)을 적용한다.
+
+  설계 제약:
+  - 하위 호환성 유지: --fid-only 플래그는 deprecated 경고와 함께 동작 유지
+  - 공통 코드: scripts/utils.py 공유 모듈로 추출
+  - Config: 기존 benchmark_experiment.yaml을 양쪽에서 공유
+  - 셸 스크립트: 불필요 (사용자가 각각 직접 실행)
+
+
+2. 결합도 분석 결과
+================================================================================
+
+  2.1 FID ↔ Benchmark 의존성 분석
+
+    run_fid_evaluation()은 벤치마크에 제로 의존성:
+    - 입력: config dict + experiment_dir + device (3개만)
+    - 출력: fid_results dict (벤치마크 학습 루프가 전혀 사용하지 않음)
+    - 즉, dead-end assignment — 완전 분리 가능
+
+  2.2 코드 비중
+
+    | 영역        | 줄 수  | 비율 |
+    |-------------|--------|------|
+    | FID 관련    | ~745줄 | 34%  |
+    | 벤치마크    | ~1,306 | 60%  |
+    | 공통/기타   | ~117   | 6%   |
+
+  2.3 import 정리
+
+    | 모듈          | 사용처           | 조치                        |
+    |---------------|------------------|-----------------------------|
+    | re            | FID 전용         | run_benchmark.py에서 제거   |
+    | FIDCalculator | FID 전용         | run_benchmark.py에서 제거   |
+    | pandas (pd)   | 양쪽 (L199 등)  | run_benchmark.py에서 유지   |
+
+
+3. 생성/수정 파일 상세
+================================================================================
+
+  3.1 scripts/utils.py (신규 생성, 94줄)
+
+    벤치마크 + FID 양쪽에서 공유하는 유틸리티 함수 4개:
+
+    | 함수                  | 역할                                      |
+    |-----------------------|-------------------------------------------|
+    | setup_project_root()  | PROJECT_ROOT 결정 + sys.path 추가         |
+    | load_config()         | YAML config 로드 + 존재 검증              |
+    | remove_empty_classes()| real/gen 이미지 부족 클래스 제거 (in-place)|
+    | sample_images()       | max_images 이하로 seeded 랜덤 샘플링      |
+
+  3.2 scripts/run_fid.py (신규 생성, 939줄)
+
+    run_benchmark.py L770-1513에서 추출한 FID 전용 독립 스크립트.
+
+    헬퍼 함수 12개:
+    | 함수                              | 역할                              |
+    |-----------------------------------|-----------------------------------|
+    | _collect_images_from_dir()        | 디렉토리 이미지 수집 (중복 제거)  |
+    | _group_gen_images_by_class()      | 생성 이미지 class별 그룹화        |
+    | _group_gen_images_by_filename()   | 파일명 기반 그룹화                |
+    | _parse_sample_name()              | 파일명 파싱 (class, subtype 등)   |
+    | _build_roi_lookup_from_metadata() | ROI 메타데이터 lookup 구축        |
+    | _group_images_by_dimension()      | 차원별 이미지 그룹화              |
+    | _group_real_roi_by_dimension()    | Real ROI 차원별 그룹화            |
+    | _group_synthetic_by_cross_dimension() | 합성 교차차원 그룹화          |
+    | _compute_granular_fid()           | 세분화 FID 계산                   |
+    | _build_real_by_class_from_csv()   | CSV 기반 real 클래스별 구축       |
+    | _build_real_roi_by_class_from_csv() | CSV 기반 real ROI 클래스별 구축 |
+
+    메인 함수:
+    | 함수                 | 역할                                       |
+    |----------------------|--------------------------------------------|
+    | run_fid_evaluation() | FID-ROI + FID-Composed 전체 파이프라인      |
+    | main()               | CLI argparse + config 로드 + 실행           |
+
+    CLI 인자:
+    | 인자           | 설명                                    | 기본값   |
+    |----------------|-----------------------------------------|----------|
+    | --config       | YAML config 경로 (필수)                 | -        |
+    | --data-dir     | train_images 경로 (CLI 오버라이드)      | None     |
+    | --csv          | train.csv 경로 (CLI 오버라이드)         | None     |
+    | --casda-dir    | casda_composed 디렉토리 (CLI 오버라이드)| None     |
+    | --casda-roi-dir| generated ROI 디렉토리 (CLI 오버라이드) | None     |
+    | --output-dir   | 결과 저장 디렉토리                      | None     |
+    | --device       | cuda / cpu                              | cuda     |
+    | --fid-mode     | roi / composed / all                    | all      |
+
+  3.3 scripts/run_benchmark.py (수정, 2168줄 → 1462줄)
+
+    변경 사항:
+    (a) import re 제거 (FID 전용)
+    (b) FIDCalculator import 제거 (FID 전용)
+    (c) FID 코드 블록 전체 제거 (L767-1512, ~745줄)
+    (d) _run_fid_deprecated_wrapper() 추가 (L775-798)
+        - scripts.run_fid.run_fid_evaluation을 lazy import하여 위임
+        - ImportError 시 에러 로그 + 빈 dict 반환
+    (e) main()의 FID 호출부를 deprecated wrapper로 교체
+    (f) --fid-only 사용 시 deprecated 경고 + run_fid.py 안내 출력
+    (g) docstring 업데이트: --fid-only 제거, run_fid.py 안내 추가
+    (h) --fid-only help 텍스트에 "[DEPRECATED]" 표시
+
+
+4. import 순서 문제 발견 및 수정
+================================================================================
+
+  4.1 문제
+
+    run_fid.py 초기 버전:
+      from scripts.utils import setup_project_root  # ← scripts 패키지 필요
+      PROJECT_ROOT = setup_project_root()            # ← sys.path 추가
+
+    scripts/__init__.py가 없으므로 `from scripts.utils import ...`가
+    프로젝트 루트가 sys.path에 없으면 실패 → 순환 의존.
+
+    python scripts/run_fid.py 실행 시 sys.path[0]은 scripts/ 디렉토리이므로
+    scripts.utils를 패키지 import로 해결할 수 없음.
+
+  4.2 수정
+
+    run_benchmark.py와 동일한 인라인 패턴으로 변경:
+
+      PROJECT_ROOT = Path(__file__).resolve().parent.parent
+      if str(PROJECT_ROOT) not in sys.path:
+          sys.path.insert(0, str(PROJECT_ROOT))
+
+      from scripts.utils import load_config, remove_empty_classes, sample_images
+      from src.training.metrics import FIDCalculator
+
+    setup_project_root() import 제거 → utils.py에 정의만 남음 (미래 스크립트용)
+
+
+5. 검증 결과
+================================================================================
+
+  5.1 py_compile
+
+    | 파일                    | 결과 |
+    |-------------------------|------|
+    | scripts/utils.py        | PASS |
+    | scripts/run_fid.py      | PASS |
+    | scripts/run_benchmark.py| PASS |
+
+  5.2 줄 수 비교
+
+    | 파일                     | 수정 전 | 수정 후 | 변화  |
+    |--------------------------|---------|---------|-------|
+    | scripts/run_benchmark.py | 2,168   | 1,462   | -706  |
+    | scripts/run_fid.py       | (신규)  | 939     | +939  |
+    | scripts/utils.py         | (신규)  | 94      | +94   |
+    | 합계                     | 2,168   | 2,495   | +327  |
+
+    327줄 증가는 run_fid.py의 독립 CLI (argparse + main) + docstring +
+    deprecated wrapper 코드에 의한 것으로, 분리에 따른 정상적 overhead.
+
+  5.3 FID 함수 완전 이전 확인
+
+    run_benchmark.py에서 FID 관련 함수 12개 모두 제거 확인:
+    _collect_images_from_dir, _group_gen_images_by_class,
+    _group_gen_images_by_filename, _parse_sample_name,
+    _build_roi_lookup_from_metadata, _group_images_by_dimension,
+    _group_real_roi_by_dimension, _group_synthetic_by_cross_dimension,
+    _compute_granular_fid, _build_real_by_class_from_csv,
+    _build_real_roi_by_class_from_csv, run_fid_evaluation
+
+    run_benchmark.py에 남은 FID 관련 코드:
+    - _run_fid_deprecated_wrapper()만 (28줄, lazy import 위임)
+
+
+6. 남은 작업
+================================================================================
+
+  | 순번 | 작업                                          | 상태   |
+  |------|-----------------------------------------------|--------|
+  | 1    | Colab에서 run_fid.py 실행 테스트              | 미완료 |
+  | 2    | FID-ROI 세분화 결과 분석 (subtype/background) | 미완료 |
+  | 3    | P3 ratio 실험 실행 (10%, 20%, 30%, 50%)      | 미완료 |
+  | 4    | 결과 분석 후: P0, P1, P2 진행 결정            | 미완료 |
+
+
+7. 핵심 설계 결정 요약
+================================================================================
+
+  (1) 완전 분리: FID ↔ Benchmark 간 제로 의존성 확인 → 안전하게 분리
+  (2) 하위 호환: --fid-only는 deprecated wrapper로 기존 동작 유지
+  (3) 공유 config: benchmark_experiment.yaml 단일 파일 양쪽 공유
+  (4) 공유 utils: scripts/utils.py로 중복 코드 4개 함수 추출
+  (5) import 안전성: 인라인 sys.path 설정 → from scripts.utils import 순서 보장

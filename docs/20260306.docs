@@ -334,7 +334,7 @@ CASDA 합성 데이터의 최적 주입 비율을 탐색하기 위한 P3 (비율
       - P2: Pruning threshold 조정 (FID roi 결과 기반)
 
 
-9. 변경 파일 요약
+9. 변경 파일 요약 (섹션 1~8)
 ================================================================================
 
     | 파일                                  | 변경 유형 | 주요 내용                          |
@@ -345,3 +345,100 @@ CASDA 합성 데이터의 최적 주입 비율을 탐색하기 위한 P3 (비율
     | src/training/dataset.py               | 수정      | threshold fallback 0.63 → 0.0 (2곳) |
     | src/training/ultralytics_trainer.py   | 수정      | threshold fallback 0.63 → 0.0       |
     | docs/20260306.docs                    | 신규      | P3 작업 일지 + 실행 가이드           |
+
+
+10. FID-ROI 세분화 구현 — roi_dir + 3차원 독립 + 교차 FID
+================================================================================
+
+  10.1 배경
+
+    v5.5 벤치마크에서 FID-ROI가 실패 (fid_roi_overall = inf):
+    - 원인: package_casda_data.py 미사용 → casda_full/ 디렉토리 미존재
+    - test_controlnet.py 출력인 generated/ 디렉토리에 512x512 ROI PNG 존재
+    - 해결: roi_dir 키 추가하여 generated/ 경로 직접 지정
+
+    SCI 논문 수준 분석을 위해 FID-ROI 세분화 추가:
+    - class_id별 (기존) + defect_subtype별 + background_type별 + 교차
+    - roi_metadata.csv의 21개 컬럼 메타데이터 활용
+    - min_samples 필터링으로 소수 그룹 자동 스킵
+
+  10.2 v5.5 FID 결과 (세분화 전)
+
+    | 메트릭              | 값     | 비고                              |
+    |---------------------|--------|-----------------------------------|
+    | fid_composed_overall| 50.83  | 전체 이미지 비교 (1600x256)       |
+    | Class1_FID_composed | 106.86 |                                   |
+    | Class2_FID_composed | 172.44 | 최악 — 원본 247장, 합성 190장     |
+    | Class3_FID_composed | 96.49  |                                   |
+    | Class4_FID_composed | 91.47  |                                   |
+    | fid_roi_overall     | inf    | casda_full/ 미존재로 실패         |
+
+  10.3 변경 사항
+
+    A. YAML (configs/benchmark_experiment.yaml)
+       - dataset.casda.roi_dir 키 추가 (빈 문자열 = full_dir fallback)
+       - evaluation.fid.roi_granularity 섹션 추가:
+         by_defect_subtype, by_background_type, cross_class_subtype, min_samples
+
+    B. CLI (scripts/run_benchmark.py)
+       - --casda-roi-dir 인자 추가 → config dataset.casda.roi_dir override
+
+    C. 새 헬퍼 함수 (scripts/run_benchmark.py)
+       - _group_gen_images_by_filename(): 파일명에서 class_id 파싱 (metadata.json fallback)
+       - _parse_sample_name(): 파일명 → sample_name 변환
+       - _build_roi_lookup_from_metadata(): roi_metadata.csv → sample_name 룩업 테이블
+       - _group_images_by_dimension(): 합성 이미지를 지정 차원으로 그룹핑
+       - _group_real_roi_by_dimension(): real ROI를 지정 차원으로 그룹핑
+       - _group_synthetic_by_cross_dimension(): class × subtype 교차 그룹핑
+       - _compute_granular_fid(): 차원별 FID 계산 (min_samples 필터링)
+
+    D. run_fid_evaluation() 수정
+       - Synthetic ROI 경로: roi_dir 우선 → full_dir fallback
+       - per-class 그룹핑: metadata.json 우선 → 파일명 파싱 fallback
+       - 세분화 FID: overall + per-class 계산 후 granularity 분석 수행
+       - feature 캐시 재활용 (중복 추출 없음)
+
+  10.4 세분화 FID-ROI 구조 (예상 출력)
+
+    Overall FID-ROI                           (1개 값)
+    ├── Per-class FID-ROI                     (4개 값: Class 1~4)
+    ├── Per-defect_subtype FID-ROI            (최대 5개: linear_scratch, ...)
+    ├── Per-background_type FID-ROI           (최대 5개: smooth, ...)
+    └── class × defect_subtype 교차 FID-ROI   (유효 조합만, min_samples≥50)
+
+  10.5 Colab 실행 예시
+
+    python scripts/run_benchmark.py \
+      --config configs/benchmark_experiment.yaml \
+      --casda-dir /content/drive/MyDrive/data/Severstal/augmented_dataset_v5.5 \
+      --casda-roi-dir /content/drive/MyDrive/data/Severstal/augmented_images_v5.5/generated \
+      --data-dir /content/drive/MyDrive/data/Severstal/train_images \
+      --csv /content/drive/MyDrive/data/Severstal/train.csv \
+      --split-csv /content/drive/MyDrive/data/Severstal/casda/splits/split_70_15_15_seed42.csv \
+      --output-dir /content/drive/MyDrive/data/Severstal/benchmark_results_v5.5 \
+      --fid-only
+
+  10.6 하위 호환성
+
+    | 시나리오                                    | 동작                              |
+    |---------------------------------------------|-----------------------------------|
+    | --casda-roi-dir 미지정, roi_dir YAML 미설정 | 기존 동일 (full_dir → casda_full) |
+    | --casda-roi-dir /path/to/generated          | 해당 경로에서 ROI 수집            |
+    | roi_granularity 전부 false                  | 기존 per-class만 계산             |
+    | min_samples=50 미달 그룹                    | 자동 스킵 (N/A 표기)             |
+    | roi_metadata.csv 없음                       | 세분화 스킵, overall만 계산       |
+
+  10.7 검증
+
+    python -m py_compile scripts/run_benchmark.py  → OK
+    YAML 문법 검증 → OK
+
+
+11. 변경 파일 요약 (섹션 10 포함)
+================================================================================
+
+    | 파일                                  | 변경 유형 | 주요 내용                                |
+    |---------------------------------------|-----------|-------------------------------------------|
+    | scripts/run_benchmark.py              | 수정      | FID-ROI roi_dir + 세분화 (7개 새 함수)    |
+    | configs/benchmark_experiment.yaml     | 수정      | casda.roi_dir, fid.roi_granularity 섹션   |
+    | docs/20260306.docs                    | 수정      | 섹션 10~11 추가                           |

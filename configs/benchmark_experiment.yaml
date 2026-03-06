@@ -36,6 +36,9 @@ dataset:
   # CLI --casda-dir 로 override 가능 (prepare_benchmark_data.py, run_benchmark.py)
   casda:
     composed_dir: "data/augmented/casda_composed"   # Poisson Blending 합성 이미지
+    roi_dir: ""  # ControlNet 생성 ROI 디렉토리 (generated/). 비어있으면 full_dir fallback.
+                 # CLI --casda-roi-dir 로 override 가능.
+                 # 예: /content/drive/MyDrive/data/Severstal/augmented_images_v5.5/generated
     suitability_threshold: 0.0   # v5.5: compose 시 quality_score 미생성 → 전부 0.5 → top_k만으로 pruning
     pruning_top_k: 2000
 
@@ -181,6 +184,14 @@ evaluation:
     #   composed: real 전체 이미지 vs casda_composed (Poisson Blending 최종 품질)
     #   both: 두 메트릭 모두 계산
     roi_metadata_csv: ""  # roi_metadata.csv 경로 (빈 문자열이면 --casda-dir에서 자동 탐색)
+
+    # FID-ROI 세분화 설정 (SCI 논문 수준 분석)
+    # roi_metadata.csv의 defect_subtype, background_type 컬럼 활용
+    roi_granularity:
+      by_defect_subtype: true   # defect_subtype별 FID-ROI (5그룹)
+      by_background_type: true  # background_type별 FID-ROI (5그룹)
+      cross_class_subtype: true # class_id × defect_subtype 교차 FID (유효 조합만)
+      min_samples: 50           # 그룹당 최소 샘플 수 (real/syn 각각). 미달 시 스킵.
 
 # ----------------------------------------------------------------------------
 # CASDA Ratio Experiment Presets (P3)

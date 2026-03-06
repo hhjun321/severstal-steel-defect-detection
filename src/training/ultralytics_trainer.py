@@ -165,7 +165,7 @@ class UltralyticsTrainer:
                     # pruning 설정을 casda_config에 병합하여 전달
                     casda_config_dict = dict(casda_cfg)
                     casda_config_dict['suitability_threshold'] = pruning_cfg.get(
-                        'suitability_threshold', casda_cfg.get('suitability_threshold', 0.63))
+                        'suitability_threshold', casda_cfg.get('suitability_threshold', 0.0))
                     casda_config_dict['pruning_top_k'] = pruning_cfg.get(
                         'top_k', casda_cfg.get('pruning_top_k', 2000))
                     casda_config_dict['stratified'] = pruning_cfg.get('stratified', False)

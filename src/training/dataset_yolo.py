@@ -410,7 +410,7 @@ def _add_casda_to_training(
 
     # Filter by suitability for pruning mode
     if casda_mode == "pruning":
-        threshold = casda_config.get('suitability_threshold', 0.63)
+        threshold = casda_config.get('suitability_threshold', 0.0)
         top_k = casda_config.get('pruning_top_k', 2000)
         stratified = casda_config.get('stratified', False)
         all_samples = [

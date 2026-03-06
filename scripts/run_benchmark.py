@@ -38,6 +38,15 @@ FID Evaluation (분리됨):
   FID 평가는 scripts/run_fid.py로 분리되었습니다.
   python scripts/run_fid.py --config configs/benchmark_experiment.yaml
   (--fid-only 플래그는 deprecated — 위 명령어를 사용하세요)
+
+Reference Results (이전 실험 결과 참조):
+  Hypothesis Test에 필요한 비교 대상(예: baseline_raw)이 이번 실행에 포함되지 않을 때,
+  이전 실험의 benchmark_results.json을 --reference-results로 지정하면
+  해당 결과를 로드하여 Hypothesis Test에 활용합니다.
+  현재 실행 결과와 중복되는 (model, dataset) 조합은 현재 실행 우선.
+  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml \\
+      --groups casda_composed_pruning --models eb_yolov8 \\
+      --reference-results /path/to/baseline_raw/benchmark_results.json
 """
 
 import os
@@ -989,6 +998,12 @@ Examples:
                              'full: casda_full 디렉토리 (기본), '
                              'composed: casda_composed 디렉토리. '
                              '예: --casda-ratio 0.3 --casda-ratio-source composed')
+    parser.add_argument('--reference-results', type=str, nargs='+', default=None,
+                        help='이전 실험의 benchmark_results.json 경로 (복수 지정 가능). '
+                             '현재 실행에서 생성되지 않은 (model, dataset) 조합의 결과를 '
+                             '로드하여 Hypothesis Test에 활용. '
+                             '중복 조합은 현재 실행 결과 우선. '
+                             '예: --reference-results /path/to/baseline_raw/benchmark_results.json')
     args = parser.parse_args()
 
     # Load config
@@ -1446,6 +1461,49 @@ Examples:
                 result['metrics'],
                 result['model'].replace(' ', '_'),
                 result['dataset'].replace(' ', '_'),
+            )
+
+    # ====== Reference Results 병합 (Hypothesis Test용) ======
+    # 이전 실험의 benchmark_results.json을 로드하여 reporter.results에 추가.
+    # 현재 실행에서 이미 생성된 (model, dataset) 조합은 중복 추가하지 않음.
+    if args.reference_results:
+        existing_keys = {
+            (r['model'], r['dataset']) for r in reporter.results
+        }
+        ref_count = 0
+        for ref_path_str in args.reference_results:
+            ref_path = Path(ref_path_str)
+            if not ref_path.exists():
+                logging.warning(f"[Reference] 파일 없음, 건너뜀: {ref_path}")
+                continue
+            try:
+                with open(ref_path) as f:
+                    ref_data = json.load(f)
+                if not isinstance(ref_data, list):
+                    logging.warning(f"[Reference] 유효하지 않은 형식 (list 아님): {ref_path}")
+                    continue
+                for entry in ref_data:
+                    key = (entry.get('model', ''), entry.get('dataset', ''))
+                    if key in existing_keys:
+                        logging.info(
+                            f"[Reference] 중복 건너뜀: {key[0]} + {key[1]} "
+                            f"(현재 실행 결과 우선)"
+                        )
+                        continue
+                    reporter.results.append(entry)
+                    existing_keys.add(key)
+                    ref_count += 1
+                    logging.info(
+                        f"[Reference] 병합: {key[0]} + {key[1]} "
+                        f"(from {ref_path.name})"
+                    )
+            except (json.JSONDecodeError, KeyError) as e:
+                logging.error(f"[Reference] JSON 파싱 실패: {ref_path} — {e}")
+                continue
+        if ref_count > 0:
+            logging.info(
+                f"[Reference] 총 {ref_count}개 이전 결과 병합 완료 "
+                f"→ reporter.results: {len(reporter.results)}개"
             )
 
     # ====== Hypothesis Testing ======

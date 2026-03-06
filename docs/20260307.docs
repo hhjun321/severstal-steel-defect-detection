@@ -1,4 +1,4 @@
-20260307 작업 일지 #9 - FID 평가 코드 분리: run_benchmark.py → run_fid.py
+20260307 작업 일지 #9 - FID 코드 분리 + v5.5 Benchmark 결과 분석
 ================================================================================
 
 1. 작업 목표
@@ -191,3 +191,263 @@ scripts/run_fid.py로 분리하여 단일 책임 원칙(SRP)을 적용한다.
   (3) 공유 config: benchmark_experiment.yaml 단일 파일 양쪽 공유
   (4) 공유 utils: scripts/utils.py로 중복 코드 4개 함수 추출
   (5) import 안전성: 인라인 sys.path 설정 → from scripts.utils import 순서 보장
+
+
+8. v5.5 Benchmark 실험 결과 분석
+================================================================================
+
+  outputs/v5.5/ 디렉토리에 업로드된 결과 파일 8개를 분석한다.
+  (benchmark_results.json, benchmark_comparison.csv, hypothesis_results.json,
+   fid_results.json, dataset_split.json, config.yaml,
+   eb_yolov8_baseline_raw_history.json, benchmark.log)
+
+
+  8.1 실험 구성
+
+    | 항목           | 값                                              |
+    |----------------|-------------------------------------------------|
+    | 모델           | EB-YOLOv8 (BiFPN, yolov8s backbone)             |
+    | 데이터셋 그룹  | CASDA-Composed-Pruning (1개만 실행)              |
+    | 합성 데이터    | casda_composed 6,061장 전체 주입                 |
+    | 학습 데이터    | train 4,666 + CASDA 6,061 = 10,727장            |
+    | Val/Test       | 각 1,000장 (stratified split, seed=42)           |
+    | 학습 시간      | 1.6h (5,924초), AMP=True                        |
+    | Early stop     | ep89/300 (patience=30, best ep59)                |
+    | suitability    | threshold=0.0 (사실상 비활성)                     |
+    | pruning_top_k  | 2,000 (설정) → 실제 6,061장 주입 (미적용 의심)   |
+
+    주의: config에 pruning_top_k=2000, suitability_threshold=0.0 설정이지만,
+    benchmark.log에서 "Injected 6061 CASDA images" 확인 → top_k pruning이
+    사실상 적용되지 않은 것으로 판단.
+
+
+  8.2 Test mAP@0.5 결과
+
+    | 구성                              | 모델       | mAP@0.5 | vs EB Baseline | 판정      |
+    |-----------------------------------|------------|---------|----------------|-----------|
+    | v5.4 Baseline (Raw)               | EB-YOLOv8  | 0.5819  | —              | 기준선    |
+    | v5.5 CASDA-Composed-Pruning       | EB-YOLOv8  | 0.5721  | -1.0%p         | 소폭 악화 |
+    | v5.4 Baseline (Raw)               | YOLO-MFD   | 0.5546  | (참고)         | 참고      |
+    | v5.4 CASDA-Composed (전체, 4049장)| YOLO-MFD   | 0.5299  | (참고)         | 참고      |
+    | v5.4 CASDA-Ratio-30% (1999장)     | YOLO-MFD   | 0.5650  | (참고)         | 참고      |
+
+    결론: CASDA 전체 주입은 EB-YOLOv8에서도 해로움 (-1.0%p).
+    v5.4 YOLO-MFD (-2.5%p)보다는 덜 악화되었으나, 방향성은 동일.
+
+
+  8.3 클래스별 AP 상세
+
+    | 클래스 | v5.5 EB+CASDA | v5.4 EB Baseline | v5.4 MFD Baseline | v5.4 MFD+CASDA전체 |
+    |--------|---------------|------------------|-------------------|--------------------|
+    | Class1 | 0.5158        | (미기록)         | 0.5576            | 0.5530             |
+    | Class2 | 0.4614        | (미기록)         | 0.4525            | 0.4050             |
+    | Class3 | 0.6755        | (미기록)         | 0.6319            | 0.6316             |
+    | Class4 | 0.6355        | (미기록)         | 0.5764            | 0.5299             |
+
+    v5.4 EB-YOLOv8 baseline의 클래스별 AP가 기록되지 않아 정밀 비교 불가.
+    YOLO-MFD 대비 참고 비교:
+    - Class3, Class4: EB-YOLOv8이 원래 강한 모델 (아키텍처 차이)
+    - Class2: 0.4614 — YOLO-MFD CASDA 전체(0.4050) 대비 양호하나
+              YOLO-MFD baseline(0.4525) 대비 유사 수준
+
+
+  8.4 학습 곡선 분석
+
+    | 지표               | 값                  |
+    |--------------------|---------------------|
+    | Best val mAP@0.5   | 0.5995 (ep59)       |
+    | Test mAP@0.5       | 0.5721              |
+    | Val-Test Gap       | -2.7%p              |
+    | val_loss 수렴      | 3.777 (ep89)        |
+    | train_loss 수렴    | 4.436 (ep89)        |
+    | val_metric 추세    | ep59 이후 정체/소폭 진동 |
+
+    Val-Test gap 비교:
+    | 구성                | Val mAP | Test mAP | Gap     |
+    |---------------------|---------|----------|---------|
+    | v5.4 MFD Baseline   | 0.6154  | 0.5546   | -6.1%p  |
+    | v5.4 MFD+Composed   | 0.5919  | 0.5299   | -6.2%p  |
+    | v5.4 MFD+Ratio-30%  | 0.5895  | 0.5650   | -2.5%p  |
+    | v5.5 EB+CASDA전체   | 0.5995  | 0.5721   | -2.7%p  |
+
+    v5.5의 Val-Test gap 2.7%p는 Ratio-30%(2.5%p)과 유사하여 양호한 편.
+    CASDA 전체 주입임에도 gap이 작은 이유:
+    → EB-YOLOv8의 BiFPN이 노이즈에 더 robust한 것으로 추정.
+
+
+  8.5 FID 결과
+
+    | 메트릭               | 값        | 해석                        |
+    |----------------------|-----------|-----------------------------|
+    | fid_composed_overall | 50.83     | 전체 합성 품질 (보통)       |
+    | Class1_FID_composed  | 106.86    | 중간                        |
+    | Class2_FID_composed  | 172.44    | 최악 — 합성 품질 가장 낮음  |
+    | Class3_FID_composed  | 96.49     | 중간                        |
+    | Class4_FID_composed  | 91.47     | 최선 — 합성 품질 가장 높음  |
+    | fid_roi_overall      | Infinity  | 실패 (아래 참조)            |
+
+    FID-ROI 실패 원인 (benchmark.log L20-21):
+      "Synthetic ROI (casda_full): 0"
+      → --casda-roi-dir을 지정하지 않아 generated/ 디렉토리를 찾지 못함.
+      → casda.roi_dir 미설정 → casda.full_dir fallback → casda_full/ 내에
+        ROI 이미지가 없음 (casda_full은 1600x256 합성 이미지).
+
+    FID-ROI 재실행 필요:
+      python scripts/run_fid.py \
+          --config configs/benchmark_experiment.yaml \
+          --casda-roi-dir .../augmented_images_v5.5/generated \
+          --output-dir .../benchmark_results_v5.5/fid_standalone
+
+    FID vs 성능 상관관계 (Class2):
+      Class2 FID 172.44 (최악) + Class2 AP 0.4614 (최저)
+      → 합성 품질이 가장 낮은 클래스가 성능도 가장 낮음
+      → P1 (Class2 품질 개선) 필요성 재확인
+
+
+  8.6 Hypothesis Test 결과
+
+    | 가설 | 설명                                     | 결과    | 원인                     |
+    |------|------------------------------------------|---------|--------------------------|
+    | H1   | CASDA > Traditional augmentation (mAP)   | no data | baseline_trad 미실행     |
+    | H2   | Pruning > Full (efficiency)              | no data | casda_composed 미실행    |
+    | H3   | CASDA effect is architecture-independent | no data | 모델 1개만 실행          |
+    | H4   | CASDA improves minority classes (3, 4)   | no data | baseline_raw 미실행      |
+    | H5   | CASDA images are physically plausible    | see FID | FID-Composed만 유효      |
+    | H6   | Optimal CASDA ratio exists               | no data | ratio 실험 미실행        |
+
+    모든 가설이 "no data" — casda_composed_pruning 1개 그룹만 실행했기 때문.
+    H1~H4, H6 검증을 위해서는 최소 baseline_raw를 함께 실행해야 함.
+
+
+  8.7 발견된 문제점
+
+    (a) pruning_top_k 미적용 의심
+        config: pruning_top_k=2000, suitability_threshold=0.0
+        실제: 6,061장 전체 주입 (log: "Injected 6061 CASDA images")
+        → suitability_threshold=0.0이면 모든 이미지가 통과하므로
+          top_k=2000이 적용되어야 하지만, 코드에서 stratified top_k 로직이
+          올바르게 동작하지 않았을 가능성 있음.
+          inject_casda_to_baseline()의 pruning 로직 검증 필요.
+
+    (b) FID-ROI 미실행
+        casda.roi_dir 미설정으로 generated/ 미참조.
+        분리된 run_fid.py에서 --casda-roi-dir 지정하여 재실행 필요.
+
+    (c) 비교 기준선 부재
+        baseline_raw를 함께 실행하지 않아 EB-YOLOv8 baseline 클래스별 AP 없음.
+        hypothesis test 전체 불가.
+
+    (d) v5.4 EB-YOLOv8 baseline 클래스별 AP 미기록
+        v5.4에서 EB-YOLOv8 mAP@0.5=0.5819만 기록, 클래스별 미기록.
+
+
+  8.8 v5.4 → v5.5 종합 비교
+
+    | 항목                    | v5.4 (YOLO-MFD)         | v5.5 (EB-YOLOv8)       |
+    |-------------------------|-------------------------|-------------------------|
+    | Baseline mAP@0.5        | 0.5546                  | 0.5819                  |
+    | CASDA 전체 주입 mAP     | 0.5299 (-2.5%p)         | 0.5721 (-1.0%p)         |
+    | 합성 이미지 수           | 4,049장 (v5.3 data)     | 6,061장 (v5.5 data)     |
+    | Val-Test gap (CASDA)    | -6.2%p                  | -2.7%p                  |
+    | FID-Composed overall    | (미측정)                | 50.83                   |
+
+    핵심 인사이트:
+    (1) CASDA 전체 주입은 양쪽 모델 모두에서 해로움 — 일관된 결론
+    (2) EB-YOLOv8이 CASDA 노이즈에 더 robust (-1.0%p vs -2.5%p)
+    (3) v5.5 데이터가 더 많지만 (6,061 vs 4,049), 비율 제한 없이는 역효과
+    (4) Val-Test gap이 크게 개선 (6.2%p → 2.7%p) — 일반화 능력은 양호
+
+
+  8.9 다음 실험 권장 사항
+
+    우선순위 1: pruning_top_k 로직 디버깅
+      inject_casda_to_baseline()의 pruning 코드 리뷰.
+      6,061장이 아닌 2,000장만 주입되었어야 함.
+
+    우선순위 2: EB-YOLOv8 baseline_raw 재실행
+      클래스별 AP 확보 + CASDA 효과 정밀 비교 기준선 확보.
+
+    우선순위 3: FID-ROI 독립 실행
+      python scripts/run_fid.py --casda-roi-dir .../generated
+      → ControlNet 생성 품질 직접 평가.
+
+    우선순위 4: P3 ratio 실험 (10%, 20%, 30%, 50%)
+      CASDA 전체 주입이 해로우므로, 최적 비율 탐색이 핵심.
+      v5.4에서 30%가 +1.0%p였으므로, EB-YOLOv8에서도 유사 경향 예상.
+
+
+9. --reference-results 기능 구현
+================================================================================
+
+  9.1 배경
+
+    v5.5 실험에서 casda_composed_pruning 1개 그룹만 실행하여,
+    hypothesis test에 필요한 baseline_raw 결과가 없었다 (H1~H4, H6 전부 "no data").
+    baseline_raw의 benchmark_results.json은 이미 Colab 특정 경로에 존재하므로,
+    이를 참조하여 hypothesis test에 활용할 수 있는 --reference-results 파라미터를 추가.
+
+  9.2 설계 결정
+
+    | 항목                 | 결정                                                |
+    |----------------------|-----------------------------------------------------|
+    | 파라미터 이름        | --reference-results (nargs='+', 복수 파일 지원)     |
+    | 병합 시점            | save_results_json() 후, hypothesis test 전           |
+    | 중복 처리            | (model, dataset) 조합 기준, 현재 실행 결과 우선     |
+    | benchmark_results.json | 현재 실행 결과만 저장 (reference 미포함)           |
+    | hypothesis_results.json | 병합된 전체 결과 기반으로 계산                    |
+    | BenchmarkReporter 수정 | 없음 — reporter.results에 직접 append             |
+
+  9.3 구현 위치
+
+    scripts/run_benchmark.py:
+    (a) L997-1004: argparse에 --reference-results 추가
+    (b) L1466-1507: 병합 로직 (save_results_json 후, hypothesis test 전)
+    (c) L37-49: docstring에 사용 예시 추가
+
+  9.4 실행 흐름
+
+    1. 현재 실험 실행 (model loop)
+    2. reporter.save_results_json()  → 현재 결과만 benchmark_results.json
+    3. reporter.save_comparison_csv() → 현재 결과만 CSV
+    4. [신규] reference JSON 로드 → reporter.results에 병합
+       - 파일 존재 검증
+       - JSON array 형식 검증
+       - (model, dataset) 중복 검사 → 현재 결과 우선
+       - 병합 건수 로깅
+    5. run_hypothesis_tests(reporter, config)  → 병합된 전체 결과 사용
+    6. hypothesis_results.json 저장
+
+  9.5 매칭 로직 검증
+
+    hypothesis test의 group matching:
+      result['dataset'] == config['dataset_groups'][group_key]['name']
+
+    config:
+      baseline_raw → "Baseline (Raw)"
+      casda_composed_pruning → "CASDA-Composed-Pruning"
+
+    reference의 benchmark_results.json 예시:
+      [{"model": "EB-YOLOv8", "dataset": "Baseline (Raw)", "metrics": {...}}]
+
+    → 동일 config 사용 시 human-readable name이 일치하므로 매칭 정상 동작.
+
+  9.6 사용 예시
+
+    # baseline_raw 결과가 /path/to/baseline/benchmark_results.json에 있을 때:
+    python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --groups casda_composed_pruning --models eb_yolov8 \
+        --reference-results /path/to/baseline/benchmark_results.json
+
+    # 복수 reference 파일:
+    python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --groups casda_composed_pruning --models eb_yolov8 \
+        --reference-results /path/to/baseline/benchmark_results.json \
+                            /path/to/trad/benchmark_results.json
+
+  9.7 py_compile
+
+    | 파일                     | 결과 |
+    |--------------------------|------|
+    | scripts/run_benchmark.py | PASS |

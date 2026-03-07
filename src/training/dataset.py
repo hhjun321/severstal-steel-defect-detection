@@ -365,7 +365,24 @@ class CASDASyntheticDataset(Dataset):
             else:
                 all_samples = all_samples[:max_samples]
 
-        return all_samples
+        # 이미지 파일 존재 여부 검증 — 누락 파일은 학습 중 crash를 유발하므로 제거
+        before_count = len(all_samples)
+        verified = []
+        missing_count = 0
+        for s in all_samples:
+            img_path = s.get('image_path', '')
+            if not os.path.isabs(img_path):
+                img_path = str(self.data_dir / img_path)
+            if os.path.exists(img_path):
+                verified.append(s)
+            else:
+                missing_count += 1
+        if missing_count > 0:
+            logging.warning(
+                f"[CASDASyntheticDataset] {missing_count}/{before_count} images not found, "
+                f"skipped. ({before_count - missing_count} remaining)"
+            )
+        return verified
 
     @staticmethod
     def _stratified_top_k(samples: List[Dict], k: int) -> List[Dict]:

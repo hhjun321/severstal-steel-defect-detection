@@ -10,7 +10,9 @@ FID-ROI:
   - 세분화: class_id / defect_subtype / background_type / class×subtype 교차
 
 FID-Composed:
-  - real 전체 이미지 (train_images/) vs Poisson Blending 합성 (casda_composed/)
+  - real 전체 이미지 (train_images/) vs pruning된 합성 이미지 (casda_composed/ top-k)
+  - 기본 동작: metadata.json의 suitability_score 기반 pruning 적용
+  - --no-fid-pruning 옵션으로 composed 전체 대상 계산 가능
 
 Config:
   benchmark_experiment.yaml을 run_benchmark.py와 동일하게 공유.
@@ -97,6 +99,151 @@ def _group_gen_images_by_class(
             continue
         img_rel = entry.get('image_path', '')
         img_abs = str(base_dir / img_rel)
+        if os.path.exists(img_abs):
+            by_class.setdefault(cls_id, []).append(img_abs)
+    return by_class if by_class else None
+
+
+def _load_pruned_image_paths(
+    metadata_path: Path,
+    base_dir: Path,
+    top_k: int = 2000,
+    suitability_threshold: float = 0.0,
+    stratified: bool = True,
+) -> list:
+    """metadata.json에서 pruning된 이미지 경로 리스트를 반환한다.
+
+    run_benchmark.py의 pruning 로직과 동일:
+      1. suitability_threshold 이상 필터링
+      2. suitability_score 내림차순 정렬
+      3. stratified top-k 또는 global top-k 선택
+
+    Args:
+        metadata_path: composed 디렉토리의 metadata.json 경로
+        base_dir: 이미지 상대 경로의 기준 디렉토리
+        top_k: 선택할 최대 이미지 수
+        suitability_threshold: 최소 suitability 점수
+        stratified: True이면 클래스 비율 유지 top-k
+
+    Returns:
+        pruning된 이미지 절대 경로 리스트
+    """
+    if not metadata_path.exists():
+        logging.warning(f"  metadata.json not found: {metadata_path} — pruning 불가")
+        return []
+
+    with open(metadata_path, 'r', encoding='utf-8') as f:
+        all_samples = json.load(f)
+
+    # threshold 필터
+    filtered = [
+        s for s in all_samples
+        if s.get('suitability_score', 0.0) >= suitability_threshold
+    ]
+    logging.info(f"  Pruning: {len(all_samples)} total → {len(filtered)} above threshold {suitability_threshold}")
+
+    # 정렬
+    filtered.sort(key=lambda x: x.get('suitability_score', 0.0), reverse=True)
+
+    # top-k 선택
+    if stratified and top_k < len(filtered):
+        # 클래스별 비율 유지 top-k
+        by_class: dict = {}
+        for s in filtered:
+            cls_id = s.get('class_id', 0)
+            by_class.setdefault(cls_id, []).append(s)
+
+        total = len(filtered)
+        selected = []
+        remainders: list = []
+        for cls_id in sorted(by_class.keys()):
+            cls_samples = by_class[cls_id]
+            quota = (len(cls_samples) / total) * top_k
+            int_quota = int(quota)
+            remainder = quota - int_quota
+            selected.extend(cls_samples[:int_quota])
+            remainders.append((remainder, cls_id, cls_samples, int_quota))
+
+        # 나머지 할당 (소수점 큰 순서로)
+        remainders.sort(key=lambda x: x[0], reverse=True)
+        deficit = top_k - len(selected)
+        for i in range(min(deficit, len(remainders))):
+            _, cls_id, cls_samples, int_quota = remainders[i]
+            if int_quota < len(cls_samples):
+                selected.append(cls_samples[int_quota])
+
+        filtered = selected[:top_k]
+        logging.info(f"  Stratified top-k: {len(filtered)} selected")
+    else:
+        filtered = filtered[:top_k]
+        logging.info(f"  Global top-k: {len(filtered)} selected")
+
+    # 경로 해석
+    paths = []
+    for s in filtered:
+        img_rel = s.get('image_path', '')
+        img_abs = str(base_dir / img_rel) if not os.path.isabs(img_rel) else img_rel
+        if os.path.exists(img_abs):
+            paths.append(img_abs)
+
+    logging.info(f"  Pruned images (existing): {len(paths)}")
+    return paths
+
+
+def _group_pruned_by_class(
+    metadata_path: Path,
+    base_dir: Path,
+    top_k: int = 2000,
+    suitability_threshold: float = 0.0,
+    stratified: bool = True,
+) -> Optional[dict]:
+    """pruning된 이미지를 class_id(0-based)별로 그룹핑하여 반환.
+
+    Returns:
+        {cls_id: [abs_path, ...]} 또는 None
+    """
+    if not metadata_path.exists():
+        return None
+
+    with open(metadata_path, 'r', encoding='utf-8') as f:
+        all_samples = json.load(f)
+
+    # threshold + sort + top-k (동일 로직)
+    filtered = [
+        s for s in all_samples
+        if s.get('suitability_score', 0.0) >= suitability_threshold
+    ]
+    filtered.sort(key=lambda x: x.get('suitability_score', 0.0), reverse=True)
+
+    if stratified and top_k < len(filtered):
+        by_cls: dict = {}
+        for s in filtered:
+            by_cls.setdefault(s.get('class_id', 0), []).append(s)
+        total = len(filtered)
+        selected = []
+        remainders: list = []
+        for cls_id in sorted(by_cls.keys()):
+            cls_samples = by_cls[cls_id]
+            quota = (len(cls_samples) / total) * top_k
+            int_quota = int(quota)
+            remainder = quota - int_quota
+            selected.extend(cls_samples[:int_quota])
+            remainders.append((remainder, cls_id, cls_samples, int_quota))
+        remainders.sort(key=lambda x: x[0], reverse=True)
+        deficit = top_k - len(selected)
+        for i in range(min(deficit, len(remainders))):
+            _, cls_id, cls_samples, int_quota = remainders[i]
+            if int_quota < len(cls_samples):
+                selected.append(cls_samples[int_quota])
+        filtered = selected[:top_k]
+    else:
+        filtered = filtered[:top_k]
+
+    by_class: dict = {}
+    for s in filtered:
+        cls_id = s.get('class_id', 0)
+        img_rel = s.get('image_path', '')
+        img_abs = str(base_dir / img_rel) if not os.path.isabs(img_rel) else img_rel
         if os.path.exists(img_abs):
             by_class.setdefault(cls_id, []).append(img_abs)
     return by_class if by_class else None
@@ -668,13 +815,14 @@ def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda')
             results['fid_roi_overall'] = float('inf')
 
     # ==================================================================
-    # fid_composed: 전체 이미지 vs 전체 이미지
+    # fid_composed: 전체 이미지 vs pruning된 합성 이미지
     #   real: train_images/ (1600x256)
-    #   synthetic: casda_composed/ (1600x256 Poisson Blending)
+    #   synthetic: casda_composed/에서 pruning된 top-k (1600x256 Poisson Blending)
+    #   --no-fid-pruning 시 composed 전체 대상
     # ==================================================================
     if fid_mode in ('composed', 'both'):
         logging.info(f"\n{'─'*50}")
-        logging.info(f"  FID-Composed: real full images vs CASDA composed")
+        logging.info(f"  FID-Composed: real full images vs CASDA composed (pruned)")
         logging.info(f"{'─'*50}")
 
         # ── Real 전체 이미지 수집 ──
@@ -686,15 +834,51 @@ def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda')
             results['fid_composed_overall'] = float('inf')
             results['fid_overall'] = float('inf')
         else:
-            # ── Synthetic composed 이미지 수집 ──
+            # ── Synthetic composed 이미지 수집 (pruning 적용) ──
             raw_composed_dir = casda_config.get('composed_dir', 'data/augmented/casda_composed')
             composed_dir = (
                 Path(raw_composed_dir) if os.path.isabs(raw_composed_dir)
                 else PROJECT_ROOT / raw_composed_dir
             )
-            composed_images = _collect_images_from_dir(composed_dir)
+
+            # Pruning 설정 읽기
+            use_pruning = fid_config.get('use_pruning', True)  # 기본값: pruning 사용
+            pruning_top_k = casda_config.get('pruning_top_k', 2000)
+            pruning_threshold = casda_config.get('suitability_threshold', 0.0)
+            pruning_stratified = True  # 기본 stratified
+
+            # dataset_groups.casda_composed_pruning 설정도 참조
+            pruning_grp = config.get('dataset_groups', {}).get('casda_composed_pruning', {})
+            pruning_cfg = pruning_grp.get('casda_pruning', {})
+            if pruning_cfg.get('enabled', False):
+                pruning_top_k = pruning_cfg.get('top_k', pruning_top_k)
+                pruning_threshold = pruning_cfg.get('suitability_threshold', pruning_threshold)
+                pruning_stratified = pruning_cfg.get('stratified', pruning_stratified)
+
+            metadata_path = composed_dir / "metadata.json"
+
+            if use_pruning and metadata_path.exists():
+                logging.info(f"  Pruning mode: top_k={pruning_top_k}, "
+                             f"threshold={pruning_threshold}, "
+                             f"stratified={pruning_stratified}")
+                composed_images = _load_pruned_image_paths(
+                    metadata_path, composed_dir,
+                    top_k=pruning_top_k,
+                    suitability_threshold=pruning_threshold,
+                    stratified=pruning_stratified,
+                )
+            else:
+                if use_pruning and not metadata_path.exists():
+                    logging.warning(
+                        f"  metadata.json not found ({metadata_path}) "
+                        f"— pruning 불가, composed 전체 사용"
+                    )
+                else:
+                    logging.info("  Pruning disabled (--no-fid-pruning) — composed 전체 사용")
+                composed_images = _collect_images_from_dir(composed_dir)
+
             logging.info(f"  Real images: {len(real_images)}, "
-                         f"Composed synthetic: {len(composed_images)}")
+                         f"Composed synthetic (pruned): {len(composed_images)}")
 
             if composed_images:
                 rng_comp = random.Random(fid_seed + 10)  # ROI와 다른 시드
@@ -706,12 +890,20 @@ def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda')
                     f"{len(comp_sampled)} synthetic"
                 )
 
-                # Per-class 그룹핑
+                # Per-class 그룹핑 (pruning 적용)
                 comp_real_by_class: Optional[dict] = None
                 comp_gen_by_class: Optional[dict] = None
                 if per_class:
-                    comp_gen_by_class = _group_gen_images_by_class(
-                        composed_dir / "metadata.json", composed_dir)
+                    if use_pruning and metadata_path.exists():
+                        comp_gen_by_class = _group_pruned_by_class(
+                            metadata_path, composed_dir,
+                            top_k=pruning_top_k,
+                            suitability_threshold=pruning_threshold,
+                            stratified=pruning_stratified,
+                        )
+                    else:
+                        comp_gen_by_class = _group_gen_images_by_class(
+                            metadata_path, composed_dir)
 
                     if comp_gen_by_class and annotation_path.exists():
                         pc_rng = random.Random(fid_seed + 11)
@@ -863,6 +1055,9 @@ Examples:
                         help='roi_metadata.csv 경로 (real ROI 목록). '
                              'Overrides config evaluation.fid.roi_metadata_csv. '
                              '미지정 시 --casda-dir 기반 자동 탐색')
+    parser.add_argument('--no-fid-pruning', action='store_true', default=False,
+                        help='FID-Composed 계산 시 pruning 없이 composed 전체 사용. '
+                             '기본: pruning 적용 (metadata.json의 suitability_score 기반 top-k)')
 
     args = parser.parse_args()
 
@@ -916,6 +1111,11 @@ Examples:
         fid_cfg = config.setdefault('evaluation', {}).setdefault('fid', {})
         fid_cfg['roi_metadata_csv'] = args.roi_metadata_csv
         print(f"[INFO] roi_metadata_csv overridden to: {args.roi_metadata_csv}")
+
+    if args.no_fid_pruning:
+        fid_cfg = config.setdefault('evaluation', {}).setdefault('fid', {})
+        fid_cfg['use_pruning'] = False
+        print(f"[INFO] FID-Composed pruning disabled (--no-fid-pruning)")
 
     # ── Device 설정 ──
     import torch

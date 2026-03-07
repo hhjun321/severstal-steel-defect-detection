@@ -1988,3 +1988,77 @@ scripts/run_fid.py로 분리하여 단일 책임 원칙(SRP)을 적용한다.
   23.5 검증
 
     py_compile + AST parse PASS.
+
+
+24. run_fid.py FID-Composed를 pruning 기반으로 변경
+
+  24.1 배경
+
+    FID-Composed가 casda_composed/ 전체 이미지(6,061장)를 대상으로 계산하고 있었다.
+    그러나 실제 학습에 투입되는 데이터는 pruning된 top-k(기본 2,000장)이므로,
+    FID도 동일한 pruning 결과물을 대상으로 측정해야 의미가 있다.
+
+    composed 전체로 FID를 계산하면 pruning에서 버려질 저품질 샘플까지 포함되어
+    FID 수치가 실제 학습 데이터 품질을 과소 평가할 수 있다.
+
+  24.2 변경 사항
+
+    (1) pruning 헬퍼 함수 2개 추가 (모듈 레벨):
+
+        _load_pruned_image_paths():
+          metadata.json에서 suitability_score 기반 top-k 이미지 경로 반환.
+          run_benchmark.py의 pruning 로직과 동일한 알고리즘:
+            1) suitability_threshold 이상 필터
+            2) suitability_score 내림차순 정렬
+            3) stratified top-k 또는 global top-k 선택
+
+        _group_pruned_by_class():
+          pruning된 이미지를 class_id(0-based)별로 그룹핑.
+          per-class FID-Composed 계산에 사용.
+
+    (2) FID-Composed 섹션 수정:
+
+        기본 동작: metadata.json에서 pruning된 top-k만 FID 계산에 사용
+        fallback: metadata.json 없으면 composed 전체 사용 (경고 출력)
+        --no-fid-pruning: composed 전체 대상 계산 (비교 목적)
+
+        pruning 설정 소스 (우선순위):
+          1) dataset_groups.casda_composed_pruning.casda_pruning (YAML)
+          2) dataset.casda.pruning_top_k / suitability_threshold (YAML)
+          3) 기본값: top_k=2000, threshold=0.0, stratified=True
+
+    (3) CLI 인자 추가:
+
+        --no-fid-pruning : FID-Composed에서 pruning 없이 전체 사용
+
+  24.3 수정된 실행 명령
+
+    기본 (pruning 적용, 권장):
+      !python scripts/run_fid.py \
+          --config configs/benchmark_experiment.yaml \
+          --data-dir .../train_images \
+          --csv .../train.csv \
+          --casda-dir .../augmented_dataset_v5.6 \
+          --casda-roi-dir .../augmented_images_v5.5/generated \
+          --roi-metadata-csv .../roi_patches_v5.1/roi_metadata.csv \
+          --output-dir .../fid_results_v5.6 \
+          --workers 12
+
+    pruning 없이 전체 composed 대상 (비교용):
+      위 명령에 --no-fid-pruning 추가
+
+  24.4 예상 로그 출력 (pruning 모드)
+
+      ──────────────────────────────────────────────────
+        FID-Composed: real full images vs CASDA composed (pruned)
+      ──────────────────────────────────────────────────
+        Pruning mode: top_k=2000, threshold=0.0, stratified=True
+        Pruning: 6061 total → 6061 above threshold 0.0
+        Stratified top-k: 2000 selected
+        Pruned images (existing): 2000
+        Real images: 12568, Composed synthetic (pruned): 2000
+        Computing FID-Composed: 1000 real vs 1000 synthetic
+
+  24.5 검증
+
+    py_compile + AST parse PASS.

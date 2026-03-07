@@ -191,7 +191,7 @@ evaluation:
       by_defect_subtype: true   # defect_subtype별 FID-ROI (5그룹)
       by_background_type: true  # background_type별 FID-ROI (5그룹)
       cross_class_subtype: true # class_id × defect_subtype 교차 FID (유효 조합만)
-      min_samples: 50           # 그룹당 최소 샘플 수 (real/syn 각각). 미달 시 스킵.
+      min_samples: 20           # 그룹당 최소 샘플 수 (real/syn 각각). 미달 시 스킵.
 
 # ----------------------------------------------------------------------------
 # CASDA Ratio Experiment Presets (P3)

@@ -819,9 +819,16 @@ Examples:
       --config configs/benchmark_experiment.yaml \\
       --data-dir /content/drive/MyDrive/data/Severstal/train_images \\
       --csv /content/drive/MyDrive/data/Severstal/train.csv \\
-      --casda-dir /content/drive/MyDrive/data/Severstal/augmented_dataset_v5.5 \\
+      --casda-dir /content/drive/MyDrive/data/Severstal/augmented_dataset_v5.6 \\
       --casda-roi-dir /content/drive/MyDrive/data/Severstal/augmented_images_v5.5/generated \\
-      --output-dir /content/drive/MyDrive/data/Severstal/casda/fid_results
+      --output-dir /content/drive/MyDrive/data/Severstal/fid_results_v5.6 \\
+      --workers 12
+
+  # ROI metadata 명시 + FID-ROI만 실행
+  python scripts/run_fid.py \\
+      --config configs/benchmark_experiment.yaml \\
+      --roi-metadata-csv /content/drive/MyDrive/data/Severstal/roi_patches_v5.1/roi_metadata.csv \\
+      --fid-mode roi
 
   # FID-ROI만 실행
   python scripts/run_fid.py --config configs/benchmark_experiment.yaml --fid-mode roi
@@ -848,6 +855,14 @@ Examples:
     parser.add_argument('--fid-mode', type=str, default=None,
                         choices=['roi', 'composed', 'both'],
                         help='FID 계산 모드: roi, composed, both (기본: YAML 설정 또는 both)')
+    parser.add_argument('--workers', type=int, default=None,
+                        help='DataLoader num_workers (이미지 I/O 병렬화). '
+                             'Overrides config evaluation.fid.num_workers. '
+                             '기본: YAML 설정 또는 4')
+    parser.add_argument('--roi-metadata-csv', type=str, default=None,
+                        help='roi_metadata.csv 경로 (real ROI 목록). '
+                             'Overrides config evaluation.fid.roi_metadata_csv. '
+                             '미지정 시 --casda-dir 기반 자동 탐색')
 
     args = parser.parse_args()
 
@@ -891,6 +906,16 @@ Examples:
         fid_cfg = config.setdefault('evaluation', {}).setdefault('fid', {})
         fid_cfg['fid_mode'] = args.fid_mode
         print(f"[INFO] fid_mode overridden to: {args.fid_mode}")
+
+    if args.workers is not None:
+        fid_cfg = config.setdefault('evaluation', {}).setdefault('fid', {})
+        fid_cfg['num_workers'] = args.workers
+        print(f"[INFO] fid num_workers overridden to: {args.workers}")
+
+    if args.roi_metadata_csv:
+        fid_cfg = config.setdefault('evaluation', {}).setdefault('fid', {})
+        fid_cfg['roi_metadata_csv'] = args.roi_metadata_csv
+        print(f"[INFO] roi_metadata_csv overridden to: {args.roi_metadata_csv}")
 
     # ── Device 설정 ──
     import torch

@@ -1925,3 +1925,66 @@ scripts/run_fid.py로 분리하여 단일 책임 원칙(SRP)을 적용한다.
 
     기존 compose 출력(metadata.json)의 class_id 값은 변경하지 않았으므로,
     이전에 생성된 데이터도 재처리 없이 그대로 사용 가능.
+
+
+23. run_fid.py CLI 인자 추가 (--workers, --roi-metadata-csv)
+
+  23.1 배경
+
+    Colab에서 run_fid.py 실행 시 --workers, --roi_image_path 등
+    미정의 인자를 사용하여 argparse 에러가 발생하였다:
+
+      run_fid.py: error: unrecognized arguments:
+        --roi_image_path ... --workers 10
+
+    기존에는 DataLoader num_workers가 config YAML에서만 설정 가능하고,
+    roi_metadata.csv 경로는 --casda-dir 기반 자동 탐색에만 의존했다.
+    다른 스크립트들은 모두 --workers CLI 인자를 지원하므로 일관성 부족.
+
+  23.2 추가된 CLI 인자
+
+    | 인자 | 타입 | 기본값 | 오버라이드 대상 |
+    |------|------|--------|----------------|
+    | --workers N | int | None (YAML 설정 또는 4) | evaluation.fid.num_workers |
+    | --roi-metadata-csv PATH | str | None (자동 탐색) | evaluation.fid.roi_metadata_csv |
+
+  23.3 수정 위치
+
+    파일: scripts/run_fid.py
+
+    (1) argparse 정의 (line 851-858):
+        --workers, --roi-metadata-csv 두 인자 추가
+
+    (2) CLI → config override 로직 (line 901-908):
+        args.workers → fid_cfg['num_workers']
+        args.roi_metadata_csv → fid_cfg['roi_metadata_csv']
+
+    (3) docstring 사용 예시 업데이트:
+        Colab 경로 v5.6 반영, --workers 12 예시 추가,
+        --roi-metadata-csv 단독 사용 예시 추가
+
+  23.4 수정된 실행 명령
+
+    수정 전 (에러 발생):
+      !python scripts/run_fid.py \
+          --casda-dir .../augmented_dataset_v5.6/casda_composed \
+          --roi_image_path .../roi_patches_v5.1 \
+          --workers 10
+
+    수정 후 (정상 동작):
+      !python scripts/run_fid.py \
+          --config configs/benchmark_experiment.yaml \
+          --data-dir /content/drive/MyDrive/data/Severstal/train_images \
+          --csv /content/drive/MyDrive/data/Severstal/train.csv \
+          --casda-dir /content/drive/MyDrive/data/Severstal/augmented_dataset_v5.6 \
+          --casda-roi-dir /content/drive/MyDrive/data/Severstal/augmented_images_v5.5/generated \
+          --roi-metadata-csv /content/drive/MyDrive/data/Severstal/roi_patches_v5.1/roi_metadata.csv \
+          --output-dir /content/drive/MyDrive/data/Severstal/fid_results_v5.6 \
+          --workers 12
+
+    주의: --casda-dir은 상위 디렉토리를 지정해야 함
+          (내부에서 /casda_full, /casda_composed 자동 추가)
+
+  23.5 검증
+
+    py_compile + AST parse PASS.

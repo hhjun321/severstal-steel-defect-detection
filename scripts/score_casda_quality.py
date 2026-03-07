@@ -512,7 +512,7 @@ def score_images(
 
     for cls_id in sorted(scores_by_class.keys()):
         cls_scores = np.array(scores_by_class[cls_id])
-        stats["by_class"][f"class{cls_id}"] = {
+        stats["by_class"][f"class{cls_id + 1}"] = {
             "count": len(cls_scores),
             "mean": round(float(np.mean(cls_scores)), 6),
             "std": round(float(np.std(cls_scores)), 6),

@@ -1550,3 +1550,378 @@ scripts/run_fid.py로 분리하여 단일 책임 원칙(SRP)을 적용한다.
     - 레거시 package_casda_data.py 출력 (augmented_metadata.json,
       image_filename/mask_filename) → fallback으로 여전히 동작
     - CLI 인터페이스 변경 없음, 추가 인자 불필요
+
+20. run_fid.py (Step 10) 실행 예시
+========================================================================
+
+  20.1 파이프라인 위치
+
+    Step 9: validate_augmented_quality.py  → QA 리포트
+    Step 10: run_fid.py  ← 여기 (FID 정량 평가)
+    Step 11: run_benchmark.py
+
+    FID 평가는 벤치마크와 독립적으로 실행 가능.
+    GPU 필요 (InceptionV3 feature extraction).
+
+  20.2 개요
+
+    run_benchmark.py에서 분리된 FID 전용 스크립트.
+    두 가지 FID 모드를 지원:
+
+    | 모드          | 비교 대상                           | 해상도    |
+    |---------------|-------------------------------------|-----------|
+    | FID-ROI       | real ROI crops vs 생성 ROI          | 512×512   |
+    | FID-Composed  | real 전체 이미지 vs 합성 이미지     | 1600×256  |
+
+    FID-ROI는 class_id / defect_subtype / background_type /
+    class×subtype 교차 세분화 점수를 산출.
+
+  20.3 CLI 인자
+
+    | 인자            | 타입  | 기본값                              | 설명                              |
+    |-----------------|-------|-------------------------------------|-----------------------------------|
+    | --config        | str   | configs/benchmark_experiment.yaml   | YAML 설정 파일                    |
+    | --data-dir      | str   | None                                | 이미지 디렉토리 (config 오버라이드)|
+    | --csv           | str   | None                                | annotation CSV (config 오버라이드)|
+    | --casda-dir     | str   | None                                | CASDA 상위 디렉토리               |
+    | --casda-roi-dir | str   | None                                | 생성 ROI 디렉토리 (generated/)    |
+    | --output-dir    | str   | None                                | 결과 저장 디렉토리                |
+    | --device        | str   | None (자동 감지)                    | cuda/cpu                          |
+    | --fid-mode      | str   | both                                | roi / composed / both             |
+
+  20.4 기본 실행 (Colab, 양쪽 FID)
+
+    python scripts/run_fid.py \
+        --config /content/severstal-steel-defect-detection/configs/benchmark_experiment.yaml \
+        --data-dir /content/drive/MyDrive/data/Severstal/train_images \
+        --csv /content/drive/MyDrive/data/Severstal/train.csv \
+        --casda-dir /content/drive/MyDrive/data/Severstal/casda_output/composed \
+        --casda-roi-dir /content/drive/MyDrive/data/Severstal/casda_output/generated \
+        --output-dir /content/drive/MyDrive/data/Severstal/casda_output/fid_results
+
+  20.5 FID-ROI만 실행
+
+    python scripts/run_fid.py \
+        --config configs/benchmark_experiment.yaml \
+        --casda-roi-dir /content/drive/MyDrive/data/Severstal/casda_output/generated \
+        --fid-mode roi
+
+  20.6 FID-Composed만 실행
+
+    python scripts/run_fid.py \
+        --config configs/benchmark_experiment.yaml \
+        --casda-dir /content/drive/MyDrive/data/Severstal/casda_output/composed \
+        --fid-mode composed
+
+  20.7 출력 파일 구조
+
+    fid_results/{YYYYMMDD_HHMMSS}/
+    ├── fid_results.json       # 전체 FID 점수 (overall, per-class, 세분화)
+    ├── fid_cache/             # InceptionV3 feature 캐시 (재실행 시 재사용)
+    ├── config.yaml            # 실행 시 사용된 설정 복사본
+    └── fid_evaluation.log     # 실행 로그
+
+  20.8 v5.5 참고 결과 (이전 실험)
+
+    | 메트릭              | 값      |
+    |---------------------|---------|
+    | FID-ROI Overall     | 79.40   |
+    | FID-ROI Class 2     | 140.83  |
+    | FID-ROI Class 4     | 74.56   |
+
+    FID는 낮을수록 좋음. Class 2가 가장 높아 품질 개선 필요.
+
+  20.9 실행 팁
+
+    - fid_cache/ 디렉토리가 있으면 InceptionV3 feature 재추출 건너뜀
+      → 반복 실행 시 속도 크게 향상
+    - --device 미지정 시 cuda 자동 감지, 불가하면 cpu fallback
+    - Colab T4 기준 ~6,000장 FID 평가: 약 10~15분
+
+21. run_benchmark.py (Step 11) 실행 예시
+========================================================================
+
+  21.1 파이프라인 위치
+
+    Step 10: run_fid.py  → FID 정량 평가
+    Step 11: run_benchmark.py  ← 여기 (모델 학습 + 성능 비교)
+
+    전체 파이프라인의 최종 단계.
+    3 models × N dataset groups = 3N 학습을 자동 수행.
+
+  21.2 개요
+
+    | 항목       | 내용                                    |
+    |------------|-----------------------------------------|
+    | 모델 3종   | YOLO-MFD, EB-YOLOv8, DeepLabV3+        |
+    | 데이터셋   | baseline_raw, baseline_trad,            |
+    |            | casda_full, casda_pruning,              |
+    |            | casda_ratio_{pct} (동적 생성)           |
+    | CASDA 주입 | Detection: inject/clean 전략            |
+    |            | Segmentation: ConcatDataset 내부 처리   |
+    | Pruning    | suitability_score 내림차순 정렬 → top-k |
+
+  21.3 CLI 인자
+
+    | 인자                | 타입       | 기본값  | 설명                              |
+    |---------------------|-----------|---------|-----------------------------------|
+    | --config            | str       | configs/benchmark_experiment.yaml | YAML 설정         |
+    | --data-dir          | str       | None    | 이미지 디렉토리                   |
+    | --csv               | str       | None    | annotation CSV                    |
+    | --models            | str+      | None    | 모델 부분 집합 (yolo_mfd 등)      |
+    | --groups            | str+      | None    | 데이터셋 그룹 (baseline 등)       |
+    | --list-groups       | flag      | False   | 사용 가능 그룹 나열 후 종료       |
+    | --device            | str       | None    | cuda/cpu 자동 감지                |
+    | --seed              | int       | None    | 난수 시드 (config 오버라이드)     |
+    | --output-dir        | str       | None    | 결과 저장 디렉토리                |
+    | --resume            | flag      | False   | 기존 실험 이어서 실행             |
+    | --epochs            | int       | None    | 전체 모델 에포크 오버라이드       |
+    | --casda-dir         | str       | None    | CASDA 상위 디렉토리               |
+    | --casda-roi-dir     | str       | None    | 생성 ROI 디렉토리                 |
+    | --split-csv         | str       | None    | 사전 생성 split CSV               |
+    | --yolo-dir          | str       | None    | 사전 변환 YOLO 디렉토리           |
+    | --casda-ratio       | float+    | None    | CASDA 주입 비율 (0.0~1.0)        |
+    | --casda-ratio-source| str       | full    | ratio 데이터 소스 (full/composed) |
+    | --reference-results | str+      | None    | 이전 실험 결과 JSON (가설 검정용) |
+    | --fid-only          | flag      | False   | [DEPRECATED] run_fid.py 사용 권장 |
+
+  21.4 그룹 이름 및 별칭
+
+    | 정식 이름          | 별칭                        |
+    |--------------------|-----------------------------|
+    | baseline_raw       | baseline, raw               |
+    | baseline_trad      | trad, traditional           |
+    | casda_full         | full                        |
+    | casda_pruning      | pruning                     |
+    | casda_composed     | composed                    |
+    | casda_composed_pruning | composed_pruning        |
+    | (전체)             | all                         |
+
+    --casda-ratio 사용 시 casda_ratio_{pct} 그룹 자동 생성
+    (예: --casda-ratio 0.1 → casda_ratio_10)
+
+  21.5 기본 실행 (Colab, 전체 벤치마크)
+
+    python scripts/run_benchmark.py \
+        --config /content/severstal-steel-defect-detection/configs/benchmark_experiment.yaml \
+        --data-dir /content/drive/MyDrive/data/Severstal/train_images \
+        --csv /content/drive/MyDrive/data/Severstal/train.csv \
+        --casda-dir /content/drive/MyDrive/data/Severstal/casda_output/composed \
+        --output-dir /content/drive/MyDrive/data/Severstal/benchmark_results
+
+  21.6 특정 모델 + 그룹만 실행
+
+    # YOLO-MFD만, baseline vs casda_full
+    python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --models yolo_mfd \
+        --groups baseline full
+
+    # EB-YOLOv8만, pruning만
+    python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --models eb_yolov8 \
+        --groups pruning
+
+  21.7 CASDA ratio 실험 (주입 비율 비교)
+
+    # 10%, 20%, 30%, 50% 비율 동시 실험
+    python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --models yolo_mfd eb_yolov8 \
+        --casda-ratio 0.1 0.2 0.3 0.5 \
+        --casda-ratio-source composed
+
+    자동 생성 그룹: casda_ratio_10, casda_ratio_20,
+    casda_ratio_30, casda_ratio_50
+    각 그룹의 max_samples = int(num_train * ratio / (1-ratio))
+
+  21.8 이전 결과 참조 (가설 검정용)
+
+    # casda_pruning만 실행하되, baseline 결과는 이전 실험에서 로드
+    python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --groups pruning \
+        --reference-results /content/drive/.../previous_run/benchmark_results.json
+
+    현재 실행 결과와 reference 중 (model, dataset) 중복 시
+    현재 실행 우선.
+
+  21.9 중단된 실험 이어서 실행
+
+    python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --resume \
+        --output-dir /content/drive/.../benchmark_results/20260307_143000
+
+    experiment_meta.json이 있는 (model, group) 조합은 건너뜀.
+    last.pt/latest.pth가 있으면 체크포인트에서 재개.
+
+  21.10 빠른 테스트 (에포크 축소)
+
+    python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --groups baseline \
+        --models yolo_mfd \
+        --epochs 5
+
+  21.11 출력 파일 구조
+
+    benchmark_results/{YYYYMMDD_HHMMSS}/
+    ├── benchmark.log              # 실행 로그
+    ├── config.yaml                # 실행 설정 복사본
+    ├── dataset_split.json         # train/val/test split 정보
+    ├── benchmark_results.json     # 전체 결과 (모델별, 그룹별)
+    ├── benchmark_comparison.csv   # 비교표 (mAP, Dice, Class AP)
+    ├── hypothesis_results.json    # 가설 검정 결과 (H1~H5)
+    ├── pr_curve_{model}_{group}.json  # PR 곡선 데이터
+    └── {model}_{group}/           # 개별 실험 디렉토리
+        ├── experiment_meta.json   # 실험 메타 (메트릭, 시간, early stop)
+        └── checkpoints/           # 모델 체크포인트
+
+  21.12 Pruning 알고리즘 상세
+
+    1. metadata.json에서 전체 CASDA 샘플 로드
+    2. suitability_threshold 이하 샘플 필터링 (기본 0.0 = 필터 없음)
+    3. suitability_score 내림차순 정렬
+    4. top-k 선택:
+       - Global top-k (기본): 점수 상위 k개 선택
+       - Stratified top-k (선택): 클래스 비율 유지하며 top-k
+         → 클래스별 quota = max(1, round(class_count/total * k))
+         → quota 합계가 k가 되도록 조정
+
+    Pruning pool이 클수록 (→ compose 출력이 많을수록)
+    quality-based top-k 선별 효과가 극대화됨.
+
+  21.13 v5.5 참고 결과 (이전 실험)
+
+    | 메트릭      | Baseline (Raw) | CASDA-Full | 변화     |
+    |-------------|----------------|------------|----------|
+    | mAP@0.5     | 0.5819         | 0.5721     | -1.0%p   |
+    | Class4 AP   | 0.6107         | 0.6355     | +2.5%p   |
+
+    v5.6에서는 pruning 수정 + ratio 실험으로 개선 기대.
+
+  21.14 실행 팁
+
+    - 전체 벤치마크 (3 models × 4 groups = 12 runs):
+      Colab T4 기준 약 8~12시간
+    - --epochs 오버라이드로 빠른 sanity check 가능
+    - --resume 사용 시 output-dir 필수 (기존 디렉토리 지정)
+    - --list-groups로 사용 가능 그룹 확인 후 실행 권장
+    -       Detection 모델은 YOLO 형식 변환 필요 → --yolo-dir 지정하면
+      변환 결과 재사용 가능 (반복 실행 시 시간 절약)
+
+
+22. class_id 인덱싱 표기 통일 (0-indexed metadata + 1-indexed 출력)
+
+  22.1 배경
+
+    Severstal 데이터셋은 원래 Class 1~4 (1-indexed)를 사용하지만,
+    YOLO 라벨 형식은 0-indexed class_id를 요구한다.
+    v5.6 파이프라인에서 두 규약이 혼재하면서 인덱싱 불일치가 발생하고 있었다.
+
+    compose_casda_images.py의 parse_class_id_from_filename() (line 136)이
+    파일명에서 추출한 1-indexed class_id를 -1 해서 0-indexed로 metadata에 저장하고,
+    dataset_yolo.py (line 451, 492, 495)에서 metadata의 class_id를
+    YOLO 라벨 파일에 직접 기록하므로, metadata는 반드시 0-indexed여야 한다.
+
+    그러나 후처리 스크립트들(score, validate)에서 이를 일관되게 처리하지 않아
+    class별 통계가 잘못 집계되거나 빈 결과가 나오는 문제가 있었다.
+
+  22.2 발견된 문제
+
+    | 파일 | 위치 | 문제 | 영향 |
+    |------|------|------|------|
+    | score_casda_quality.py | line 515 | f"class{cls_id}" → "class0", "class1" 등 출력 | Severstal 규약(1~4)과 불일치 |
+    | validate_augmented_quality.py | line 347 | for class_id in [1,2,3,4] 하드코딩 | compose metadata(0-indexed)와 매칭 안 됨 → class_pass_rates 전부 빈 dict |
+    | validate_augmented_quality.py | line 404, 530 | class_id를 그대로 출력 | 0-indexed 그대로 표시 (Class 0, 1, 2, 3) |
+
+  22.3 규칙 확정
+
+    ┌───────────────────────────────────────────────────────────────┐
+    │ metadata 내부 (JSON, YOLO 라벨): 0-indexed (0, 1, 2, 3)     │
+    │ 콘솔 출력 / 리포트 파일:        1-indexed (Class 1, 2, 3, 4) │
+    └───────────────────────────────────────────────────────────────┘
+
+    근거:
+    - YOLO 형식 호환 필수 → metadata는 0-indexed 유지
+    - Severstal 원본 데이터 규약 → 사용자 대면 출력은 1-indexed
+
+  22.4 수정 내역
+
+    (1) score_casda_quality.py — line 515
+
+        수정 전:
+          stats["by_class"][f"class{cls_id}"] = { ... }
+
+        수정 후:
+          stats["by_class"][f"class{cls_id + 1}"] = { ... }
+
+        효과: JSON 출력이 "class1", "class2", "class3", "class4"로 통일
+
+    (2) validate_augmented_quality.py — line 347
+
+        수정 전:
+          for class_id in [1, 2, 3, 4]:
+
+        수정 후:
+          for class_id in [0, 1, 2, 3]:
+
+        효과: compose metadata의 0-indexed class_id와 매칭되어
+              class_pass_rates가 정상 집계됨
+
+    (3) validate_augmented_quality.py — line 404 (report 파일 출력)
+
+        수정 전:
+          f.write(f"  Class {class_id}: {rate*100:.2f}%\n")
+
+        수정 후:
+          f.write(f"  Class {class_id + 1}: {rate*100:.2f}%\n")
+
+    (4) validate_augmented_quality.py — line 530 (콘솔 출력)
+
+        수정 전:
+          print(f"  Class {class_id}: {rate*100:.2f}%")
+
+        수정 후:
+          print(f"  Class {class_id + 1}: {rate*100:.2f}%")
+
+        효과: 사용자 대면 출력이 "Class 1" ~ "Class 4"로 통일
+
+  22.5 검증
+
+    두 파일 모두 py_compile + AST parse 통과 확인.
+
+    수정 후 예상 출력 (validate_augmented_quality.py):
+
+      Pass rates by class:
+        Class 1: 85.23%
+        Class 2: 72.14%
+        Class 3: 91.05%
+        Class 4: 88.67%
+
+    수정 후 예상 출력 (score_casda_quality.py JSON):
+
+      {
+        "by_class": {
+          "class1": {"count": 1523, "mean": 0.712, ...},
+          "class2": {"count": 987, "mean": 0.634, ...},
+          "class3": {"count": 2145, "mean": 0.789, ...},
+          "class4": {"count": 1406, "mean": 0.741, ...}
+        }
+      }
+
+  22.6 영향 범위
+
+    | 스크립트 | 영향 | 조치 |
+    |----------|------|------|
+    | compose_casda_images.py | metadata에 0-indexed 저장 (기존 정상) | 변경 없음 |
+    | score_casda_quality.py | 출력 키 "class0"→"class1" | 수정 완료 |
+    | validate_augmented_quality.py | 순회 0-indexed, 출력 +1 | 수정 완료 |
+    | run_fid.py | 기존 line 356, 394에서 cls_id+1 사용 (정상) | 변경 없음 |
+    | run_benchmark.py | pruning 시 metadata class_id 직접 사용 (0-indexed 정상) | 변경 없음 |
+    | dataset_yolo.py | metadata class_id → YOLO 라벨 (0-indexed 정상) | 변경 없음 |
+
+    기존 compose 출력(metadata.json)의 class_id 값은 변경하지 않았으므로,
+    이전에 생성된 데이터도 재처리 없이 그대로 사용 가능.

@@ -343,8 +343,8 @@ class QualityValidator:
             stats['avg_defect_consistency'] = np.mean([r['defect_consistency'] for r in validation_results])
             stats['avg_presence_score'] = np.mean([r['presence_score'] for r in validation_results])
             
-            # Per-class pass rates
-            for class_id in [1, 2, 3, 4]:
+            # Per-class pass rates (metadata는 0-indexed, 출력은 +1)
+            for class_id in [0, 1, 2, 3]:
                 class_results = [r for r in validation_results if r['class_id'] == class_id]
                 if len(class_results) > 0:
                     passed = sum(1 for r in class_results if r['passed'])
@@ -401,7 +401,7 @@ class QualityValidator:
             
             f.write("Pass Rates by Class:\n")
             for class_id, rate in sorted(stats['class_pass_rates'].items()):
-                f.write(f"  Class {class_id}: {rate*100:.2f}%\n")
+                f.write(f"  Class {class_id + 1}: {rate*100:.2f}%\n")
         
         print(f"Saved quality report to: {report_path}")
 
@@ -527,7 +527,7 @@ def main():
     
     print(f"\nPass rates by class:")
     for class_id, rate in sorted(stats['class_pass_rates'].items()):
-        print(f"  Class {class_id}: {rate*100:.2f}%")
+        print(f"  Class {class_id + 1}: {rate*100:.2f}%")
     
     print(f"\nValidation results saved to: {args.output_dir}")
     print("="*80)

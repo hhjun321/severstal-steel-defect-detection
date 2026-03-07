@@ -1367,3 +1367,186 @@ scripts/run_fid.py로 분리하여 단일 책임 원칙(SRP)을 적용한다.
     - 16.4: v5.5 대비 v5.6 비교에서 "패키징" 항목을 "불필요" 처리
     - 16.5: 의존성 그래프에서 package_casda_data.py 노드 제거
     - 16.6: 재실행 필수 단계를 Step 7~11 (5단계)로 수정
+
+18. validate_augmented_quality.py 호환성 수정 (compose 출력 형식 대응)
+========================================================================
+
+  18.1 배경
+
+    v5.6 파이프라인에서 package_casda_data.py를 제외한 이후,
+    validate_augmented_quality.py가 compose_casda_images.py 출력과
+    호환되지 않는 문제를 발견. 메타데이터 파일명·필드명·조건부 필드
+    3가지 불일치를 수정.
+
+  18.2 발견된 불일치 (4건)
+
+    | # | 항목              | compose 출력          | validate 기대값           | 영향           |
+    |---|-------------------|-----------------------|---------------------------|----------------|
+    | 1 | 메타데이터 파일   | metadata.json         | augmented_metadata.json   | FileNotFoundError|
+    | 2 | 이미지 경로 필드  | image_path            | image_filename            | KeyError       |
+    | 3 | 마스크 경로 필드  | mask_path             | mask_filename             | KeyError       |
+    | 4 | defect_subtype    | 조건부 (unknown 누락) | 무조건 접근               | KeyError       |
+
+  18.3 수정 내용 (7개 변경, 1개 파일)
+
+    대상 파일: scripts/validate_augmented_quality.py (509줄 → 544줄)
+    설계 원칙: compose 형식 우선, 레거시 형식 fallback — 하위 호환성 100%
+
+    변경 1: docstring 업데이트 (lines 1-15)
+      — compose/레거시 양쪽 호환 명시 3줄 추가
+
+    변경 2: 헬퍼 함수 3개 추가 (lines 33-55)
+      — _resolve_image_path(): image_path 또는 image_filename 필드 대응
+      — _resolve_mask_path(): mask_path 또는 mask_filename 필드 대응
+      — _get_image_name(): report 출력용 이름 추출
+
+    변경 3: 메타데이터 파일명 fallback (lines 240-247)
+      — metadata.json 우선 탐색, 없으면 augmented_metadata.json fallback
+      — 양쪽 다 없으면 FileNotFoundError (경로 두 개 모두 표시)
+
+    변경 4: defect_subtype 안전 접근 (line 189)
+      — metadata['defect_subtype'] → metadata.get('defect_subtype', 'general')
+      — compose가 unknown일 때 필드 자체를 누락하므로 KeyError 방지
+
+    변경 5: 병렬 경로 이미지/마스크 경로 (lines 264-265)
+      — augmented_dir / 'images' / metadata['image_filename']
+        → _resolve_image_path(augmented_dir, metadata)
+
+    변경 6: 순차 경로 이미지/마스크 경로 (lines 286-287)
+      — 동일 패턴으로 _resolve_image_path / _resolve_mask_path 적용
+
+    변경 7: report 출력 (lines 368, 375)
+      — sample['image_filename'] → _get_image_name(sample)
+
+  18.4 검증
+
+    - py_compile: PASS
+    - AST parse: PASS (UTF-8)
+    - CLI 인터페이스 변경: 없음
+    - colab_notebook.ipynb 수정: 불필요 (스크립트가 자동 탐색)
+
+19. validate_augmented_quality.py 실행 예시
+========================================================================
+
+  19.1 파이프라인 위치
+
+    Step 7: compose_casda_images.py  → composed/{images,masks,metadata.json}
+    Step 8: score_casda_quality.py   → suitability_score 갱신
+    Step 9: validate_augmented_quality.py  ← 여기 (품질 검증)
+    Step 10: run_fid.py
+    Step 11: run_benchmark.py
+
+    Step 9는 Step 7의 출력(composed/)을 직접 읽는다.
+    Step 8 실행 전후 어느 시점에서든 독립적으로 실행 가능.
+
+  19.2 기본 실행 (Colab, 순차 처리)
+
+    python scripts/validate_augmented_quality.py \
+        --augmented_dir /content/drive/MyDrive/data/Severstal/casda_output/composed \
+        --min_quality_score 0.7
+
+    - --augmented_dir: compose_casda_images.py의 --output_dir과 동일 경로
+    - --output_dir 미지정 시 기본값: composed/validation/
+    - 입력 디렉토리 구조:
+        composed/
+        ├── images/          # 합성된 1600×256 이미지
+        ├── masks/           # 전체 크기 마스크
+        └── metadata.json    # compose가 생성한 메타데이터
+
+  19.3 병렬 처리 (워커 4개)
+
+    python scripts/validate_augmented_quality.py \
+        --augmented_dir /content/drive/MyDrive/data/Severstal/casda_output/composed \
+        --min_quality_score 0.7 \
+        --workers 4
+
+  19.4 자동 워커 감지 (CPU 코어 - 1)
+
+    python scripts/validate_augmented_quality.py \
+        --augmented_dir /content/drive/MyDrive/data/Severstal/casda_output/composed \
+        --min_quality_score 0.65 \
+        --workers -1
+
+  19.5 출력 디렉토리 명시
+
+    python scripts/validate_augmented_quality.py \
+        --augmented_dir /content/drive/MyDrive/data/Severstal/casda_output/composed \
+        --output_dir /content/drive/MyDrive/data/Severstal/casda_output/validation_results \
+        --min_quality_score 0.7
+
+  19.6 출력 파일 구조
+
+    validation_results/
+    ├── quality_scores.json          # 전 샘플 상세 점수
+    │                                  (blur, artifact, color,
+    │                                   defect_consistency, presence)
+    ├── passed_samples.txt           # 통과 이미지 파일명 목록
+    ├── rejected_samples.txt         # 탈락 이미지 + 점수
+    ├── validation_statistics.json   # 집계 통계 (pass_rate, 클래스별 통과율)
+    └── quality_report.txt           # 사람이 읽을 수 있는 텍스트 리포트
+
+  19.7 품질 점수 구성 (가중치 합계 = 1.0)
+
+    | 항목                | 가중치 | 설명                              |
+    |---------------------|--------|-----------------------------------|
+    | blur_score          | 0.20   | Laplacian 분산 기반 선명도        |
+    | artifact_score      | 0.20   | Sobel 기울기 이상치 비율          |
+    | color_score         | 0.15   | LAB 색공간 범위 일관성            |
+    | defect_consistency  | 0.25   | defect_subtype 일치도             |
+    | presence_score      | 0.20   | 결함 마스크 면적 비율 적정성      |
+
+  19.8 품질 임계값 조정 가이드
+
+    | --min_quality_score | 용도                                          |
+    |---------------------|-----------------------------------------------|
+    | 0.5                 | 느슨한 필터링 — 분포 확인용                   |
+    | 0.7 (기본값)        | 권장 — 아티팩트·블러·색상 이상 제거           |
+    | 0.8                 | 엄격 — 고품질만, pruning top-k 병행 시 유용   |
+    | 0.9                 | 매우 엄격 — 통과율 매우 낮음, 디버깅용        |
+
+  19.9 예상 콘솔 출력 (v5.5 기준 추정치)
+
+    ================================================================
+    Augmented Data Quality Validation
+    ================================================================
+    Augmented data: .../composed
+    Output directory: .../composed/validation
+    Min quality score: 0.7
+    ================================================================
+
+    Validating 6061 augmented samples...
+    Validating samples: 100%|██████████| 6061/6061 [03:42<00:00]
+
+    ================================================================
+    Validation Complete!
+    ================================================================
+
+    Total samples: 6061
+    Passed samples: ~4850
+    Rejected samples: ~1211
+    Pass rate: ~80%
+
+    Average scores:
+      Overall quality: ~0.782
+      Blur: ~0.856
+      Artifacts: ~0.891
+      Color: ~0.834
+      Defect consistency: ~0.623
+      Presence: ~0.742
+
+    Pass rates by class:
+      Class 1: ~82%
+      Class 2: ~71% (FID 최악 → 품질도 낮을 가능성)
+      Class 3: ~85%
+      Class 4: ~85%
+
+    (실측값은 Colab 실행 후 확인 필요)
+
+  19.10 호환성 참고
+
+    본 세션 섹션 18에서 수정한 호환성 변경 덕분에:
+    - compose_casda_images.py 출력 (metadata.json, image_path/mask_path)
+      → 자동 인식
+    - 레거시 package_casda_data.py 출력 (augmented_metadata.json,
+      image_filename/mask_filename) → fallback으로 여전히 동작
+    - CLI 인터페이스 변경 없음, 추가 인자 불필요

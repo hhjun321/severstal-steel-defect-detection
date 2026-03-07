@@ -4,6 +4,10 @@ Augmented Data Quality Validation Script
 This script validates the quality of generated augmented data.
 It checks physical plausibility, background preservation, and defect consistency.
 
+compose_casda_images.py 출력 형식 (metadata.json, image_path/mask_path 필드)과
+레거시 package_casda_data.py 출력 형식 (augmented_metadata.json, image_filename/
+mask_filename 필드) 양쪽 모두 호환.
+
 Usage:
     python scripts/validate_augmented_quality.py \
         --augmented_dir data/augmented \
@@ -24,6 +28,31 @@ from skimage.metrics import structural_similarity as ssim
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.analysis.defect_characterization import DefectCharacterizer
+
+
+# ======================================================================
+# 메타데이터 형식 호환 헬퍼 (compose / 레거시 package 양쪽 지원)
+# ======================================================================
+
+def _resolve_image_path(augmented_dir, metadata):
+    """compose(image_path) 또는 레거시(image_filename) 필드에서 실제 파일 경로 반환."""
+    if 'image_path' in metadata:
+        return Path(augmented_dir) / metadata['image_path']          # "images/xxx.png"
+    return Path(augmented_dir) / 'images' / metadata['image_filename']  # "xxx.png"
+
+
+def _resolve_mask_path(augmented_dir, metadata):
+    """compose(mask_path) 또는 레거시(mask_filename) 필드에서 실제 파일 경로 반환."""
+    if 'mask_path' in metadata:
+        return Path(augmented_dir) / metadata['mask_path']
+    return Path(augmented_dir) / 'masks' / metadata['mask_filename']
+
+
+def _get_image_name(metadata):
+    """report 출력용 이미지 이름 반환 (compose/레거시 양쪽 대응)."""
+    if 'image_path' in metadata:
+        return Path(metadata['image_path']).name
+    return metadata.get('image_filename', 'unknown')
 
 
 class QualityValidator:
@@ -158,8 +187,9 @@ class QualityValidator:
         color_score = self.compute_color_consistency_score(generated_image)
         
         # 4. Defect metrics consistency (25%)
+        # compose 출력은 defect_subtype을 조건부로만 포함 (unknown이면 누락)
         defect_consistency = self.compute_defect_metrics_consistency(
-            defect_mask, metadata['defect_subtype']
+            defect_mask, metadata.get('defect_subtype', 'general')
         )
         
         # 5. Defect presence check (20%)
@@ -206,10 +236,15 @@ class QualityValidator:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Load metadata
-        metadata_path = augmented_dir / 'augmented_metadata.json'
+        # Load metadata — compose 출력(metadata.json) 우선, 레거시 fallback
+        metadata_path = augmented_dir / 'metadata.json'
         if not metadata_path.exists():
-            raise FileNotFoundError(f"Metadata not found: {metadata_path}")
+            metadata_path = augmented_dir / 'augmented_metadata.json'
+        if not metadata_path.exists():
+            raise FileNotFoundError(
+                f"Metadata not found: tried metadata.json and "
+                f"augmented_metadata.json in {augmented_dir}"
+            )
         
         with open(metadata_path, 'r') as f:
             all_metadata = json.load(f)
@@ -226,8 +261,8 @@ class QualityValidator:
             print(f"  병렬 모드: {num_workers} workers")
             worker_args = []
             for metadata in all_metadata:
-                image_path = str(augmented_dir / 'images' / metadata['image_filename'])
-                mask_path = str(augmented_dir / 'masks' / metadata['mask_filename'])
+                image_path = str(_resolve_image_path(augmented_dir, metadata))
+                mask_path = str(_resolve_mask_path(augmented_dir, metadata))
                 worker_args.append((image_path, mask_path, metadata,
                                     self.min_quality_score))
 
@@ -248,8 +283,8 @@ class QualityValidator:
             # ── 순차 경로 (기존 로직) ──
             for metadata in tqdm(all_metadata, desc="Validating samples"):
                 # Load image and mask
-                image_path = augmented_dir / 'images' / metadata['image_filename']
-                mask_path = augmented_dir / 'masks' / metadata['mask_filename']
+                image_path = _resolve_image_path(augmented_dir, metadata)
+                mask_path = _resolve_mask_path(augmented_dir, metadata)
                 
                 if not image_path.exists() or not mask_path.exists():
                     continue
@@ -330,14 +365,14 @@ class QualityValidator:
         passed_path = output_dir / 'passed_samples.txt'
         with open(passed_path, 'w') as f:
             for sample in passed_samples:
-                f.write(f"{sample['image_filename']}\n")
+                f.write(f"{_get_image_name(sample)}\n")
         print(f"Saved passed samples list to: {passed_path}")
         
         # Save rejected samples list
         rejected_path = output_dir / 'rejected_samples.txt'
         with open(rejected_path, 'w') as f:
             for sample in rejected_samples:
-                f.write(f"{sample['image_filename']} (score: {sample['quality_score']:.3f})\n")
+                f.write(f"{_get_image_name(sample)} (score: {sample['quality_score']:.3f})\n")
         print(f"Saved rejected samples list to: {rejected_path}")
         
         # Save statistics

@@ -15,7 +15,9 @@ import pandas as pd
 import numpy as np
 import cv2
 import json
+import os
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 
 # Add src to path
@@ -23,6 +25,59 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.analysis.background_characterization import BackgroundAnalyzer
 from src.utils.rle_utils import get_all_masks_for_image
+
+
+# ── 병렬 워커 함수 (ProcessPoolExecutor용 — 모듈 레벨 정의 필수) ──
+
+def _extract_patches_from_single_image(args_tuple):
+    """
+    단일 이미지에서 배경 패치를 추출하는 워커 함수.
+
+    ProcessPoolExecutor에서 pickle 직렬화가 가능하도록
+    모듈 레벨에 정의하고, BackgroundExtractor 인스턴스는
+    워커 내부에서 재생성한다.
+
+    Args:
+        args_tuple: (image_id, image_dir_str, train_csv_str,
+                     patch_size, min_quality, overlap, blur_threshold,
+                     patches_per_image)
+
+    Returns:
+        list of patch_info dicts (패치 이미지 제외 — 메인 프로세스에서 저장)
+        또는 빈 리스트
+    """
+    (image_id, image_dir_str, train_csv_str,
+     patch_size, min_quality, overlap, blur_threshold,
+     patches_per_image) = args_tuple
+
+    image_path = Path(image_dir_str) / image_id
+    if not image_path.exists():
+        return []
+
+    # 워커 내부에서 필요한 객체 재생성 (pickle 회피)
+    extractor = BackgroundExtractor(
+        patch_size=patch_size,
+        min_quality=min_quality,
+        overlap=overlap,
+        blur_threshold=blur_threshold,
+    )
+
+    train_df = pd.read_csv(train_csv_str)
+
+    patches = extractor.extract_patches_from_image(image_path, train_df, image_id)
+
+    # 품질 상위 N개만 선택
+    if len(patches) > patches_per_image:
+        patches = sorted(patches, key=lambda x: x[1]['quality_score'], reverse=True)
+        patches = patches[:patches_per_image]
+
+    # 패치 이미지와 메타데이터를 함께 반환
+    # (이미지는 numpy array → pickle 가능)
+    results = []
+    for patch_img, patch_info in patches:
+        results.append((patch_img, patch_info))
+
+    return results
 
 
 class BackgroundExtractor:
@@ -217,7 +272,8 @@ class BackgroundExtractor:
         return patches
     
     def extract_backgrounds(self, image_dir, train_csv, output_dir,
-                          patches_per_image=5, max_images=None):
+                          patches_per_image=5, max_images=None,
+                          num_workers=0):
         """
         Extract clean backgrounds from entire dataset.
         
@@ -227,6 +283,7 @@ class BackgroundExtractor:
             output_dir: Output directory
             patches_per_image: Target patches per image
             max_images: Maximum images to process (None = all)
+            num_workers: 병렬 워커 수 (0 = 순차 처리, >=2 = ProcessPoolExecutor)
             
         Returns:
             Dictionary with extraction statistics
@@ -266,53 +323,107 @@ class BackgroundExtractor:
         }
         
         inventory = []
+        use_parallel = num_workers > 1 and len(all_image_ids) > 10
         
-        # Process each image
-        for image_id in tqdm(all_image_ids, desc="Extracting backgrounds"):
-            image_path = image_dir / image_id
+        if use_parallel:
+            # ── 병렬 경로: ProcessPoolExecutor ──
+            print(f"  병렬 모드: {num_workers} workers, {len(all_image_ids)} images")
             
-            if not image_path.exists():
-                continue
+            tasks = [
+                (image_id, str(image_dir), str(train_csv),
+                 self.patch_size, self.min_quality, self.overlap,
+                 self.blur_threshold, patches_per_image)
+                for image_id in all_image_ids
+            ]
             
-            # Extract patches
-            patches = self.extract_patches_from_image(image_path, train_df, image_id)
+            all_results = []  # list of (patch_img, patch_info) lists
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                futures = {
+                    executor.submit(_extract_patches_from_single_image, t): t[0]
+                    for t in tasks
+                }
+                for future in tqdm(as_completed(futures),
+                                   total=len(futures),
+                                   desc="Extracting backgrounds (parallel)"):
+                    result = future.result()
+                    if result:
+                        all_results.append(result)
             
-            # Limit patches per image
-            if len(patches) > patches_per_image:
-                # Sort by quality and take top N
-                patches = sorted(patches, key=lambda x: x[1]['quality_score'], reverse=True)
-                patches = patches[:patches_per_image]
-            
-            # Save patches
-            for idx, (patch, info) in enumerate(patches):
-                bg_type = info['background_type']
-                quality = info['quality_score']
+            # 메인 프로세스에서 패치 저장 + 통계 집계
+            for patches in all_results:
+                for idx, (patch, info) in enumerate(patches):
+                    bg_type = info['background_type']
+                    quality = info['quality_score']
+                    
+                    type_dir = output_dir / bg_type
+                    type_dir.mkdir(exist_ok=True)
+                    
+                    image_id = info['image_id']
+                    patch_filename = f"{image_id.replace('.jpg', '')}_patch{idx}.png"
+                    patch_path = type_dir / patch_filename
+                    
+                    patch_bgr = cv2.cvtColor(patch, cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(str(patch_path), patch_bgr)
+                    
+                    info['patch_path'] = str(patch_path.relative_to(output_dir))
+                    inventory.append(info)
+                    
+                    stats['total_patches'] += 1
+                    stats['patches_by_type'][bg_type] = stats['patches_by_type'].get(bg_type, 0) + 1
+                    
+                    if quality >= 0.9:
+                        stats['patches_by_quality']['high'] += 1
+                    elif quality >= 0.7:
+                        stats['patches_by_quality']['medium'] += 1
+                    else:
+                        stats['patches_by_quality']['low'] += 1
+        else:
+            # ── 순차 경로 (기존 동작) ──
+            for image_id in tqdm(all_image_ids, desc="Extracting backgrounds"):
+                image_path = image_dir / image_id
                 
-                # Create type directory
-                type_dir = output_dir / bg_type
-                type_dir.mkdir(exist_ok=True)
+                if not image_path.exists():
+                    continue
                 
-                # Save patch
-                patch_filename = f"{image_id.replace('.jpg', '')}_patch{idx}.png"
-                patch_path = type_dir / patch_filename
+                # Extract patches
+                patches = self.extract_patches_from_image(image_path, train_df, image_id)
                 
-                patch_bgr = cv2.cvtColor(patch, cv2.COLOR_RGB2BGR)
-                cv2.imwrite(str(patch_path), patch_bgr)
+                # Limit patches per image
+                if len(patches) > patches_per_image:
+                    # Sort by quality and take top N
+                    patches = sorted(patches, key=lambda x: x[1]['quality_score'], reverse=True)
+                    patches = patches[:patches_per_image]
                 
-                # Update info
-                info['patch_path'] = str(patch_path.relative_to(output_dir))
-                inventory.append(info)
-                
-                # Update statistics
-                stats['total_patches'] += 1
-                stats['patches_by_type'][bg_type] = stats['patches_by_type'].get(bg_type, 0) + 1
-                
-                if quality >= 0.9:
-                    stats['patches_by_quality']['high'] += 1
-                elif quality >= 0.7:
-                    stats['patches_by_quality']['medium'] += 1
-                else:
-                    stats['patches_by_quality']['low'] += 1
+                # Save patches
+                for idx, (patch, info) in enumerate(patches):
+                    bg_type = info['background_type']
+                    quality = info['quality_score']
+                    
+                    # Create type directory
+                    type_dir = output_dir / bg_type
+                    type_dir.mkdir(exist_ok=True)
+                    
+                    # Save patch
+                    patch_filename = f"{image_id.replace('.jpg', '')}_patch{idx}.png"
+                    patch_path = type_dir / patch_filename
+                    
+                    patch_bgr = cv2.cvtColor(patch, cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(str(patch_path), patch_bgr)
+                    
+                    # Update info
+                    info['patch_path'] = str(patch_path.relative_to(output_dir))
+                    inventory.append(info)
+                    
+                    # Update statistics
+                    stats['total_patches'] += 1
+                    stats['patches_by_type'][bg_type] = stats['patches_by_type'].get(bg_type, 0) + 1
+                    
+                    if quality >= 0.9:
+                        stats['patches_by_quality']['high'] += 1
+                    elif quality >= 0.7:
+                        stats['patches_by_quality']['medium'] += 1
+                    else:
+                        stats['patches_by_quality']['low'] += 1
         
         # Save inventory
         inventory_path = output_dir / 'background_inventory.json'
@@ -370,6 +481,12 @@ def main():
         default=None,
         help='Maximum images to process (for testing)'
     )
+    parser.add_argument(
+        '--workers',
+        type=int,
+        default=0,
+        help='병렬 워커 수 (0=순차 처리, -1=자동 감지, N=N개 워커)'
+    )
     
     args = parser.parse_args()
     
@@ -384,6 +501,15 @@ def main():
     print(f"Min quality: {args.min_quality}")
     if args.max_images:
         print(f"Max images: {args.max_images}")
+    
+    # 워커 수 결정
+    num_workers = args.workers
+    if num_workers < 0:
+        cpu_count = os.cpu_count() or 2
+        num_workers = max(1, cpu_count - 1)
+        print(f"Workers: {num_workers} (auto-detected, CPU: {cpu_count})")
+    else:
+        print(f"Workers: {num_workers or 'sequential'}")
     print("="*80)
     
     # Create extractor
@@ -400,7 +526,8 @@ def main():
         train_csv=args.train_csv,
         output_dir=args.output_dir,
         patches_per_image=args.patches_per_image,
-        max_images=args.max_images
+        max_images=args.max_images,
+        num_workers=num_workers
     )
     
     # Print statistics

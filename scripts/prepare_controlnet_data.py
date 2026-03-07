@@ -12,6 +12,7 @@ Usage:
     python scripts/prepare_controlnet_data.py --roi_metadata data/processed/roi_patches/roi_metadata.csv --skip_validation
 """
 import argparse
+import os
 from pathlib import Path
 import pandas as pd
 import sys
@@ -177,6 +178,12 @@ def main():
         default=16,
         help='Number of samples for visual validation'
     )
+    parser.add_argument(
+        '--workers',
+        type=int,
+        default=0,
+        help='병렬 워커 수 (0=순차 처리, -1=자동 감지, N=N개 워커)'
+    )
     
     args = parser.parse_args()
     
@@ -224,6 +231,15 @@ def main():
         print(f"Per-class cap: {args.per_class_cap} (rare threshold: {args.rare_class_threshold})")
     if class_margin_overrides:
         print(f"Edge margin overrides: {class_margin_overrides}")
+    
+    # 워커 수 결정
+    num_workers = args.workers
+    if num_workers < 0:
+        cpu_count = os.cpu_count() or 2
+        num_workers = max(1, cpu_count - 1)
+        print(f"Workers: {num_workers} (auto-detected, CPU: {cpu_count})")
+    else:
+        print(f"Workers: {num_workers or 'sequential'}")
     print("="*80)
     
     # Load ROI metadata
@@ -281,6 +297,7 @@ def main():
         per_class_cap=args.per_class_cap,
         rare_class_threshold_count=args.rare_class_threshold,
         class_margin_overrides=class_margin_overrides,
+        num_workers=num_workers,
     )
     
     # Print final summary

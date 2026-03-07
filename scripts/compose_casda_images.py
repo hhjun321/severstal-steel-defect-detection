@@ -848,6 +848,11 @@ def _compose_single_task(args: dict) -> Optional[dict]:
         "scale_factor": round(scale_factor, 6),
     }
     
+    # 합성 변형 인덱스 (compositions_per_roi > 1일 때 추적용)
+    composition_variant = args.get('composition_variant', 0)
+    if composition_variant > 0:
+        entry["composition_variant"] = composition_variant
+    
     if defect_bbox_original:
         entry["defect_bbox_original"] = list(defect_bbox_original)
     if defect_subtype != 'unknown':
@@ -883,6 +888,7 @@ def compose_all(
     smooth_ksize: int = 21,
     smooth_sigma: float = 7.0,
     brightness_tolerance: float = 30.0,
+    compositions_per_roi: int = 1,
 ):
     """
     전체 합성 파이프라인 실행.
@@ -912,6 +918,9 @@ def compose_all(
         smooth_ksize: 가우시안 커널 크기 (홀수, 기본 21)
         smooth_sigma: 가우시안 시그마 (기본 7.0)
         brightness_tolerance: 배경 밝기 매칭 허용 오차 (±, 기본 30.0, 0이면 비활성)
+        compositions_per_roi: 각 생성 이미지당 합성 변형 수 (기본 1).
+            N>1이면 각 ROI에 대해 서로 다른 (배경, jitter, scale) 조합으로
+            N개의 합성 이미지를 생성한다. GPU 비용 없이 pruning 풀을 N배 확대.
     """
     pipeline_start = time.time()
     rng = random.Random(seed)
@@ -926,6 +935,13 @@ def compose_all(
             logger.info(f"  Multi-Scale: [{scale_min:.4f}, {scale_max:.4f}]")
         if use_smooth_mask:
             logger.info(f"  Smooth Mask: ksize={smooth_ksize}, sigma={smooth_sigma}")
+    if compositions_per_roi > 1:
+        logger.info(f"  Compositions per ROI: {compositions_per_roi} "
+                    f"(pruning 풀 {compositions_per_roi}x 확대)")
+    elif compositions_per_roi < 1:
+        raise ValueError(
+            f"compositions_per_roi는 1 이상이어야 합니다 (입력: {compositions_per_roi})"
+        )
     if brightness_tolerance > 0:
         logger.info(f"밝기 매칭 활성화: tolerance=±{brightness_tolerance:.1f}")
     else:
@@ -1031,6 +1047,8 @@ def compose_all(
     tasks = []
     stats = {
         'total': len(generated_images),
+        'total_tasks': 0,  # compositions_per_roi 반영된 실제 task 수
+        'compositions_per_roi': compositions_per_roi,
         'success': 0,
         'fail_no_roi_meta': 0,
         'fail_no_hint': 0,
@@ -1084,61 +1102,81 @@ def compose_all(
         target_brightness = gen_brightness.get(filename)  # None이면 밝기 필터 비활성
         
         roi_x_center = (roi_bbox[0] + roi_bbox[2]) // 2
-        bg_name = bg_pool.get_compatible_background(
-            defect_subtype=defect_subtype,
-            roi_x_center=roi_x_center,
-            target_brightness=target_brightness,
-            brightness_tolerance=brightness_tolerance,
-            rng=rng,
-        )
         
-        if bg_name is None:
-            stats['fail_no_background'] += 1
-            continue
-        
-        bg_path = clean_images_dir / bg_name
-        
-        # 품질 점수 조회
+        # 품질 점수 조회 (composition variant 간 공유)
         quality_score = get_quality_score(
             quality_map, filename, default=default_quality_score
         )
         
-        out_img_name = filename
-        out_mask_name = filename.replace(".png", "_mask.png")
+        # 각 생성 이미지에 대해 compositions_per_roi 개의 합성 변형 생성
+        # 매 반복마다 다른 (배경, jitter_x, scale_factor) 조합 사용
+        stem = filename.replace(".png", "")
         
-        # Tier-1 증강: 이미지별 랜덤 jitter_x, scale_factor 생성
-        img_jitter_x = rng.randint(-jitter_range, jitter_range) if jitter_range > 0 else 0
-        img_scale_factor = rng.uniform(scale_min, scale_max) if scale_min < scale_max else scale_min
-        
-        task = {
-            'img_path': str(img_path),
-            'hint_path': str(hint_path),
-            'bg_path': str(bg_path),
-            'roi_bbox': list(roi_bbox),
-            'class_id': class_id,
-            'filename': filename,
-            'bg_name': bg_name,
-            'quality_score': quality_score,
-            'defect_subtype': defect_subtype,
-            'background_type': background_type,
-            'defect_bbox_original': list(roi_meta['defect_bbox']) if roi_meta.get('defect_bbox') else None,
-            'out_img_path': str(out_img_dir / out_img_name),
-            'out_mask_path': str(out_mask_dir / out_mask_name),
-            'dilation_px': dilation_px,
-            'blend_mode': blend_mode,
-            'mask_threshold': mask_threshold,
-            'png_compression': png_compression,
-            # Tier-1 증강 파라미터
-            'jitter_x': img_jitter_x,
-            'scale_factor': img_scale_factor,
-            'use_smooth_mask': use_smooth_mask,
-            'smooth_ksize': smooth_ksize,
-            'smooth_sigma': smooth_sigma,
-        }
-        tasks.append(task)
+        for comp_idx in range(compositions_per_roi):
+            bg_name = bg_pool.get_compatible_background(
+                defect_subtype=defect_subtype,
+                roi_x_center=roi_x_center,
+                target_brightness=target_brightness,
+                brightness_tolerance=brightness_tolerance,
+                rng=rng,
+            )
+            
+            if bg_name is None:
+                stats['fail_no_background'] += 1
+                continue
+            
+            bg_path = clean_images_dir / bg_name
+            
+            # 출력 파일명: N=1이면 기존과 동일, N>1이면 _comp{idx} 접미사 추가
+            if compositions_per_roi > 1:
+                out_img_name = f"{stem}_comp{comp_idx}.png"
+                out_mask_name = f"{stem}_comp{comp_idx}_mask.png"
+            else:
+                out_img_name = filename
+                out_mask_name = filename.replace(".png", "_mask.png")
+            
+            # Tier-1 증강: 변형별 랜덤 jitter_x, scale_factor 생성
+            img_jitter_x = rng.randint(-jitter_range, jitter_range) if jitter_range > 0 else 0
+            img_scale_factor = rng.uniform(scale_min, scale_max) if scale_min < scale_max else scale_min
+            
+            task = {
+                'img_path': str(img_path),
+                'hint_path': str(hint_path),
+                'bg_path': str(bg_path),
+                'roi_bbox': list(roi_bbox),
+                'class_id': class_id,
+                'filename': filename,
+                'bg_name': bg_name,
+                'quality_score': quality_score,
+                'defect_subtype': defect_subtype,
+                'background_type': background_type,
+                'defect_bbox_original': list(roi_meta['defect_bbox']) if roi_meta.get('defect_bbox') else None,
+                'out_img_path': str(out_img_dir / out_img_name),
+                'out_mask_path': str(out_mask_dir / out_mask_name),
+                'dilation_px': dilation_px,
+                'blend_mode': blend_mode,
+                'mask_threshold': mask_threshold,
+                'png_compression': png_compression,
+                # Tier-1 증강 파라미터
+                'jitter_x': img_jitter_x,
+                'scale_factor': img_scale_factor,
+                'use_smooth_mask': use_smooth_mask,
+                'smooth_ksize': smooth_ksize,
+                'smooth_sigma': smooth_sigma,
+                # 합성 변형 인덱스 (metadata 추적용)
+                'composition_variant': comp_idx,
+            }
+            tasks.append(task)
     
-    logger.info(f"합성 작업 준비 완료: {len(tasks)}개 (사전 필터링 실패: "
-                f"{stats['total'] - len(tasks) - stats['fail_class_parse']}개)")
+    stats['total_tasks'] = len(tasks)
+    
+    if compositions_per_roi > 1:
+        logger.info(f"합성 작업 준비 완료: {len(tasks)}개 "
+                    f"({stats['total']}장 × {compositions_per_roi}변형, "
+                    f"사전 필터링 실패 포함)")
+    else:
+        logger.info(f"합성 작업 준비 완료: {len(tasks)}개 (사전 필터링 실패: "
+                    f"{stats['total'] - len(tasks) - stats['fail_class_parse']}개)")
     
     # ── Step 6: 합성 실행 (순차 또는 병렬) ──
     logger.info("=" * 60)
@@ -1251,6 +1289,11 @@ def compose_all(
                 "scale_factor": round(task['scale_factor'], 6),
             }
             
+            # 합성 변형 인덱스 (compositions_per_roi > 1일 때 추적용)
+            comp_variant = task.get('composition_variant', 0)
+            if comp_variant > 0:
+                entry["composition_variant"] = comp_variant
+            
             if task.get('defect_bbox_original'):
                 entry["defect_bbox_original"] = task['defect_bbox_original']
             if task['defect_subtype'] != 'unknown':
@@ -1307,9 +1350,12 @@ def compose_all(
             "smooth_ksize": smooth_ksize,
             "smooth_sigma": smooth_sigma,
             "brightness_tolerance": brightness_tolerance,
+            "compositions_per_roi": compositions_per_roi,
         },
         "statistics": {
             "total_generated": stats['total'],
+            "total_tasks": stats['total_tasks'],
+            "compositions_per_roi": compositions_per_roi,
             "success": stats['success'],
             "fail_no_roi_meta": stats['fail_no_roi_meta'],
             "fail_no_hint": stats['fail_no_hint'],
@@ -1317,7 +1363,7 @@ def compose_all(
             "fail_blend": stats['fail_blend'],
             "fail_class_parse": stats['fail_class_parse'],
             "success_rate": round(
-                stats['success'] / max(stats['total'], 1) * 100, 1
+                stats['success'] / max(stats['total_tasks'], 1) * 100, 1
             ),
             "blend_methods": stats['blend_methods'],
             "class_distribution": {
@@ -1350,8 +1396,11 @@ def compose_all(
     logger.info("CASDA Composed 합성 완료")
     logger.info("=" * 60)
     logger.info(f"  입력 생성 이미지: {stats['total']}장")
+    if compositions_per_roi > 1:
+        logger.info(f"  합성 변형 수: {compositions_per_roi}x → "
+                    f"총 {stats['total_tasks']}개 task 생성")
     logger.info(f"  합성 성공: {stats['success']}장 "
-                f"({stats['success']/max(stats['total'],1)*100:.1f}%)")
+                f"({stats['success']/max(stats['total_tasks'],1)*100:.1f}%)")
     logger.info(f"  실패 — ROI 메타 없음: {stats['fail_no_roi_meta']}")
     logger.info(f"  실패 — 힌트 없음: {stats['fail_no_hint']}")
     logger.info(f"  실패 — 배경 없음: {stats['fail_no_background']}")
@@ -1489,6 +1538,13 @@ def main():
         "--brightness-tolerance", type=float, default=30.0,
         help="배경 밝기 매칭 허용 오차 ±N (0=비활성, 기본: 30.0, 권장: 25~40)",
     )
+    # ── Pruning 풀 확대 옵션 ──
+    parser.add_argument(
+        "--compositions-per-roi", type=int, default=1,
+        help="각 생성 이미지당 합성 변형 수 (기본: 1). "
+             "N>1이면 각 ROI에 대해 서로 다른 (배경, jitter, scale) 조합으로 "
+             "N개의 합성 이미지를 생성하여 pruning 풀을 N배 확대. GPU 비용 없음",
+    )
     
     args = parser.parse_args()
     
@@ -1530,6 +1586,7 @@ def main():
         smooth_ksize=args.smooth_ksize,
         smooth_sigma=args.smooth_sigma,
         brightness_tolerance=args.brightness_tolerance,
+        compositions_per_roi=args.compositions_per_roi,
     )
 
 

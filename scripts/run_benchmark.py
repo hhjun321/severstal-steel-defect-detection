@@ -257,6 +257,7 @@ def inject_casda_to_baseline(
     prefix: str = CASDA_PREFIX,
     max_samples: Optional[int] = None,
     suitability_threshold: Optional[float] = None,
+    stratified: bool = False,
 ) -> int:
     """
     CASDA 합성 이미지/라벨을 baseline_raw YOLO 데이터셋의 train/에 주입한다.
@@ -273,6 +274,7 @@ def inject_casda_to_baseline(
         prefix: 주입 파일 접두사 (clean 시 이 prefix로 삭제)
         max_samples: 주입할 최대 합성 이미지 수 (None이면 전체)
         suitability_threshold: 최소 suitability 점수 (None이면 필터링 없음)
+        stratified: True이면 클래스별 균등 분배 pruning (stratified top-k)
 
     Returns:
         주입된 이미지 수
@@ -295,6 +297,7 @@ def inject_casda_to_baseline(
         casda_config = {
             'pruning_top_k': max_samples or 99999,
             'suitability_threshold': suitability_threshold or 0.0,
+            'stratified': stratified,
         }
 
     count = _add_casda_to_training(
@@ -1337,23 +1340,43 @@ Examples:
                     casda_data_dir = casda_cfg.get('full_dir', '')
 
             if casda_data_dir and os.path.exists(casda_data_dir):
-                # ratio 그룹이면 max_samples 제한 적용
+                # pruning 파라미터 결정: ratio 그룹 → casda_pruning 그룹 → 전체
                 ratio_max_samples = None
+                suitability_thresh = None
+                use_stratified = False
+
                 if group_key in casda_ratio_map:
+                    # ratio 그룹: 비율 기반 max_samples
                     _, ratio_max_samples = casda_ratio_map[group_key]
+                else:
+                    # 그룹 config에서 casda_pruning 설정 읽기
+                    group_cfg = config.get('dataset_groups', {}).get(group_key, {})
+                    pruning_cfg = group_cfg.get('casda_pruning', {})
+                    if pruning_cfg.get('enabled', False):
+                        ratio_max_samples = pruning_cfg.get('top_k', 2000)
+                        suitability_thresh = pruning_cfg.get(
+                            'suitability_threshold', 0.0)
+                        use_stratified = pruning_cfg.get('stratified', False)
 
                 logging.info(f"\n{'='*70}")
                 logging.info(f"INJECT: {group_key} → baseline_raw")
                 logging.info(f"  Source: {casda_data_dir}")
                 logging.info(f"  Target: {baseline_yolo_dir}")
                 if ratio_max_samples is not None:
-                    logging.info(f"  Max samples: {ratio_max_samples} (ratio-limited)")
+                    mode_str = 'stratified' if use_stratified else 'global'
+                    logging.info(
+                        f"  Max samples: {ratio_max_samples} ({mode_str} top-k)")
+                if suitability_thresh is not None:
+                    logging.info(
+                        f"  Suitability threshold: {suitability_thresh}")
                 logging.info(f"{'='*70}")
 
                 inject_count = inject_casda_to_baseline(
                     baseline_dir=baseline_yolo_dir,
                     casda_dir=casda_data_dir,
                     max_samples=ratio_max_samples,
+                    suitability_threshold=suitability_thresh,
+                    stratified=use_stratified,
                 )
                 casda_injected = True
                 logging.info(f"  → {inject_count} images injected")

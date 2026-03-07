@@ -22,11 +22,97 @@ from typing import Dict, List, Tuple, Optional
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
+import os
 
 from ..utils.rle_utils import decode_mask_from_csv, get_all_masks_for_image, build_image_index
 from src.analysis.defect_characterization import DefectCharacterizer
 from src.analysis.background_characterization import BackgroundAnalyzer
 from src.analysis.roi_suitability import ROISuitabilityEvaluator
+
+
+# ── 병렬 워커 함수 (ProcessPoolExecutor용 — 모듈 레벨 정의 필수) ──
+
+def _process_single_image_worker(args_tuple):
+    """
+    단일 이미지에서 ROI를 추출하는 워커 함수.
+
+    ProcessPoolExecutor에서 pickle 직렬화가 가능하도록
+    모듈 레벨에 정의. ROIExtractor 인스턴스를 워커 내에서 재생성한다.
+
+    Args:
+        args_tuple: (image_id, image_dir_str, train_csv_str,
+                     roi_size, min_suitability, grid_size,
+                     save_patches, output_dir_str)
+
+    Returns:
+        list of roi_data dicts, 또는 빈 리스트
+    """
+    (image_id, image_dir_str, train_csv_str,
+     roi_size, min_suitability, grid_size,
+     save_patches, output_dir_str) = args_tuple
+
+    from pathlib import Path
+
+    image_path = str(Path(image_dir_str) / image_id)
+    if not Path(image_path).exists():
+        return []
+
+    # 워커 내부에서 필요한 객체 재생성 (pickle 회피)
+    defect_analyzer = DefectCharacterizer()
+    background_analyzer = BackgroundAnalyzer(
+        grid_size=grid_size,
+        variance_threshold=100.0,
+        edge_threshold=0.3,
+    )
+    roi_evaluator = ROISuitabilityEvaluator(defect_analyzer, background_analyzer)
+
+    extractor = ROIExtractor(
+        defect_analyzer=defect_analyzer,
+        background_analyzer=background_analyzer,
+        roi_evaluator=roi_evaluator,
+        roi_size=roi_size,
+        min_suitability=min_suitability,
+    )
+
+    import pandas as pd
+    train_df = pd.read_csv(train_csv_str)
+    image_index = build_image_index(train_df)
+
+    # 이미지 로드
+    image = cv2.imread(image_path)
+    if image is None:
+        return []
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    h, w = image_rgb.shape[:2]
+
+    masks = get_all_masks_for_image(image_id, train_df, shape=(h, w),
+                                    image_index=image_index)
+    if len(masks) == 0:
+        return []
+
+    roi_results, _, _ = extractor.process_single_image(
+        image_path, train_df, image_id,
+        image_rgb=image_rgb, masks=masks, image_index=image_index,
+    )
+
+    if len(roi_results) == 0:
+        return []
+
+    output_dir = Path(output_dir_str)
+
+    # 패치 저장
+    all_roi_data = []
+    for roi_data in roi_results:
+        if save_patches:
+            class_id = roi_data['class_id']
+            mask = masks.get(class_id)
+            if mask is not None:
+                roi_data = extractor.save_roi_data(
+                    image_rgb, mask, roi_data, output_dir, save_patches
+                )
+        all_roi_data.append(roi_data)
+
+    return all_roi_data
 
 
 class ROIExtractor:
@@ -292,47 +378,81 @@ class ROIExtractor:
         
         all_roi_data = []
         
-        # Process each image (single-load pattern)
-        for image_id in tqdm(image_ids, desc="Processing images"):
-            image_path = str(image_dir / image_id)
+        use_parallel = num_workers > 1 and len(image_ids) > 10
+        
+        if use_parallel:
+            # ── 병렬 경로: ProcessPoolExecutor ──
+            print(f"  병렬 모드: {num_workers} workers, {len(image_ids)} images")
             
-            if not Path(image_path).exists():
-                continue
+            # output_dir 하위 디렉토리 미리 생성 (워커에서 race condition 방지)
+            (output_dir / 'images').mkdir(parents=True, exist_ok=True)
+            (output_dir / 'masks').mkdir(parents=True, exist_ok=True)
             
-            # Load image ONCE
-            image = cv2.imread(image_path)
-            if image is None:
-                continue
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            h, w = image_rgb.shape[:2]
+            # BackgroundAnalyzer의 grid_size를 워커에 전달
+            grid_size = self.background_analyzer.grid_size if hasattr(
+                self.background_analyzer, 'grid_size') else 64
             
-            # Decode masks ONCE using pre-built index
-            masks = get_all_masks_for_image(image_id, train_df, shape=(h, w),
-                                            image_index=image_index)
+            tasks = [
+                (img_id, str(image_dir), str(train_csv),
+                 self.roi_size, self.min_suitability, grid_size,
+                 save_patches, str(output_dir))
+                for img_id in image_ids
+            ]
             
-            if len(masks) == 0:
-                continue
-            
-            # Extract ROIs (pass pre-loaded image and masks)
-            roi_results, _, _ = self.process_single_image(
-                image_path, train_df, image_id,
-                image_rgb=image_rgb, masks=masks, image_index=image_index
-            )
-            
-            if len(roi_results) == 0:
-                continue
-            
-            # Save each ROI (reuse already-loaded image and masks)
-            for roi_data in roi_results:
-                if save_patches:
-                    class_id = roi_data['class_id']
-                    mask = masks.get(class_id)
-                    if mask is not None:
-                        roi_data = self.save_roi_data(
-                            image_rgb, mask, roi_data, output_dir, save_patches
-                        )
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                futures = {
+                    executor.submit(_process_single_image_worker, t): t[0]
+                    for t in tasks
+                }
+                for future in tqdm(as_completed(futures),
+                                   total=len(futures),
+                                   desc="Processing images (parallel)"):
+                    result = future.result()
+                    if result:
+                        all_roi_data.extend(result)
+        else:
+            # ── 순차 경로 (기존 동작) ──
+            # Process each image (single-load pattern)
+            for image_id in tqdm(image_ids, desc="Processing images"):
+                image_path = str(image_dir / image_id)
                 
-                all_roi_data.append(roi_data)
+                if not Path(image_path).exists():
+                    continue
+                
+                # Load image ONCE
+                image = cv2.imread(image_path)
+                if image is None:
+                    continue
+                image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                h, w = image_rgb.shape[:2]
+                
+                # Decode masks ONCE using pre-built index
+                masks = get_all_masks_for_image(image_id, train_df, shape=(h, w),
+                                                image_index=image_index)
+                
+                if len(masks) == 0:
+                    continue
+                
+                # Extract ROIs (pass pre-loaded image and masks)
+                roi_results, _, _ = self.process_single_image(
+                    image_path, train_df, image_id,
+                    image_rgb=image_rgb, masks=masks, image_index=image_index
+                )
+                
+                if len(roi_results) == 0:
+                    continue
+                
+                # Save each ROI (reuse already-loaded image and masks)
+                for roi_data in roi_results:
+                    if save_patches:
+                        class_id = roi_data['class_id']
+                        mask = masks.get(class_id)
+                        if mask is not None:
+                            roi_data = self.save_roi_data(
+                                image_rgb, mask, roi_data, output_dir, save_patches
+                            )
+                    
+                    all_roi_data.append(roi_data)
         
         # Convert to DataFrame
         roi_df = pd.DataFrame(all_roi_data)

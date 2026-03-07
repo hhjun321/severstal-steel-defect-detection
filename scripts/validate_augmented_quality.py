@@ -14,7 +14,9 @@ from pathlib import Path
 import json
 import numpy as np
 import cv2
+import os
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 from skimage.metrics import structural_similarity as ssim
 
@@ -188,13 +190,14 @@ class QualityValidator:
         
         return validation_result
     
-    def validate_dataset(self, augmented_dir, output_dir):
+    def validate_dataset(self, augmented_dir, output_dir, num_workers=0):
         """
         Validate entire augmented dataset.
         
         Args:
             augmented_dir: Directory with augmented data
             output_dir: Output directory for validation results
+            num_workers: 병렬 워커 수 (0 = 순차 처리, >=2 = 병렬 처리)
             
         Returns:
             Validation statistics
@@ -216,33 +219,59 @@ class QualityValidator:
         validation_results = []
         passed_samples = []
         rejected_samples = []
+        use_parallel = num_workers > 1 and len(all_metadata) > 10
         
-        for metadata in tqdm(all_metadata, desc="Validating samples"):
-            # Load image and mask
-            image_path = augmented_dir / 'images' / metadata['image_filename']
-            mask_path = augmented_dir / 'masks' / metadata['mask_filename']
-            
-            if not image_path.exists() or not mask_path.exists():
-                continue
-            
-            generated_image = cv2.imread(str(image_path))
-            generated_image = cv2.cvtColor(generated_image, cv2.COLOR_BGR2RGB)
-            
-            defect_mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-            
-            # Validate
-            validation_result = self.validate_sample(
-                generated_image, defect_mask, metadata
-            )
-            
-            # Combine with metadata
-            result = {**metadata, **validation_result}
-            validation_results.append(result)
-            
-            if validation_result['passed']:
-                passed_samples.append(result)
-            else:
-                rejected_samples.append(result)
+        if use_parallel:
+            # ── 병렬 경로: ProcessPoolExecutor ──
+            print(f"  병렬 모드: {num_workers} workers")
+            worker_args = []
+            for metadata in all_metadata:
+                image_path = str(augmented_dir / 'images' / metadata['image_filename'])
+                mask_path = str(augmented_dir / 'masks' / metadata['mask_filename'])
+                worker_args.append((image_path, mask_path, metadata,
+                                    self.min_quality_score))
+
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                futures = [executor.submit(_validate_single_sample, arg)
+                           for arg in worker_args]
+                for future in tqdm(as_completed(futures), total=len(futures),
+                                   desc="Validating samples"):
+                    result = future.result()
+                    if result is None:
+                        continue
+                    validation_results.append(result)
+                    if result['passed']:
+                        passed_samples.append(result)
+                    else:
+                        rejected_samples.append(result)
+        else:
+            # ── 순차 경로 (기존 로직) ──
+            for metadata in tqdm(all_metadata, desc="Validating samples"):
+                # Load image and mask
+                image_path = augmented_dir / 'images' / metadata['image_filename']
+                mask_path = augmented_dir / 'masks' / metadata['mask_filename']
+                
+                if not image_path.exists() or not mask_path.exists():
+                    continue
+                
+                generated_image = cv2.imread(str(image_path))
+                generated_image = cv2.cvtColor(generated_image, cv2.COLOR_BGR2RGB)
+                
+                defect_mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+                
+                # Validate
+                validation_result = self.validate_sample(
+                    generated_image, defect_mask, metadata
+                )
+                
+                # Combine with metadata
+                result = {**metadata, **validation_result}
+                validation_results.append(result)
+                
+                if validation_result['passed']:
+                    passed_samples.append(result)
+                else:
+                    rejected_samples.append(result)
         
         # Compute statistics
         stats = self.compute_validation_statistics(validation_results)
@@ -342,6 +371,49 @@ class QualityValidator:
         print(f"Saved quality report to: {report_path}")
 
 
+# ======================================================================
+# 병렬 워커 함수 (ProcessPoolExecutor용 — 모듈 레벨 정의 필수)
+# ======================================================================
+
+def _validate_single_sample(args_tuple):
+    """
+    단일 샘플의 품질을 검증하는 워커 함수.
+
+    ProcessPoolExecutor에서 pickle 직렬화가 가능하도록 모듈 레벨에 정의.
+    각 워커 프로세스에서 QualityValidator를 생성하여 사용한다.
+
+    Args:
+        args_tuple: (image_path_str, mask_path_str, metadata_dict, min_quality_score)
+
+    Returns:
+        성공 시: {**metadata, **validation_result} dict
+        실패 시: None
+    """
+    import cv2 as _cv2
+
+    image_path_str, mask_path_str, metadata, min_quality_score = args_tuple
+
+    if not Path(image_path_str).exists() or not Path(mask_path_str).exists():
+        return None
+
+    generated_image = _cv2.imread(image_path_str)
+    if generated_image is None:
+        return None
+    generated_image = _cv2.cvtColor(generated_image, _cv2.COLOR_BGR2RGB)
+
+    defect_mask = _cv2.imread(mask_path_str, _cv2.IMREAD_GRAYSCALE)
+    if defect_mask is None:
+        return None
+
+    # 워커별 validator 인스턴스 (DefectCharacterizer 포함)
+    validator = QualityValidator(min_quality_score=min_quality_score)
+    validation_result = validator.validate_sample(
+        generated_image, defect_mask, metadata
+    )
+
+    return {**metadata, **validation_result}
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Validate quality of augmented defect data'
@@ -364,8 +436,20 @@ def main():
         default=0.7,
         help='Minimum quality score threshold'
     )
+    parser.add_argument(
+        '--workers', type=int, default=0,
+        help='병렬 워커 수 (기본 0 = 순차 처리, -1 = CPU 코어 수 자동 감지, '
+             'N >= 2 = N개 프로세스 병렬 처리)',
+    )
     
     args = parser.parse_args()
+    
+    # 워커 수 결정
+    num_workers = args.workers
+    if num_workers < 0:
+        cpu_count = os.cpu_count() or 1
+        num_workers = max(1, cpu_count - 1)
+        print(f"워커 수 자동 설정: {num_workers} (CPU: {cpu_count})")
     
     # Default output dir
     if args.output_dir is None:
@@ -385,7 +469,8 @@ def main():
     # Validate dataset
     stats = validator.validate_dataset(
         augmented_dir=args.augmented_dir,
-        output_dir=args.output_dir
+        output_dir=args.output_dir,
+        num_workers=num_workers,
     )
     
     # Print summary

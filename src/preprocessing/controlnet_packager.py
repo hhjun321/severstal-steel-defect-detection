@@ -11,9 +11,11 @@ Output format matches standard ControlNet training requirements.
 """
 import ast
 import json
+import os
 import pandas as pd
 import cv2
 import numpy as np
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional
 from tqdm import tqdm
@@ -21,6 +23,84 @@ from tqdm import tqdm
 from .hint_generator import HintImageGenerator
 from .prompt_generator import PromptGenerator
 from ..utils.rle_utils import get_all_masks_for_image
+
+
+# ── 병렬 워커 함수 (ProcessPoolExecutor용 — 모듈 레벨 정의 필수) ──
+
+def _package_single_roi_worker(args_tuple):
+    """
+    단일 ROI를 패키징하는 워커 함수.
+
+    ProcessPoolExecutor에서 pickle 직렬화가 가능하도록
+    모듈 레벨에 정의. HintImageGenerator와 PromptGenerator를
+    워커 내부에서 재생성한다.
+
+    Args:
+        args_tuple: (roi_dict, output_dir_str, create_hints, prompt_style)
+
+    Returns:
+        Updated roi_dict, 또는 None (실패 시)
+    """
+    roi_dict, output_dir_str, create_hints, prompt_style = args_tuple
+    output_dir = Path(output_dir_str)
+
+    # ROI 이미지 로드
+    roi_image_path = Path(roi_dict['roi_image_path'])
+    if not roi_image_path.exists():
+        return None
+    roi_image = cv2.imread(str(roi_image_path))
+    if roi_image is None:
+        return None
+    roi_image_rgb = cv2.cvtColor(roi_image, cv2.COLOR_BGR2RGB)
+
+    # ROI 마스크 로드
+    roi_mask_path = Path(roi_dict['roi_mask_path'])
+    if not roi_mask_path.exists():
+        return None
+    roi_mask = cv2.imread(str(roi_mask_path), cv2.IMREAD_GRAYSCALE)
+    if roi_mask is None:
+        return None
+    roi_mask = (roi_mask > 0).astype(np.uint8)
+
+    # 워커 내부에서 generator 재생성
+    hint_gen = HintImageGenerator()
+    prompt_gen = PromptGenerator(style=prompt_style)
+
+    if create_hints:
+        # hint 이미지 생성
+        hint_image = hint_gen.generate_hint_image(
+            roi_image=roi_image_rgb,
+            roi_mask=roi_mask,
+            defect_metrics=roi_dict,
+            background_type=roi_dict.get('background_type', 'smooth'),
+            stability_score=roi_dict.get('stability_score', 0.5),
+        )
+
+        hint_dir = output_dir / 'hints'
+        hint_dir.mkdir(parents=True, exist_ok=True)
+
+        image_id = roi_dict['image_id']
+        class_id = roi_dict['class_id']
+        region_id = roi_dict['region_id']
+        hint_filename = f"{image_id}_class{class_id}_region{region_id}_hint.png"
+        hint_path = hint_dir / hint_filename
+
+        hint_gen.save_hint_image(hint_image, hint_path)
+        roi_dict['hint_path'] = str(hint_path)
+
+    # prompt 생성
+    prompt = prompt_gen.generate_prompt(
+        defect_subtype=roi_dict.get('defect_subtype', 'general'),
+        background_type=roi_dict.get('background_type', 'smooth'),
+        class_id=roi_dict.get('class_id', 1),
+        stability_score=roi_dict.get('stability_score', 0.5),
+        defect_metrics=roi_dict,
+        suitability_score=roi_dict.get('suitability_score', 0.5),
+    )
+    roi_dict['prompt'] = prompt
+    roi_dict['negative_prompt'] = prompt_gen.generate_negative_prompt()
+
+    return roi_dict
 
 
 class ControlNetDatasetPackager:
@@ -585,6 +665,7 @@ class ControlNetDatasetPackager:
                        class_margin_overrides: Optional[Dict[int, Dict[str, float]]] = None,
                        edge_margin_x: float = 0.1,
                        edge_margin_y: float = 0.05,
+                       num_workers: int = 0,
                        ) -> Path:
         """
         Package complete dataset for ControlNet training.
@@ -614,6 +695,8 @@ class ControlNetDatasetPackager:
                 _edge_filter의 기본 마진을 외부에서 조정 가능.
             edge_margin_y: 상하 엣지 마진 비율 (기본 0.05 = 5%).
                 _edge_filter의 기본 마진을 외부에서 조정 가능.
+            num_workers: 병렬 워커 수 (0=순차 처리, >=2=ProcessPoolExecutor).
+                ROI별 hint 생성 + 이미지 I/O를 병렬화.
             
         Returns:
             Path to output directory
@@ -676,59 +759,86 @@ class ControlNetDatasetPackager:
         
         packaged_data = []
         
-        # Process each ROI
-        for idx, row in tqdm(roi_metadata_df.iterrows(), 
-                            total=len(roi_metadata_df),
-                            desc="Packaging ROIs"):
+        use_parallel = num_workers > 1 and len(roi_metadata_df) > 10
+        
+        if use_parallel:
+            # ── 병렬 경로: ProcessPoolExecutor ──
+            print(f"\n  병렬 모드: {num_workers} workers, {len(roi_metadata_df)} ROIs")
             
-            roi_data = row.to_dict()
+            prompt_style = self.prompt_generator.style if hasattr(
+                self.prompt_generator, 'style') else 'detailed'
             
-            # Load ROI image
-            roi_image_path = Path(row['roi_image_path'])
-            if not roi_image_path.exists():
-                print(f"Warning: Image not found: {roi_image_path}")
-                continue
+            tasks = []
+            for _, row in roi_metadata_df.iterrows():
+                roi_dict = row.to_dict()
+                tasks.append((roi_dict, str(output_dir), create_hints, prompt_style))
             
-            roi_image = cv2.imread(str(roi_image_path))
-            if roi_image is None:
-                print(f"Warning: Failed to read image (corrupt?): {roi_image_path}")
-                continue
-            roi_image_rgb = cv2.cvtColor(roi_image, cv2.COLOR_BGR2RGB)
-            
-            # Load ROI mask
-            roi_mask_path = Path(row['roi_mask_path'])
-            if not roi_mask_path.exists():
-                print(f"Warning: Mask not found: {roi_mask_path}")
-                continue
-            
-            roi_mask = cv2.imread(str(roi_mask_path), cv2.IMREAD_GRAYSCALE)
-            if roi_mask is None:
-                print(f"Warning: Failed to read mask (corrupt?): {roi_mask_path}")
-                continue
-            roi_mask = (roi_mask > 0).astype(np.uint8)
-            
-            # Package this ROI
-            if create_hints:
-                roi_data = self.package_single_roi(
-                    roi_data=roi_data,
-                    roi_image=roi_image_rgb,
-                    roi_mask=roi_mask,
-                    output_dir=output_dir
-                )
-            else:
-                # Just generate prompts
-                prompt = self.prompt_generator.generate_prompt(
-                    defect_subtype=roi_data.get('defect_subtype', 'general'),
-                    background_type=roi_data.get('background_type', 'smooth'),
-                    class_id=roi_data['class_id'],
-                    stability_score=roi_data.get('stability_score', 0.5),
-                    defect_metrics=roi_data,
-                    suitability_score=roi_data.get('suitability_score', 0.5)
-                )
-                roi_data['prompt'] = prompt
-                roi_data['negative_prompt'] = self.prompt_generator.generate_negative_prompt()
-            
-            packaged_data.append(roi_data)
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                futures = {
+                    executor.submit(_package_single_roi_worker, t): i
+                    for i, t in enumerate(tasks)
+                }
+                for future in tqdm(as_completed(futures),
+                                   total=len(futures),
+                                   desc="Packaging ROIs (parallel)"):
+                    result = future.result()
+                    if result is not None:
+                        packaged_data.append(result)
+        else:
+            # ── 순차 경로 (기존 동작) ──
+            # Process each ROI
+            for idx, row in tqdm(roi_metadata_df.iterrows(), 
+                                total=len(roi_metadata_df),
+                                desc="Packaging ROIs"):
+                
+                roi_data = row.to_dict()
+                
+                # Load ROI image
+                roi_image_path = Path(row['roi_image_path'])
+                if not roi_image_path.exists():
+                    print(f"Warning: Image not found: {roi_image_path}")
+                    continue
+                
+                roi_image = cv2.imread(str(roi_image_path))
+                if roi_image is None:
+                    print(f"Warning: Failed to read image (corrupt?): {roi_image_path}")
+                    continue
+                roi_image_rgb = cv2.cvtColor(roi_image, cv2.COLOR_BGR2RGB)
+                
+                # Load ROI mask
+                roi_mask_path = Path(row['roi_mask_path'])
+                if not roi_mask_path.exists():
+                    print(f"Warning: Mask not found: {roi_mask_path}")
+                    continue
+                
+                roi_mask = cv2.imread(str(roi_mask_path), cv2.IMREAD_GRAYSCALE)
+                if roi_mask is None:
+                    print(f"Warning: Failed to read mask (corrupt?): {roi_mask_path}")
+                    continue
+                roi_mask = (roi_mask > 0).astype(np.uint8)
+                
+                # Package this ROI
+                if create_hints:
+                    roi_data = self.package_single_roi(
+                        roi_data=roi_data,
+                        roi_image=roi_image_rgb,
+                        roi_mask=roi_mask,
+                        output_dir=output_dir
+                    )
+                else:
+                    # Just generate prompts
+                    prompt = self.prompt_generator.generate_prompt(
+                        defect_subtype=roi_data.get('defect_subtype', 'general'),
+                        background_type=roi_data.get('background_type', 'smooth'),
+                        class_id=roi_data['class_id'],
+                        stability_score=roi_data.get('stability_score', 0.5),
+                        defect_metrics=roi_data,
+                        suitability_score=roi_data.get('suitability_score', 0.5)
+                    )
+                    roi_data['prompt'] = prompt
+                    roi_data['negative_prompt'] = self.prompt_generator.generate_negative_prompt()
+                
+                packaged_data.append(roi_data)
         
         print(f"\nSuccessfully packaged {len(packaged_data)} ROIs")
         

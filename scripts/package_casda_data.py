@@ -43,9 +43,11 @@ Usage (Colab example):
 
 import argparse
 import json
+import os
 import re
 import shutil
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -210,6 +212,107 @@ def filename_to_sample_name(filename: str) -> str:
     return Path(filename).stem
 
 
+# ── 병렬 워커 함수 (ProcessPoolExecutor용 — 모듈 레벨 정의 필수) ──
+
+def _process_single_generated_image(args_tuple):
+    """
+    단일 생성 이미지를 처리하는 워커 함수.
+
+    이미지 복사 + 마스크 추출 + bbox 계산을 수행한다.
+
+    Args:
+        args_tuple: (img_path_str, hint_dir_str, full_img_dir_str,
+                     full_mask_dir_str, quality_map_for_worker,
+                     sample_name_map_keys, mask_threshold, default_score)
+
+    Returns:
+        (metadata_entry_dict, skipped_reason) 또는 (None, reason)
+    """
+    (img_path_str, hint_dir_str, full_img_dir_str, full_mask_dir_str,
+     quality_score, sample_name, mask_threshold) = args_tuple
+
+    img_path = Path(img_path_str)
+    hint_dir = Path(hint_dir_str)
+    full_img_dir = Path(full_img_dir_str)
+    full_mask_dir = Path(full_mask_dir_str)
+    filename = img_path.name
+
+    # Parse class_id
+    try:
+        class_id = parse_class_id_from_filename(filename)
+    except ValueError:
+        return None, "class_parse"
+
+    # Find hint image for mask extraction
+    hint_filename = f"{sample_name}_hint.png"
+    local_hint_path = hint_dir / hint_filename
+
+    mask = extract_mask_from_hint(str(local_hint_path), threshold=mask_threshold)
+    if mask is None:
+        # No mask found — still include image without mask
+        pass
+
+    # Copy image to casda_full/images/
+    dest_img = full_img_dir / filename
+    shutil.copy2(str(img_path), str(dest_img))
+
+    # Save mask if available
+    mask_rel_path_str = None
+    zero_mask = False
+    if mask is not None:
+        mask_filename = filename.replace(".png", "_mask.png")
+        mask_dest = full_mask_dir / mask_filename
+        cv2.imwrite(str(mask_dest), mask)
+        mask_rel_path_str = f"masks/{mask_filename}"
+        if np.count_nonzero(mask) == 0:
+            zero_mask = True
+
+    # Pre-compute YOLO-format bboxes
+    yolo_bboxes = []
+    yolo_labels = []
+    if mask is not None and np.count_nonzero(mask) > 0:
+        h_mask, w_mask = mask.shape[:2]
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        for cnt in contours:
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            if bw * bh >= 16:
+                cx = (bx + bw / 2.0) / w_mask
+                cy = (by + bh / 2.0) / h_mask
+                nw = bw / w_mask
+                nh = bh / h_mask
+                yolo_bboxes.append([
+                    round(cx, 6), round(cy, 6),
+                    round(nw, 6), round(nh, 6),
+                ])
+                yolo_labels.append(class_id)
+
+    entry = {
+        "image_path": f"images/{filename}",
+        "class_id": class_id,
+        "suitability_score": quality_score,
+    }
+    if mask_rel_path_str:
+        entry["mask_path"] = mask_rel_path_str
+    if yolo_bboxes:
+        entry["bboxes"] = yolo_bboxes
+        entry["labels"] = yolo_labels
+        entry["bbox_format"] = "yolo"
+    if mask is not None:
+        h_mask, w_mask = mask.shape[:2]
+        entry["image_width"] = w_mask
+        entry["image_height"] = h_mask
+
+    skip_reason = None
+    if mask is None:
+        skip_reason = "no_hint"
+    elif zero_mask:
+        skip_reason = "zero_mask"
+
+    return entry, skip_reason
+
+
 def package_data(
     generated_dir: Path,
     summary_json: Path,
@@ -220,6 +323,7 @@ def package_data(
     pruning_top_k: int = 2000,
     mask_threshold: int = 127,
     default_score: float = 1.0,
+    num_workers: int = 0,
 ) -> None:
     """Main packaging logic."""
     
@@ -267,106 +371,141 @@ def package_data(
     skipped_no_mask = 0
     skipped_class_parse = 0
     
-    for img_path in generated_images:
-        filename = img_path.name
-        sample_name = filename_to_sample_name(filename)
+    use_parallel = num_workers > 1 and len(generated_images) > 10
+    
+    if use_parallel:
+        # ── 병렬 경로: ProcessPoolExecutor ──
+        print(f"  병렬 모드: {num_workers} workers, {len(generated_images)} images")
         
-        # Parse class_id
-        try:
-            class_id = parse_class_id_from_filename(filename)
-        except ValueError as e:
-            print(f"  SKIP (class parse): {e}")
-            skipped_class_parse += 1
-            continue
+        tasks = []
+        for img_path in generated_images:
+            filename = img_path.name
+            sample_name = filename_to_sample_name(filename)
+            q_score = get_quality_score(quality_map, filename, default=default_score)
+            tasks.append((
+                str(img_path), str(hint_dir), str(full_img_dir), str(full_mask_dir),
+                q_score, sample_name, mask_threshold
+            ))
         
-        # Get quality score (with sample-name fallback for multi-generation)
-        suitability_score = get_quality_score(quality_map, filename, default=default_score)
-        
-        # Find hint image for mask extraction
-        # Try from results[] first (has exact hint_path), then construct from sample_name
-        result_entry = sample_name_map.get(sample_name, {})
-        hint_path_str = result_entry.get("hint_path", "")
-        
-        # The hint_path in JSON is an absolute Colab path, but we use --hint-dir
-        # Construct the expected hint filename from sample_name
-        hint_filename = f"{sample_name}_hint.png"
-        local_hint_path = hint_dir / hint_filename
-        
-        # Extract mask from hint
-        mask = extract_mask_from_hint(str(local_hint_path), threshold=mask_threshold)
-        
-        if mask is None:
-            # Try alternative: maybe hint file uses a slightly different name
-            # Check if the hint_path from JSON gives a filename we can use
-            if hint_path_str:
-                alt_hint_name = Path(hint_path_str).name
-                alt_hint_path = hint_dir / alt_hint_name
-                mask = extract_mask_from_hint(str(alt_hint_path), threshold=mask_threshold)
+        from tqdm import tqdm
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(_process_single_generated_image, t): t
+                       for t in tasks}
+            for future in tqdm(as_completed(futures),
+                               total=len(futures),
+                               desc="Packaging images (parallel)"):
+                entry, skip_reason = future.result()
+                if entry is None:
+                    if skip_reason == "class_parse":
+                        skipped_class_parse += 1
+                    continue
+                all_metadata.append(entry)
+                if skip_reason == "no_hint":
+                    skipped_no_hint += 1
+                elif skip_reason == "zero_mask":
+                    skipped_no_mask += 1
+    else:
+        # ── 순차 경로 (기존 동작) ──
+        for img_path in generated_images:
+            filename = img_path.name
+            sample_name = filename_to_sample_name(filename)
+            
+            # Parse class_id
+            try:
+                class_id = parse_class_id_from_filename(filename)
+            except ValueError as e:
+                print(f"  SKIP (class parse): {e}")
+                skipped_class_parse += 1
+                continue
+            
+            # Get quality score (with sample-name fallback for multi-generation)
+            suitability_score_val = get_quality_score(quality_map, filename, default=default_score)
+            
+            # Find hint image for mask extraction
+            # Try from results[] first (has exact hint_path), then construct from sample_name
+            result_entry = sample_name_map.get(sample_name, {})
+            hint_path_str = result_entry.get("hint_path", "")
+            
+            # The hint_path in JSON is an absolute Colab path, but we use --hint-dir
+            # Construct the expected hint filename from sample_name
+            hint_filename = f"{sample_name}_hint.png"
+            local_hint_path = hint_dir / hint_filename
+            
+            # Extract mask from hint
+            mask = extract_mask_from_hint(str(local_hint_path), threshold=mask_threshold)
             
             if mask is None:
-                skipped_no_hint += 1
-                # Still include the image but without mask
-                # (CASDASyntheticDataset falls back to whole-image bbox for detection)
-                mask_rel_path = None
-            else:
-                skipped_no_hint -= 0  # found with alternate
-        
-        # Copy image to casda_full/images/
-        dest_img = full_img_dir / filename
-        shutil.copy2(str(img_path), str(dest_img))
-        
-        # Save mask if available
-        mask_rel_path_str = None
-        if mask is not None:
-            mask_filename = filename.replace(".png", "_mask.png")
-            mask_dest = full_mask_dir / mask_filename
-            cv2.imwrite(str(mask_dest), mask)
-            mask_rel_path_str = f"masks/{mask_filename}"
-            # Verify mask has defect pixels
-            defect_pixels = np.count_nonzero(mask)
-            if defect_pixels == 0:
-                skipped_no_mask += 1
-        
-        # Pre-compute YOLO-format bboxes from mask contours
-        # This eliminates cv2.imread at inject/training time
-        yolo_bboxes = []
-        yolo_labels = []
-        if mask is not None and np.count_nonzero(mask) > 0:
-            h_mask, w_mask = mask.shape[:2]
-            contours, _ = cv2.findContours(
-                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
-            for cnt in contours:
-                bx, by, bw, bh = cv2.boundingRect(cnt)
-                if bw * bh >= 16:  # same threshold as downstream consumers
-                    # Normalized YOLO format: cx, cy, w, h (0~1)
-                    cx = (bx + bw / 2.0) / w_mask
-                    cy = (by + bh / 2.0) / h_mask
-                    nw = bw / w_mask
-                    nh = bh / h_mask
-                    yolo_bboxes.append([
-                        round(cx, 6), round(cy, 6),
-                        round(nw, 6), round(nh, 6),
-                    ])
-                    yolo_labels.append(class_id)
-        
-        entry = {
-            "image_path": f"images/{filename}",
-            "class_id": class_id,
-            "suitability_score": suitability_score,
-        }
-        if mask_rel_path_str:
-            entry["mask_path"] = mask_rel_path_str
-        if yolo_bboxes:
-            entry["bboxes"] = yolo_bboxes
-            entry["labels"] = yolo_labels
-            entry["bbox_format"] = "yolo"
-        if mask is not None:
-            h_mask, w_mask = mask.shape[:2]
-            entry["image_width"] = w_mask
-            entry["image_height"] = h_mask
-        
-        all_metadata.append(entry)
+                # Try alternative: maybe hint file uses a slightly different name
+                # Check if the hint_path from JSON gives a filename we can use
+                if hint_path_str:
+                    alt_hint_name = Path(hint_path_str).name
+                    alt_hint_path = hint_dir / alt_hint_name
+                    mask = extract_mask_from_hint(str(alt_hint_path), threshold=mask_threshold)
+                
+                if mask is None:
+                    skipped_no_hint += 1
+                    # Still include the image but without mask
+                    # (CASDASyntheticDataset falls back to whole-image bbox for detection)
+                    mask_rel_path = None
+                else:
+                    skipped_no_hint -= 0  # found with alternate
+            
+            # Copy image to casda_full/images/
+            dest_img = full_img_dir / filename
+            shutil.copy2(str(img_path), str(dest_img))
+            
+            # Save mask if available
+            mask_rel_path_str = None
+            if mask is not None:
+                mask_filename = filename.replace(".png", "_mask.png")
+                mask_dest = full_mask_dir / mask_filename
+                cv2.imwrite(str(mask_dest), mask)
+                mask_rel_path_str = f"masks/{mask_filename}"
+                # Verify mask has defect pixels
+                defect_pixels = np.count_nonzero(mask)
+                if defect_pixels == 0:
+                    skipped_no_mask += 1
+            
+            # Pre-compute YOLO-format bboxes from mask contours
+            # This eliminates cv2.imread at inject/training time
+            yolo_bboxes = []
+            yolo_labels = []
+            if mask is not None and np.count_nonzero(mask) > 0:
+                h_mask, w_mask = mask.shape[:2]
+                contours, _ = cv2.findContours(
+                    mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+                for cnt in contours:
+                    bx, by, bw, bh = cv2.boundingRect(cnt)
+                    if bw * bh >= 16:  # same threshold as downstream consumers
+                        # Normalized YOLO format: cx, cy, w, h (0~1)
+                        cx = (bx + bw / 2.0) / w_mask
+                        cy = (by + bh / 2.0) / h_mask
+                        nw = bw / w_mask
+                        nh = bh / h_mask
+                        yolo_bboxes.append([
+                            round(cx, 6), round(cy, 6),
+                            round(nw, 6), round(nh, 6),
+                        ])
+                        yolo_labels.append(class_id)
+            
+            entry = {
+                "image_path": f"images/{filename}",
+                "class_id": class_id,
+                "suitability_score": suitability_score_val,
+            }
+            if mask_rel_path_str:
+                entry["mask_path"] = mask_rel_path_str
+            if yolo_bboxes:
+                entry["bboxes"] = yolo_bboxes
+                entry["labels"] = yolo_labels
+                entry["bbox_format"] = "yolo"
+            if mask is not None:
+                h_mask, w_mask = mask.shape[:2]
+                entry["image_width"] = w_mask
+                entry["image_height"] = h_mask
+            
+            all_metadata.append(entry)
     
     # Save casda_full metadata
     full_meta_path = full_dir / "metadata.json"
@@ -619,8 +758,21 @@ def main():
         default=127,
         help="Red channel threshold for binary mask extraction (default: 127)",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="병렬 워커 수 (0=순차 처리, -1=자동 감지, N=N개 워커)",
+    )
     
     args = parser.parse_args()
+    
+    # 워커 수 결정
+    num_workers = args.workers
+    if num_workers < 0:
+        cpu_count = os.cpu_count() or 2
+        num_workers = max(1, cpu_count - 1)
+        print(f"Workers: {num_workers} (auto-detected, CPU: {cpu_count})")
     
     package_data(
         generated_dir=Path(args.generated_dir),
@@ -632,6 +784,7 @@ def main():
         pruning_top_k=args.pruning_top_k,
         mask_threshold=args.mask_threshold,
         default_score=args.default_score,
+        num_workers=num_workers,
     )
 
 

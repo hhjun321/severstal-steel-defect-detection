@@ -47,6 +47,7 @@ import logging
 import os
 import subprocess
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -64,9 +65,83 @@ logger = logging.getLogger(__name__)
 # Generation Quality Evaluation
 # =============================================================================
 
+def _evaluate_single_image_cpu(args_tuple: tuple) -> Optional[Dict]:
+    """
+    단일 이미지의 CPU-bound 품질 메트릭을 계산하는 워커 함수.
+
+    ProcessPoolExecutor에서 pickle 직렬화가 가능하도록 모듈 레벨에 정의.
+    3개 기본 메트릭(color, artifact, blur) + SSIM(선택)을 계산한다.
+    LPIPS는 GPU(torch) 모델이 필요하므로 워커에서 제외, 메인 프로세스에서 처리.
+
+    Args:
+        args_tuple: (img_path_str, ref_path_str_or_none, ssim_available)
+
+    Returns:
+        성공 시: {"filename": str, "color": float, "artifact": float,
+                  "blur": float, "ssim": float|None} dict
+        실패 시: None
+    """
+    import cv2
+    import numpy as _np
+
+    img_path_str, ref_path_str, ssim_available = args_tuple
+
+    img = cv2.imread(img_path_str)
+    if img is None:
+        return None
+
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # 3개 기본 메트릭 (모듈 레벨 함수 직접 호출)
+    color_score = _score_color_consistency(img_rgb)
+    artifact_score = _score_artifacts(gray)
+    blur_score = _score_sharpness(gray)
+
+    # SSIM (CPU-bound, skimage 사용)
+    ssim_score = None
+    if ssim_available and ref_path_str is not None:
+        ref_img = cv2.imread(ref_path_str)
+        if ref_img is not None:
+            ssim_score = _compute_ssim(gray, ref_img)
+
+    filename = str(Path(img_path_str).name)
+    return {
+        "filename": filename,
+        "color": color_score,
+        "artifact": artifact_score,
+        "blur": blur_score,
+        "ssim": ssim_score,
+    }
+
+
+def _calc_weighted_quality(
+    color_score: float,
+    artifact_score: float,
+    blur_score: float,
+    ssim_score: Optional[float],
+    lpips_score: Optional[float],
+) -> float:
+    """SSIM/LPIPS 가용성에 따라 동적 가중치를 적용한 품질 점수를 계산한다."""
+    if ssim_score is not None and lpips_score is not None:
+        return (0.30 * color_score + 0.20 * artifact_score
+                + 0.20 * blur_score + 0.15 * ssim_score
+                + 0.15 * (1.0 - lpips_score))
+    elif ssim_score is not None:
+        return (0.30 * color_score + 0.25 * artifact_score
+                + 0.25 * blur_score + 0.20 * ssim_score)
+    elif lpips_score is not None:
+        return (0.30 * color_score + 0.25 * artifact_score
+                + 0.25 * blur_score + 0.20 * (1.0 - lpips_score))
+    else:
+        return (0.40 * color_score + 0.30 * artifact_score
+                + 0.30 * blur_score)
+
+
 def _compute_generation_quality(
     output_dir: Path,
     quality_threshold: float = 0.5,
+    num_workers: int = 0,
 ) -> Dict:
     """생성된 이미지의 정량적 품질을 평가합니다.
 
@@ -157,88 +232,124 @@ def _compute_generation_quality(
     reference_map = _build_reference_map(output_dir)
 
     sample_scores = []
+    use_parallel = num_workers > 1 and len(image_paths) > 10
 
-    for img_path in sorted(image_paths):
-        img = cv2.imread(str(img_path))
-        if img is None:
-            continue
+    if use_parallel:
+        # ── 병렬 경로: CPU-bound 3메트릭 + SSIM을 ProcessPoolExecutor로 처리 ──
+        logger.info(f"  품질 평가 병렬 모드: {num_workers} workers, "
+                    f"{len(image_paths)} images")
 
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # 워커 인자 준비
+        worker_args = []
+        sorted_paths = sorted(image_paths)
+        for img_path in sorted_paths:
+            ref_path_str = None
+            if img_path.name in reference_map:
+                ref_path_str = str(reference_map[img_path.name])
+            worker_args.append((str(img_path), ref_path_str, ssim_available))
 
-        # 1. Color/distribution quality (weight: 0.30)
-        # 채도, 밝기 범위, 히스토그램 엔트로피, 텍스처 복잡도 종합 평가
-        color_score = _score_color_consistency(img_rgb)
+        # 병렬 실행: 3메트릭 + SSIM
+        cpu_results: Dict[str, Dict] = {}  # filename -> result dict
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = {
+                executor.submit(_evaluate_single_image_cpu, arg): arg[0]
+                for arg in worker_args
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    cpu_results[result["filename"]] = result
 
-        # 2. Artifact detection (weight: 0.20)
-        # 통계적 gradient 이상치 + 고주파 패턴 분석
-        artifact_score = _score_artifacts(gray)
+        # LPIPS는 GPU 모델이므로 순차적으로 메인 프로세스에서 처리
+        for img_path in sorted_paths:
+            fname = img_path.name
+            if fname not in cpu_results:
+                continue
 
-        # 3. Sharpness (weight: 0.20)
-        # Laplacian variance + gradient contrast ratio
-        blur_score = _score_sharpness(gray)
+            r = cpu_results[fname]
+            color_score = r["color"]
+            artifact_score = r["artifact"]
+            blur_score = r["blur"]
+            ssim_score = r["ssim"]
 
-        # 4. SSIM (weight: 0.15, 참조 이미지 존재 시)
-        ssim_score = None
-        if ssim_available and img_path.name in reference_map:
-            ref_img = cv2.imread(str(reference_map[img_path.name]))
-            if ref_img is not None:
-                ssim_score = _compute_ssim(gray, ref_img)
+            # LPIPS (순차)
+            lpips_score = None
+            if lpips_available and fname in reference_map:
+                ref_img = cv2.imread(str(reference_map[fname]))
+                if ref_img is not None:
+                    gen_img = cv2.imread(str(img_path))
+                    if gen_img is not None:
+                        lpips_score = _compute_lpips(gen_img, ref_img, lpips_model)
 
-        # 5. LPIPS (weight: 0.15, 참조 이미지 존재 시)
-        lpips_score = None
-        if lpips_available and img_path.name in reference_map:
-            ref_img = cv2.imread(str(reference_map[img_path.name]))
-            if ref_img is not None:
-                lpips_score = _compute_lpips(img, ref_img, lpips_model)
-
-        # 가중 평균 계산 (SSIM/LPIPS 가용성에 따라 동적 가중치)
-        if ssim_score is not None and lpips_score is not None:
-            # 5개 메트릭 모두 사용 가능
-            quality_score = (
-                0.30 * color_score
-                + 0.20 * artifact_score
-                + 0.20 * blur_score
-                + 0.15 * ssim_score
-                + 0.15 * (1.0 - lpips_score)  # LPIPS는 낮을수록 좋음
-            )
-        elif ssim_score is not None:
-            # SSIM만 사용 가능
-            quality_score = (
-                0.30 * color_score
-                + 0.25 * artifact_score
-                + 0.25 * blur_score
-                + 0.20 * ssim_score
-            )
-        elif lpips_score is not None:
-            # LPIPS만 사용 가능
-            quality_score = (
-                0.30 * color_score
-                + 0.25 * artifact_score
-                + 0.25 * blur_score
-                + 0.20 * (1.0 - lpips_score)
-            )
-        else:
-            # 기존 3개 메트릭만 사용
-            quality_score = (
-                0.40 * color_score
-                + 0.30 * artifact_score
-                + 0.30 * blur_score
+            # 가중 평균 계산
+            quality_score = _calc_weighted_quality(
+                color_score, artifact_score, blur_score, ssim_score, lpips_score
             )
 
-        score_entry = {
-            "filename": img_path.name,
-            "quality_score": round(float(quality_score), 4),
-            "color_score": round(float(color_score), 4),
-            "artifact_score": round(float(artifact_score), 4),
-            "blur_score": round(float(blur_score), 4),
-        }
-        if ssim_score is not None:
-            score_entry["ssim_score"] = round(float(ssim_score), 4)
-        if lpips_score is not None:
-            score_entry["lpips_score"] = round(float(lpips_score), 4)
+            score_entry = {
+                "filename": fname,
+                "quality_score": round(float(quality_score), 4),
+                "color_score": round(float(color_score), 4),
+                "artifact_score": round(float(artifact_score), 4),
+                "blur_score": round(float(blur_score), 4),
+            }
+            if ssim_score is not None:
+                score_entry["ssim_score"] = round(float(ssim_score), 4)
+            if lpips_score is not None:
+                score_entry["lpips_score"] = round(float(lpips_score), 4)
 
-        sample_scores.append(score_entry)
+            sample_scores.append(score_entry)
+    else:
+        # ── 순차 경로 (기존 로직) ──
+        for img_path in sorted(image_paths):
+            img = cv2.imread(str(img_path))
+            if img is None:
+                continue
+
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+            # 1. Color/distribution quality (weight: 0.30)
+            color_score = _score_color_consistency(img_rgb)
+
+            # 2. Artifact detection (weight: 0.20)
+            artifact_score = _score_artifacts(gray)
+
+            # 3. Sharpness (weight: 0.20)
+            blur_score = _score_sharpness(gray)
+
+            # 4. SSIM (weight: 0.15, 참조 이미지 존재 시)
+            ssim_score = None
+            if ssim_available and img_path.name in reference_map:
+                ref_img = cv2.imread(str(reference_map[img_path.name]))
+                if ref_img is not None:
+                    ssim_score = _compute_ssim(gray, ref_img)
+
+            # 5. LPIPS (weight: 0.15, 참조 이미지 존재 시)
+            lpips_score = None
+            if lpips_available and img_path.name in reference_map:
+                ref_img = cv2.imread(str(reference_map[img_path.name]))
+                if ref_img is not None:
+                    lpips_score = _compute_lpips(img, ref_img, lpips_model)
+
+            # 가중 평균 계산
+            quality_score = _calc_weighted_quality(
+                color_score, artifact_score, blur_score, ssim_score, lpips_score
+            )
+
+            score_entry = {
+                "filename": img_path.name,
+                "quality_score": round(float(quality_score), 4),
+                "color_score": round(float(color_score), 4),
+                "artifact_score": round(float(artifact_score), 4),
+                "blur_score": round(float(blur_score), 4),
+            }
+            if ssim_score is not None:
+                score_entry["ssim_score"] = round(float(ssim_score), 4)
+            if lpips_score is not None:
+                score_entry["lpips_score"] = round(float(lpips_score), 4)
+
+            sample_scores.append(score_entry)
 
     if not sample_scores:
         return {
@@ -815,7 +926,10 @@ def run_phase1(args):
 
         # 품질 평가
         quality_threshold = getattr(args, "quality_threshold", 0.5)
-        quality_result = _compute_generation_quality(output_dir, quality_threshold)
+        quality_result = _compute_generation_quality(
+            output_dir, quality_threshold,
+            num_workers=getattr(args, "workers", 0),
+        )
 
         # 품질 결과를 generation_summary에 병합하여 저장
         summary["quality"] = quality_result
@@ -980,7 +1094,8 @@ def run_phase2(args):
         entry_output_dir = Path(entry["output_dir"])
         if entry_output_dir.exists():
             quality_result = _compute_generation_quality(
-                entry_output_dir, quality_threshold
+                entry_output_dir, quality_threshold,
+                num_workers=getattr(args, "workers", 0),
             )
             entry["quality"] = {
                 "avg_quality_score": quality_result.get("avg_quality_score"),
@@ -1129,7 +1244,10 @@ def run_phase3(args):
 
         # 품질 평가
         quality_threshold = getattr(args, "quality_threshold", 0.5)
-        quality_result = _compute_generation_quality(output_dir, quality_threshold)
+        quality_result = _compute_generation_quality(
+            output_dir, quality_threshold,
+            num_workers=getattr(args, "workers", 0),
+        )
 
         # 품질 결과를 generation_summary에 병합하여 저장
         summary["quality"] = quality_result
@@ -2130,7 +2248,20 @@ def parse_args():
              "Passed through to test_controlnet.py. 예: --resolution 512",
     )
 
+    # Parallelization
+    parser.add_argument(
+        "--workers", type=int, default=0,
+        help="품질 평가 병렬 워커 수 (기본 0 = 순차 처리, -1 = CPU 코어 수 자동 감지, "
+             "N >= 2 = N개 프로세스 병렬 처리). LPIPS 제외 CPU-bound 메트릭만 병렬화.",
+    )
+
     args = parser.parse_args()
+
+    # 워커 수 결정
+    if args.workers < 0:
+        cpu_count = os.cpu_count() or 1
+        args.workers = max(1, cpu_count - 1)
+        logger.info(f"워커 수 자동 설정: {args.workers} (CPU: {cpu_count})")
 
     # Validation: model_path 또는 pipeline_path 중 하나는 필수
     if not args.model_path and not args.pipeline_path:

@@ -17,14 +17,49 @@ import pandas as pd
 import numpy as np
 import cv2
 import json
+import os
 import shutil
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.utils.rle_utils import mask_to_rle
+
+
+# ── 병렬 워커 함수 (ProcessPoolExecutor용 — 모듈 레벨 정의 필수) ──
+
+def _convert_single_mask_to_rle(args_tuple):
+    """
+    단일 증강 샘플의 마스크를 RLE로 변환하는 워커 함수.
+
+    Args:
+        args_tuple: (image_filename, mask_path_str, class_id)
+
+    Returns:
+        (image_filename, class_id, rle_string) 또는 None (실패 시)
+    """
+    image_filename, mask_path_str, class_id = args_tuple
+
+    mask_path = Path(mask_path_str)
+    if not mask_path.exists():
+        return None
+
+    mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        return None
+    mask = (mask > 0).astype(np.uint8)
+
+    if np.sum(mask) == 0:
+        return None
+
+    rle = mask_to_rle(mask)
+    if len(rle) == 0:
+        return None
+
+    return (image_filename, class_id, rle)
 
 
 class DatasetMerger:
@@ -103,7 +138,7 @@ class DatasetMerger:
         return rle
     
     def create_augmented_entries(self, augmented_dir, metadata, validation_results, 
-                                 use_only_passed=True):
+                                 use_only_passed=True, num_workers=0):
         """
         Create CSV entries for augmented samples.
         
@@ -112,6 +147,7 @@ class DatasetMerger:
             metadata: List of augmented sample metadata
             validation_results: Dict with validation results
             use_only_passed: Whether to use only validated samples
+            num_workers: 병렬 워커 수 (0=순차, >=2=ProcessPoolExecutor)
             
         Returns:
             List of (image_id, class_id, encoded_pixels) tuples
@@ -121,43 +157,64 @@ class DatasetMerger:
         
         print(f"\nProcessing {len(metadata)} augmented samples...")
         
-        for sample_meta in tqdm(metadata, desc="Converting masks to RLE"):
+        # 유효한 샘플 목록 필터링 (validation check)
+        valid_samples = []
+        for sample_meta in metadata:
             image_filename = sample_meta['image_filename']
-            
-            # Check validation
             if validation_results and use_only_passed:
                 if image_filename not in validation_results:
                     continue
                 if not validation_results[image_filename]['passed']:
                     continue
+            valid_samples.append(sample_meta)
+        
+        use_parallel = num_workers > 1 and len(valid_samples) > 10
+        
+        if use_parallel:
+            # ── 병렬 경로 ──
+            print(f"  병렬 모드: {num_workers} workers, {len(valid_samples)} samples")
+            tasks = [
+                (s['image_filename'],
+                 str(augmented_dir / 'masks' / s['mask_filename']),
+                 s['class_id'])
+                for s in valid_samples
+            ]
             
-            # Load mask
-            mask_path = augmented_dir / 'masks' / sample_meta['mask_filename']
-            
-            if not mask_path.exists():
-                print(f"Warning: Mask not found: {mask_path}")
-                continue
-            
-            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-            mask = (mask > 0).astype(np.uint8)
-            
-            # Convert to RLE
-            rle = self.convert_mask_to_rle(mask)
-            
-            if len(rle) == 0:
-                print(f"Warning: Empty mask for {image_filename}")
-                continue
-            
-            # Create entry (ImageId, ClassId, EncodedPixels)
-            image_id = image_filename  # Use augmented filename as ImageId
-            class_id = sample_meta['class_id']
-            
-            entries.append((image_id, class_id, rle))
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                futures = {executor.submit(_convert_single_mask_to_rle, t): t[0]
+                           for t in tasks}
+                for future in tqdm(as_completed(futures),
+                                   total=len(futures),
+                                   desc="Converting masks to RLE (parallel)"):
+                    result = future.result()
+                    if result is not None:
+                        entries.append(result)
+        else:
+            # ── 순차 경로 (기존 동작) ──
+            for sample_meta in tqdm(valid_samples, desc="Converting masks to RLE"):
+                image_filename = sample_meta['image_filename']
+                
+                mask_path = augmented_dir / 'masks' / sample_meta['mask_filename']
+                if not mask_path.exists():
+                    print(f"Warning: Mask not found: {mask_path}")
+                    continue
+                
+                mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+                mask = (mask > 0).astype(np.uint8)
+                
+                rle = self.convert_mask_to_rle(mask)
+                if len(rle) == 0:
+                    print(f"Warning: Empty mask for {image_filename}")
+                    continue
+                
+                image_id = image_filename
+                class_id = sample_meta['class_id']
+                entries.append((image_id, class_id, rle))
         
         return entries
     
     def merge_datasets(self, original_csv, augmented_dir, output_csv,
-                      use_only_passed=True):
+                      use_only_passed=True, num_workers=0):
         """
         Merge original and augmented datasets.
         
@@ -166,6 +223,7 @@ class DatasetMerger:
             augmented_dir: Directory with augmented data
             output_csv: Path to output merged CSV
             use_only_passed: Use only validated augmented samples
+            num_workers: 병렬 워커 수 (0=순차, >=2=ProcessPoolExecutor)
             
         Returns:
             Merged DataFrame and statistics
@@ -191,7 +249,8 @@ class DatasetMerger:
         
         # Create augmented entries
         augmented_entries = self.create_augmented_entries(
-            augmented_dir, augmented_metadata, validation_results, use_only_passed
+            augmented_dir, augmented_metadata, validation_results, use_only_passed,
+            num_workers=num_workers
         )
         
         print(f"\nAugmented samples to add: {len(augmented_entries)}")
@@ -372,6 +431,12 @@ def main():
         action='store_true',
         help='Copy augmented images to output directory'
     )
+    parser.add_argument(
+        '--workers',
+        type=int,
+        default=0,
+        help='병렬 워커 수 (0=순차 처리, -1=자동 감지, N=N개 워커)'
+    )
     
     args = parser.parse_args()
     
@@ -384,6 +449,15 @@ def main():
     print(f"Output CSV: {args.output_csv}")
     print(f"Output directory: {args.output_dir}")
     print(f"Use only passed samples: {args.use_only_passed}")
+    
+    # 워커 수 결정
+    num_workers = args.workers
+    if num_workers < 0:
+        cpu_count = os.cpu_count() or 2
+        num_workers = max(1, cpu_count - 1)
+        print(f"Workers: {num_workers} (auto-detected, CPU: {cpu_count})")
+    else:
+        print(f"Workers: {num_workers or 'sequential'}")
     print("="*80)
     
     # Create merger
@@ -394,7 +468,8 @@ def main():
         original_csv=args.original_csv,
         augmented_dir=args.augmented_dir,
         output_csv=args.output_csv,
-        use_only_passed=args.use_only_passed
+        use_only_passed=args.use_only_passed,
+        num_workers=num_workers
     )
     
     # Save statistics

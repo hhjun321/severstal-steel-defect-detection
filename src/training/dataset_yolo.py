@@ -345,6 +345,88 @@ def _stratified_top_k_yolo(samples: List[Dict], k: int) -> List[Dict]:
     return result
 
 
+def _test_symlink_support(target_dir: Path) -> bool:
+    """target_dir에서 symlink가 지원되는지 1회 테스트."""
+    import tempfile
+    test_src = target_dir / "__symlink_test_src__.tmp"
+    test_dst = target_dir / "__symlink_test_dst__.tmp"
+    try:
+        test_src.write_text("test")
+        os.symlink(test_src.resolve(), test_dst)
+        result = test_dst.exists()
+        return result
+    except (OSError, NotImplementedError):
+        return False
+    finally:
+        for p in (test_dst, test_src):
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def _generate_label_content(
+    sample: Dict,
+    img_path: str,
+    casda_path: Path,
+) -> str:
+    """
+    샘플 메타데이터로부터 YOLO 라벨 텍스트를 생성한다.
+    파일 I/O 없이 문자열만 반환 (로컬 스테이징에 사용).
+    
+    bbox_format="yolo"이면 cv2 없이 바로 생성.
+    legacy format이면 cv2.imread가 필요할 수 있음.
+    """
+    cls_id = sample.get('class_id', 0)
+    bboxes = sample.get('bboxes', [])
+    labels = sample.get('labels', [])
+    bbox_format = sample.get('bbox_format', 'xyxy')
+
+    lines: List[str] = []
+
+    if bboxes and labels and bbox_format == 'yolo':
+        # v5.1+: pre-computed YOLO normalized bboxes — 바로 기록
+        for bbox, lbl in zip(bboxes, labels):
+            cx, cy, bw, bh = bbox
+            lines.append(f"{lbl} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+    elif bboxes and labels:
+        # Legacy: xyxy pixel coords — 이미지 읽어서 정규화
+        img = cv2.imread(img_path)
+        if img is not None:
+            h, w = img.shape[:2]
+            for bbox, lbl in zip(bboxes, labels):
+                x1, y1, x2, y2 = bbox
+                cx = ((x1 + x2) / 2.0) / w
+                cy = ((y1 + y2) / 2.0) / h
+                bw_n = (x2 - x1) / w
+                bh_n = (y2 - y1) / h
+                lines.append(f"{lbl} {cx:.6f} {cy:.6f} {bw_n:.6f} {bh_n:.6f}")
+    elif 'mask_path' in sample:
+        # mask에서 bbox 유도
+        mask_path = sample['mask_path']
+        if not os.path.isabs(mask_path):
+            mask_path = str(casda_path / mask_path)
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is not None:
+            h, w = mask.shape[:2]
+            contours, _ = cv2.findContours(
+                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            for cnt in contours:
+                bx, by, bw, bh = cv2.boundingRect(cnt)
+                if bw * bh >= 16:
+                    cx = (bx + bw / 2.0) / w
+                    cy = (by + bh / 2.0) / h
+                    nw = bw / w
+                    nh = bh / h
+                    lines.append(f"{cls_id} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}")
+    else:
+        # Fallback: 전체 이미지 bbox
+        lines.append(f"{cls_id} 0.500000 0.500000 1.000000 1.000000")
+
+    return "\n".join(lines) + "\n" if lines else "\n"
+
+
 def _add_casda_to_training(
     casda_dir: str,
     casda_mode: str,
@@ -369,17 +451,25 @@ def _add_casda_to_training(
       - mask_path fallback: derive bbox from mask contours via cv2.
       - No bbox, no mask: full-image bbox fallback.
     
+    최적화 (v5.6):
+      - symlink 지원 여부를 1회 사전 테스트하여 매번 예외 발생 방지
+      - 라벨 .txt 파일을 로컬 tmpdir에 먼저 일괄 생성 후 대상 디렉토리에 복사
+        (Google Drive FUSE 등 느린 파일시스템에서 per-file 메타데이터 오버헤드 감소)
+      - 500건마다 progress 로그 출력
+    
     Returns:
         Number of synthetic images added
     """
     import json
+    import tempfile
+    import time
 
     casda_path = Path(casda_dir)
     if not casda_path.exists():
         logger.warning(f"CASDA directory not found: {casda_dir}")
         return 0
 
-    # Load metadata (same logic as CASDASyntheticDataset._load_metadata)
+    # ── 1. 메타데이터 로드 ──
     meta_path = casda_path / "metadata.json"
     csv_path = casda_path / "annotations.csv"
 
@@ -408,7 +498,7 @@ def _add_casda_to_training(
                 'suitability_score': 0.0,
             })
 
-    # Filter by suitability for pruning mode
+    # ── 2. Pruning 필터링 ──
     if casda_mode == "pruning":
         threshold = casda_config.get('suitability_threshold', 0.0)
         top_k = casda_config.get('pruning_top_k', 2000)
@@ -423,77 +513,92 @@ def _add_casda_to_training(
         else:
             all_samples = all_samples[:top_k]
 
-    count = 0
+    total = len(all_samples)
+    if total == 0:
+        logger.warning("No CASDA samples to inject after filtering.")
+        return 0
+
+    logger.info(f"  Injecting {total} CASDA images...")
+
+    # ── 3. symlink 지원 여부 사전 탐지 ──
+    use_symlink = _test_symlink_support(images_train_dir)
+    link_mode = "symlink" if use_symlink else "copy"
+    logger.info(f"  Image link mode: {link_mode}")
+
+    # ── 4. 라벨을 로컬 tmpdir에 일괄 생성 ──
+    # 로컬 디스크에서 작은 .txt 파일을 빠르게 생성한 후 대상 디렉토리에 일괄 복사.
+    # Google Drive FUSE 등에서 per-file open/write/close 오버헤드를 크게 줄인다.
+    t0 = time.time()
+    label_staging: List[Tuple[str, str]] = []  # (label_filename, label_content)
+    img_tasks: List[Tuple[str, str]] = []      # (src_path, dst_name)
+    skipped = 0
+
     for idx, sample in enumerate(all_samples):
-        # Resolve image path
+        # 이미지 경로 resolve
         img_path = sample.get('image_path', '')
         if not os.path.isabs(img_path):
             img_path = str(casda_path / img_path)
 
         if not os.path.exists(img_path):
+            skipped += 1
             continue
 
-        # Create a unique filename to avoid collisions
+        # 파일명 생성
         src = Path(img_path)
         dst_name = f"casda_{idx:05d}_{src.name}"
-        dst_img = images_train_dir / dst_name
 
-        if not dst_img.exists():
-            try:
-                os.symlink(src.resolve(), dst_img)
-            except (OSError, NotImplementedError):
-                shutil.copy2(str(src), str(dst_img))
-
-        # Generate label file
+        # 라벨 내용 생성 (메모리에서)
+        label_content = _generate_label_content(sample, img_path, casda_path)
         label_name = Path(dst_name).stem + ".txt"
-        dst_lbl = labels_train_dir / label_name
+        label_staging.append((label_name, label_content))
 
-        cls_id = sample.get('class_id', 0)
-        bboxes = sample.get('bboxes', [])
-        labels = sample.get('labels', [])
-        bbox_format = sample.get('bbox_format', 'xyxy')
+        # 이미지 복사 작업 등록
+        img_tasks.append((img_path, dst_name))
 
-        with open(dst_lbl, 'w') as f:
-            if bboxes and labels and bbox_format == 'yolo':
-                # v5.1+: pre-computed YOLO normalized bboxes — write directly
-                for bbox, lbl in zip(bboxes, labels):
-                    cx, cy, bw, bh = bbox
-                    f.write(f"{lbl} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
-            elif bboxes and labels:
-                # Legacy: xyxy pixel coords — read image once for normalization
-                img = cv2.imread(img_path)
-                if img is not None:
-                    h, w = img.shape[:2]
-                    for bbox, lbl in zip(bboxes, labels):
-                        x1, y1, x2, y2 = bbox
-                        cx = ((x1 + x2) / 2.0) / w
-                        cy = ((y1 + y2) / 2.0) / h
-                        bw = (x2 - x1) / w
-                        bh = (y2 - y1) / h
-                        f.write(f"{lbl} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
-            elif 'mask_path' in sample:
-                # Derive bbox from mask
-                mask_path = sample['mask_path']
-                if not os.path.isabs(mask_path):
-                    mask_path = str(casda_path / mask_path)
-                mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-                if mask is not None:
-                    h, w = mask.shape[:2]
-                    contours, _ = cv2.findContours(
-                        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-                    )
-                    for cnt in contours:
-                        bx, by, bw, bh = cv2.boundingRect(cnt)
-                        if bw * bh >= 16:
-                            cx = (bx + bw / 2.0) / w
-                            cy = (by + bh / 2.0) / h
-                            nw = bw / w
-                            nh = bh / h
-                            f.write(f"{cls_id} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}\n")
+    if skipped > 0:
+        logger.warning(f"  {skipped} images not found, skipped.")
+
+    # ── 5. 로컬 tmpdir에 라벨 파일 일괄 쓰기 → 대상 디렉토리에 복사 ──
+    with tempfile.TemporaryDirectory(prefix="casda_labels_") as tmpdir:
+        tmp_path = Path(tmpdir)
+        for label_name, label_content in label_staging:
+            (tmp_path / label_name).write_text(label_content)
+
+        # 일괄 복사: tmpdir → labels_train_dir
+        for label_name, _ in label_staging:
+            src_lbl = tmp_path / label_name
+            dst_lbl = labels_train_dir / label_name
+            shutil.copy2(str(src_lbl), str(dst_lbl))
+
+    label_elapsed = time.time() - t0
+    logger.info(f"  Labels: {len(label_staging)} files written ({label_elapsed:.1f}s)")
+
+    # ── 6. 이미지 symlink/copy + progress 로그 ──
+    t1 = time.time()
+    count = 0
+    log_interval = max(1, total // 4)  # 25% 간격 로그 (최소 500건마다)
+    if log_interval > 500:
+        log_interval = 500
+
+    for src_path, dst_name in img_tasks:
+        dst_img = images_train_dir / dst_name
+        if not dst_img.exists():
+            if use_symlink:
+                os.symlink(Path(src_path).resolve(), dst_img)
             else:
-                # Fallback: full-image bbox with class
-                f.write(f"{cls_id} 0.500000 0.500000 1.000000 1.000000\n")
-
+                shutil.copy2(src_path, str(dst_img))
         count += 1
+
+        if count % log_interval == 0:
+            elapsed = time.time() - t1
+            rate = count / elapsed if elapsed > 0 else 0
+            logger.info(f"  Progress: {count}/{len(img_tasks)} images "
+                        f"({count * 100 // len(img_tasks)}%, "
+                        f"{rate:.0f} img/s, {elapsed:.1f}s)")
+
+    img_elapsed = time.time() - t1
+    total_elapsed = time.time() - t0
+    logger.info(f"  Images: {count} files ({link_mode}, {img_elapsed:.1f}s)")
+    logger.info(f"  Total inject time: {total_elapsed:.1f}s")
 
     return count

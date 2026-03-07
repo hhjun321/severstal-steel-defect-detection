@@ -1326,6 +1326,13 @@ Examples:
 
         # --- Inject CASDA if needed ---
         if is_casda and baseline_yolo_dir:
+            # 사전 정리: 이전 실행 잔류 casda_* 파일 제거
+            # (이전 실행이 중단되어 CLEAN 단계가 실행되지 않았을 수 있음)
+            pre_removed = clean_casda_from_baseline(
+                baseline_dir=baseline_yolo_dir, expected_count=0)
+            if pre_removed > 0:
+                logging.info(f"  Pre-clean: removed {pre_removed} stale CASDA files")
+
             casda_subdir = CASDA_GROUP_TO_SUBDIR[group_key]
             casda_data_dir = None
 

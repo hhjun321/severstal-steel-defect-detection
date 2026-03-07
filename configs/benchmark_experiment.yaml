@@ -40,7 +40,7 @@ dataset:
                  # CLI --casda-roi-dir 로 override 가능.
                  # 예: /content/drive/MyDrive/data/Severstal/augmented_images_v5.5/generated
     suitability_threshold: 0.0   # v5.5: compose 시 quality_score 미생성 → 전부 0.5 → top_k만으로 pruning
-    pruning_top_k: 2000
+    pruning_top_k: 2500
 
 # ----------------------------------------------------------------------------
 # 4 Dataset Groups (Control Groups)
@@ -83,7 +83,7 @@ dataset_groups:
     casda_pruning:
       enabled: true
       suitability_threshold: 0.0   # v5.5: quality_score 부재 → top_k만으로 필터링
-      top_k: 2000
+      top_k: 2500
       stratified: true
 
 # ----------------------------------------------------------------------------
@@ -214,14 +214,14 @@ reporting:
   save_confusion_matrix: true
   generate_comparison_table: true
   hypothesis_tests:
-    - name: "H1"
-      description: "CASDA > Traditional augmentation (mAP)"
-      compare: ["casda_composed", "baseline_trad"]
-      metric: "mAP@0.5"
-    - name: "H2"
-      description: "Pruning > Full (efficiency)"
-      compare: ["casda_composed_pruning", "casda_composed"]
-      metric: "mAP@0.5"
+    # - name: "H1"
+    #   description: "CASDA > Traditional augmentation (mAP)"
+    #   compare: ["casda_composed", "baseline_trad"]
+    #   metric: "mAP@0.5"
+    # - name: "H2"
+    #   description: "Pruning > Full (efficiency)"
+    #   compare: ["casda_composed_pruning", "casda_composed"]
+    #   metric: "mAP@0.5"
     - name: "H3"
       description: "CASDA effect is architecture-independent"
       compare: ["casda_composed_pruning", "baseline_raw"]

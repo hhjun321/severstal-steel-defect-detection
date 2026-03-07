@@ -962,6 +962,8 @@ Examples:
                         help='Device (cuda/cpu). Auto-detected if not specified.')
     parser.add_argument('--fid-only', action='store_true',
                         help='[DEPRECATED] FID만 계산. scripts/run_fid.py를 직접 사용 권장.')
+    parser.add_argument('--no-fid', action='store_true',
+                        help='FID 평가를 건너뜁니다. (run_fid.py로 별도 실행 시 사용)')
     parser.add_argument('--seed', type=int, default=None,
                         help='Random seed (overrides config)')
     parser.add_argument('--output-dir', type=str, default=None,
@@ -1268,7 +1270,9 @@ Examples:
         logging.info("FID-only mode complete (via deprecated wrapper).")
         return
 
-    if has_casda and config.get('evaluation', {}).get('fid', {}).get('compute', True):
+    if args.no_fid:
+        logging.info("Skipping FID evaluation (--no-fid flag)")
+    elif has_casda and config.get('evaluation', {}).get('fid', {}).get('compute', True):
         logging.info("FID evaluation delegated to scripts/run_fid.py (deprecated wrapper)")
         fid_results = _run_fid_deprecated_wrapper(config, experiment_dir, device)
     elif not has_casda:

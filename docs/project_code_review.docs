@@ -1,0 +1,842 @@
+================================================================================
+  CASDA 프로젝트 코드 리뷰
+  Severstal Steel Defect Detection — Context-Aware Steel Defect Augmentation
+  작성일: 2026-03-07
+================================================================================
+
+  목차
+  ────────────────────────────────────────────────────────────────────────────
+  1.  프로젝트 개요 및 통계
+  2.  아키텍처 총평
+  3.  src/ 라이브러리 코드 리뷰
+      3.1  src/analysis/ — 결함·배경 분석
+      3.2  src/preprocessing/ — 데이터 전처리 파이프라인
+      3.3  src/training/ — 학습 인프라
+      3.4  src/models/ — 탐지·세그멘테이션 모델
+      3.5  src/utils/ — 유틸리티
+  4.  scripts/ 파이프라인 스크립트 리뷰
+      4.1  Stage A (Steps 1-3): 데이터 전처리
+      4.2  Stage B (Steps 4-6): ControlNet 학습·생성
+      4.3  Stage C (Steps 7-9): 후처리·품질 관리
+      4.4  Stage D (Steps 10-11): 평가
+  5.  configs/ 설정 파일 리뷰
+  6.  코드 품질 평가
+      6.1  강점
+      6.2  개선 필요 사항
+      6.3  기술 부채
+  7.  보안 및 안정성
+  8.  테스트 커버리지
+  9.  종합 평가 및 권장 사항
+  ────────────────────────────────────────────────────────────────────────────
+
+
+================================================================================
+  1. 프로젝트 개요 및 통계
+================================================================================
+
+  1.1 프로젝트 목표
+
+    Severstal Steel Defect Detection 대회 데이터에 대해 ControlNet 기반
+    합성 데이터 증강(CASDA)을 적용하여 결함 탐지/세그멘테이션 성능을 향상시키는
+    연구 파이프라인. 4개 결함 클래스(1-4)에 대해 ROI 추출 → ControlNet 학습 →
+    합성 이미지 생성 → Poisson Blending → 품질 평가 → 모델 벤치마크의
+    11단계 파이프라인을 구축함.
+
+  1.2 코드 규모
+
+    | 영역                 | 파일 수 | 총 라인 수 |
+    |----------------------|---------|-----------|
+    | src/ (라이브러리)     | 27      | ~9,620    |
+    | scripts/ (파이프라인) | 34 .py  | ~20,376   |
+    | configs/             | 1       | 242       |
+    | tests/               | 1       | ~100      |
+    | 루트 스크립트        | ~14     | ~2,000    |
+    | 합계                 | ~77     | ~32,000   |
+
+  1.3 핵심 기술 스택
+
+    - Python 3.10+, PyTorch, torchvision
+    - Diffusers (ControlNet, Stable Diffusion v1.5)
+    - Ultralytics (YOLOv8)
+    - OpenCV (Poisson Blending, 이미지 처리)
+    - scikit-image, scipy, LPIPS (품질 메트릭)
+
+  1.4 데이터 특성
+
+    - 이미지 해상도: 1600×256 (W×H) — 비정형 종횡비
+    - 4개 결함 클래스 (1-indexed in CSV, 0-indexed in model)
+    - RLE(Run-Length Encoding) 마스크 어노테이션
+
+
+================================================================================
+  2. 아키텍처 총평
+================================================================================
+
+  2.1 디렉토리 구조 평가: 양호
+
+    src/와 scripts/의 분리가 명확함.
+    - src/: 재사용 가능한 라이브러리 코드 (분석, 전처리, 학습, 모델, 유틸)
+    - scripts/: CLI 진입점 (argparse 기반 파이프라인 스크립트)
+
+    이 구조는 "라이브러리 + 실행기" 패턴으로, 연구 프로젝트에 적합함.
+    각 스크립트가 독립적으로 실행 가능하며, src/ 모듈을 import하여 사용.
+
+  2.2 의존성 방향: 양호
+
+    scripts/ → src/ (단방향 의존)
+    src/ 내부: analysis, preprocessing, training, models, utils 간 순환 의존 없음.
+
+    단, scripts/ 간 의존이 일부 존재:
+    - score_casda_quality.py → run_validation_phases.py (스코어링 함수 import)
+    - scripts/utils.py: 공통 유틸리티 (FID 관련)
+
+  2.3 설정 관리: 양호
+
+    YAML 기반 실험 설정 (configs/benchmark_experiment.yaml) + CLI argparse 오버라이드.
+    CLI 인자가 YAML 설정보다 우선하는 계층적 구조.
+
+  2.4 데이터 흐름: 양호
+
+    11단계 파이프라인이 파일 기반으로 연결됨.
+    각 단계의 출력이 다음 단계의 입력이 되는 명확한 DAG 구조.
+    중간 산출물(JSON, CSV, 이미지)이 디스크에 영속화되어 재실행/디버깅 용이.
+
+
+================================================================================
+  3. src/ 라이브러리 코드 리뷰
+================================================================================
+
+  ──────────────────────────────────────────────────────────────────────────
+  3.1 src/analysis/ — 결함·배경 분석 (3 모듈, ~885줄)
+  ──────────────────────────────────────────────────────────────────────────
+
+    defect_characterization.py (230줄)
+    ────────────────────────────────
+    DefectCharacterizer 클래스: 결함의 선형성(linearity), 밀도(solidity),
+    범위(extent), 종횡비(aspect_ratio)를 계산하여 5가지 서브타입으로 분류.
+
+    [강점]
+    - cv2.minAreaRect 기반 정밀한 기하학적 특성 분석
+    - 서브타입 분류 규칙이 상수로 명확히 정의됨 (HIGH_LINEARITY=0.85 등)
+
+    [개선점]
+    - 분류 규칙이 하드코딩됨 → 설정 파일로 외부화 권장
+    - 단일 결함 영역만 분석 → 다중 결함이 있는 경우 대응 미흡
+
+    background_characterization.py (313줄)
+    ────────────────────────────────────
+    BackgroundType 열거형 (SMOOTH, TEXTURED, VERTICAL_STRIPE,
+    HORIZONTAL_STRIPE, COMPLEX_PATTERN).
+    BackgroundAnalyzer: 분산, 엣지 방향, 주파수 스펙트럼으로 배경 유형 분류.
+
+    [강점]
+    - FFT 기반 주파수 분석으로 줄무늬 패턴 감지
+    - 수직/수평 줄무늬 구분이 가능
+
+    [개선점]
+    - 분류 임계값이 하드코딩됨
+    - 분류 결과 캐싱 메커니즘 없음 → 매번 재계산
+
+    roi_suitability.py (342줄)
+    ──────────────────────────
+    ROISuitabilityEvaluator: 결함-배경 호환성 점수 산출.
+    MATCHING_RULES 호환성 매트릭스로 결함 서브타입 × 배경 유형 적합성 판단.
+
+    [강점]
+    - 도메인 지식 기반 호환성 매트릭스 설계
+    - ROI 위치 최적화 (결함이 중앙에 오도록)
+
+    [개선점]
+    - 호환성 점수가 경험적 → 실험적 검증 필요
+
+  ──────────────────────────────────────────────────────────────────────────
+  3.2 src/preprocessing/ — 데이터 전처리 (8 모듈, ~4,200줄)
+  ──────────────────────────────────────────────────────────────────────────
+
+    roi_extraction.py (460줄)
+    ─────────────────────────
+    ROIExtractor: 학습 이미지에서 결함 영역을 256px 패치로 추출.
+    병렬 처리 지원 (ProcessPoolExecutor).
+
+    [강점]
+    - 256px ROI 크기가 Severstal 이미지 높이(256)에 정확히 맞음
+    - suitability score 기반 필터링으로 저품질 ROI 배제
+    - 병렬화 완료 (모듈 레벨 워커 함수)
+
+    [개선점]
+    - 원래 dead code로 존재했다가 활성화됨 — 일부 경로 처리에 잔존 이슈 가능
+    - ROI 크기가 하드코딩(256) → 설정 파라미터로 이미 구현됨 (양호)
+
+    controlnet_packager.py (888줄) — 가장 큰 src 모듈
+    ──────────────────────────────────────────────────
+    ControlNetDatasetPackager: ROI 패치를 ControlNet 학습 포맷으로 변환.
+    엣지/품질 필터링, 계층적 샘플링, JSONL/메타데이터 출력.
+
+    [강점]
+    - v5.2 class-aware capping: rare_class_threshold 이하 클래스 전량 포함
+    - 병렬 처리 완료
+    - train.jsonl 포맷이 diffusers ControlNet 학습과 호환
+
+    [개선점]
+    - 888줄로 단일 파일 크기가 큼 → 필터링/샘플링/패키징을 분리 고려
+    - validation_samples 출력 로직이 패키징과 혼재
+
+    hint_generator.py (297줄)
+    ─────────────────────────
+    HintImageGenerator: 3채널 그레이스케일 힌트 이미지 생성.
+    R=결함 마스크(×0.5), G=구조(×0.3), B=텍스처(×0.2).
+
+    [강점]
+    - 3채널 인코딩으로 결함 위치/구조/텍스처 정보를 동시 전달
+    - ControlNet의 condition input으로 직접 활용 가능
+
+    [개선점]
+    - 채널 가중치(0.5, 0.3, 0.2)가 하드코딩 → 실험적 최적화 여지
+
+    prompt_generator.py (330줄)
+    ──────────────────────────
+    PromptGenerator: ControlNet용 텍스트 프롬프트 생성 (simple/detailed/technical).
+
+    [강점]
+    - 3단계 세분화된 프롬프트 스타일
+    - negative prompt 자동 생성
+    - 결함 서브타입과 배경 유형 정보를 프롬프트에 반영
+
+    [개선점]
+    - 프롬프트 템플릿이 코드 내 하드코딩 → 외부 파일 분리 권장
+
+    background_extraction.py (523줄)
+    ────────────────────────────────
+    BackgroundExtractor: 결함 없는 이미지에서 깨끗한 배경 영역 추출.
+
+    [강점]
+    - 다양성 보장을 위한 배경 유형별 샘플링
+    - Laplacian 분산 기반 블러 감지
+
+    [개선점]
+    - 슬라이딩 윈도우 방식으로 중복 영역이 많을 수 있음
+    - 512px 패치가 1600×256 이미지에서 비효율적 (높이 256에 512 패치)
+
+    background_library.py (410줄)
+    ─────────────────────────────
+    BackgroundLibrary: 배경 이미지 인덱싱 및 유형/호환성 기반 검색.
+
+    [강점]
+    - COMPATIBILITY_MATRIX 기반 호환 배경 선택
+    - 다양성 샘플링으로 단일 배경 과사용 방지
+
+    [개선점]
+    - 메모리 내 인덱스 → 대규모 데이터셋에서 메모리 이슈 가능
+
+    poisson_blender.py (821줄) — 핵심 합성 모듈
+    ────────────────────────────────────────────
+    PoissonBlender: cv2.seamlessClone으로 합성 결함을 배경에 합성.
+    alpha-blend fallback, YOLO bbox 자동 생성.
+
+    [강점]
+    - NORMAL_CLONE/MIXED_CLONE 선택 가능
+    - Poisson blending 실패 시 alpha-blend fallback으로 안정성 확보
+    - 합성 이미지에서 자동으로 YOLO 형식 bbox 생성
+    - 마스크 경계 부드럽게 처리 (Gaussian blur)
+
+    [개선점]
+    - 821줄로 파일 크기가 큼
+    - seamlessClone이 내부적으로 단일 쓰레드 — 병렬화 효과 제한적
+
+    augmentation_generator.py (471줄)
+    ─────────────────────────────────
+    AugmentationGenerator: 템플릿 매칭, 배치 샘플 생성.
+
+    [평가]
+    - 초기 버전의 증강 생성기로, 현재 파이프라인에서는 compose_casda_images.py가
+      이 역할을 대체. 레거시 코드에 가까움.
+
+  ──────────────────────────────────────────────────────────────────────────
+  3.3 src/training/ — 학습 인프라 (5 모듈, ~3,215줄)
+  ──────────────────────────────────────────────────────────────────────────
+
+    dataset.py (884줄) — 데이터셋 정의
+    ────────────────────────────────
+    SeverstalDetectionDataset, SeverstalSegmentationDataset,
+    CASDASyntheticDataset 3개 클래스.
+
+    [강점]
+    - 4개 데이터셋 그룹 지원 (baseline_raw, baseline_trad, casda_composed,
+      casda_composed_pruning)
+    - CASDASyntheticDataset이 metadata.json 기반으로 자동 로딩
+    - ConcatDataset으로 segmentation 데이터 자동 병합
+
+    [개선점]
+    - 884줄 단일 파일에 3개 Dataset + 헬퍼 함수 → 분할 권장
+    - Detection과 Segmentation 데이터셋이 각각 독립적인 전처리 파이프라인 보유
+      → 공통 부분 추출 가능
+
+    dataset_yolo.py (499줄) — YOLO 포맷 변환
+    ─────────────────────────────────────────
+    prepare_yolo_dataset: Ultralytics YOLO 디렉토리 구조 생성 (심링크 기반).
+    stratified top-k 선별로 CASDA pruning 데이터 주입.
+
+    [강점]
+    - 심링크 기반으로 디스크 공간 절약
+    - 계층적(stratified) top-k 선별: 클래스별 비율 유지하면서 pruning
+
+    [개선점]
+    - _add_casda_to_training()이 499줄 중 상당 부분 차지 → 복잡도 높음
+    - 심링크가 Google Drive에서 간혹 문제 발생
+
+    trainer.py (501줄) — PyTorch 학습 루프
+    ──────────────────────────────────────
+    EarlyStopping, BenchmarkTrainer 클래스.
+    AMP(Mixed Precision), TensorBoard, cosine/poly LR 스케줄러.
+
+    [강점]
+    - EarlyStopping이 patience + best model 저장 지원
+    - AMP로 T4 GPU Tensor Core 활용
+
+    [개선점]
+    - 체크포인트 관리가 단순 (최신 + best만)
+    - 분산 학습 미지원 (단일 GPU 전제)
+
+    ultralytics_trainer.py (462줄) — YOLO 학습 래퍼
+    ─────────────────────────────────────────────────
+    UltralyticsTrainer: ultralytics.YOLO.train()/.val() 래핑.
+
+    [강점]
+    - Ultralytics 네이티브 API 활용으로 최적화된 YOLO 학습
+    - CASDA 데이터 주입/제거가 벤치마크 프레임워크와 통합
+
+    [개선점]
+    - Ultralytics 버전 의존성이 명시되지 않음
+
+    metrics.py (833줄) — 평가 메트릭
+    ────────────────────────────────
+    DetectionEvaluator (mAP@0.5), SegmentationEvaluator (Dice/IoU),
+    FIDCalculator (디스크+메모리 캐싱), BenchmarkReporter (JSON/CSV/PR 곡선).
+
+    [강점]
+    - FID 계산에 2단계 캐싱 (메모리 → 디스크)으로 재실행 시 큰 성능 향상
+    - mAP 계산이 COCO 스타일 AP와 일관됨
+    - PR 곡선 시각화 자동 생성
+
+    [개선점]
+    - 833줄 단일 파일에 4개 클래스 → 분할 권장
+    - FID 계산이 InceptionV3 기반 — 최신 CLIP-FID 등 미지원
+
+  ──────────────────────────────────────────────────────────────────────────
+  3.4 src/models/ — 탐지·세그멘테이션 모델 (3 모듈, ~702줄)
+  ──────────────────────────────────────────────────────────────────────────
+
+    yolo_mfd.py (295줄) — YOLO-MFD
+    ───────────────────────────────
+    MEFE (Multi-scale Edge Feature Enhancement): 1×1, 3×3, 5×5, dilated
+    convolution + channel attention. SobelEdgeExtractor로 엣지 특징 추출.
+    커스텀 YAML로 YOLOv8s P3/P4에 MEFE 삽입.
+
+    [강점]
+    - 다중 스케일 엣지 특징이 미세 결함 탐지에 효과적
+    - Sobel 엣지 + channel attention 조합으로 결함 특성 강화
+    - Ultralytics 커스텀 모듈 등록 방식 사용
+
+    [개선점]
+    - MEFE 모듈의 하이퍼파라미터(커널 크기, dilation rate)가 고정
+    - ablation study 결과가 문서화되지 않음
+
+    eb_yolov8.py (141줄) — EB-YOLOv8
+    ─────────────────────────────────
+    BiFPNFuse: 가중 depthwise-separable fusion.
+    현재 팩토리 함수가 표준 YOLOv8s를 반환 (BiFPN 통합 미완료).
+
+    [주의]
+    - BiFPN 통합이 미완료 상태 — 실질적으로 표준 YOLOv8s
+    - 벤치마크에서 "EB-YOLOv8"으로 표시되지만 실제 모델은 vanilla YOLOv8s
+
+    deeplabv3plus.py (266줄) — DeepLabV3+
+    ─────────────────────────────────────
+    ResNet-101 backbone, ASPP (rates 6/12/18), encoder-decoder 구조.
+    BCE+Dice 복합 손실 함수.
+
+    [강점]
+    - 표준 세그멘테이션 아키텍처로 벤치마크 기준선 역할 충실
+    - pretrained ResNet-101 활용
+
+    [개선점]
+    - 고정된 output_stride=16 → 8로 변경 시 세밀한 세그멘테이션 가능
+    - 입력 크기 256×512로 리사이즈 → 원본 1600×256 대비 정보 손실
+
+  ──────────────────────────────────────────────────────────────────────────
+  3.5 src/utils/ — 유틸리티 (2 모듈, ~585줄)
+  ──────────────────────────────────────────────────────────────────────────
+
+    rle_utils.py (153줄)
+    ────────────────────
+    vectorized RLE decode/encode, 이미지 인덱스 O(1) 룩업.
+
+    [강점]
+    - numpy 벡터화로 대량 RLE 변환 빠름
+    - build_image_index로 이미지별 마스크 즉시 조회
+
+    dataset_validator.py (432줄)
+    ────────────────────────────
+    DatasetValidator: 분포 검증 (클래스/서브타입/배경 균형), 엣지 근접성,
+    시각 검사 보고서 생성.
+
+    [강점]
+    - 데이터셋 품질 문제를 사전에 감지하는 체계적 검증
+
+    [개선점]
+    - 검증 임계값이 하드코딩
+
+
+================================================================================
+  4. scripts/ 파이프라인 스크립트 리뷰
+================================================================================
+
+  ──────────────────────────────────────────────────────────────────────────
+  4.1 Stage A (Steps 1-3): 데이터 전처리
+  ──────────────────────────────────────────────────────────────────────────
+
+    extract_rois.py (231줄) — Step 1
+    ─────────────────────────────────
+    5단계 ROI 추출: 분석기 초기화 → 데이터셋 처리 → CSV 저장 → 통계 생성.
+
+    [강점]
+    - 간결하고 명확한 메인 함수 구조
+    - --no_save_patches로 메타데이터만 생성 가능
+
+    [개선점]
+    - --num_workers 0이 기본값 → Colab에서 -1 권장
+
+    extract_clean_backgrounds.py (553줄) — Step 2
+    ──────────────────────────────────────────────
+    BackgroundExtractor로 결함 없는 이미지에서 512×512 클린 배경 패치 추출.
+
+    [강점]
+    - 4단계 품질 점수 (blur 30%, contrast 30%, brightness 20%, noise 20%)
+    - 패치 클린 여부를 마스크 기반으로 정밀 확인
+
+    [개선점]
+    - 512×512 패치 크기가 이미지 높이(256)보다 큼 → 유효 패치가 제한적일 수 있음
+    - compose_casda_images.py의 BackgroundPool과 기능 중복 가능성
+
+    prepare_controlnet_data.py (328줄) — Step 3
+    ─────────────────────────────────────────────
+    ROI 메타데이터 → ControlNet 학습 포맷 변환. 계층적 샘플링.
+
+    [강점]
+    - v5.2 class-aware capping: --per_class_cap + --rare_class_threshold
+    - --class_edge_override로 클래스별 엣지 마진 미세 조정
+
+    [개선점]
+    - --max_samples와 --per_class_cap이 상호 배타적이지만 둘 다 지정 시
+      동작이 명확하지 않을 수 있음
+
+  ──────────────────────────────────────────────────────────────────────────
+  4.2 Stage B (Steps 4-6): ControlNet 학습·생성
+  ──────────────────────────────────────────────────────────────────────────
+
+    train_controlnet.py (1,481줄) — Step 4
+    ───────────────────────────────────────
+    ControlNet 학습: SD v1.5 + ControlNet fine-tuning.
+    Min-SNR weighting, grayscale target, early stopping.
+
+    [강점]
+    - 33개 CLI 인자로 유연한 학습 설정
+    - Min-SNR weighting (snr_gamma=5.0)으로 안정적 학습
+    - grayscale target 강제로 컬러 아티팩트 방지 (Severstal 특화)
+    - 체크포인트 관리 (최대 3개, best/final 분리)
+    - FP16 저장으로 디스크 절약
+
+    [개선점]
+    - 1,481줄 단일 파일 → 데이터셋, 학습 루프, 유틸리티 분리 권장
+    - gradient_checkpointing이 기본 비활성 → T4 VRAM 제한 시 OOM 위험
+    - Wandb/MLflow 등 실험 추적 미통합
+
+    run_validation_phases.py (2,332줄) — Step 5
+    ─────────────────────────────────────────────
+    4개 검증 페이즈: 기본 생성 → 파라미터 스윕 → 미지 데이터 일반화 → 요약.
+    프로젝트 내 가장 큰 스크립트.
+
+    [강점]
+    - 체계적 4단계 검증으로 모델 품질 종합 평가
+    - Phase 2 파라미터 스윕 (guidance_scale, inference_steps)
+    - Phase 3 미지 ROI 일반화 테스트
+    - 병렬 품질 평가 (LPIPS 제외 CPU 메트릭)
+
+    [개선점]
+    - 2,332줄은 과도함 → 페이즈별 모듈 분리 필수
+    - 27개 함수가 단일 파일에 존재 → 가독성 저하
+    - Phase 2 스윕 범위가 하드코딩
+
+    test_controlnet.py (695줄) — Step 6
+    ────────────────────────────────────
+    학습된 ControlNet으로 합성 이미지 배치 생성.
+
+    [강점]
+    - v5.2 class-aware 다중 생성 (--num_images_per_class)
+    - grayscale postprocessing 기본 활성 (컬러 아티팩트 제거)
+    - resolve_path로 Colab 환경 경로 자동 탐색
+
+    [개선점]
+    - 단일 이미지/배치 생성 함수가 분리되어 있으나 중복 코드 존재
+    - 생성 중 메모리 관리 (GPU 캐시 클리어) 빈도가 미지정
+
+  ──────────────────────────────────────────────────────────────────────────
+  4.3 Stage C (Steps 7-9): 후처리·품질 관리
+  ──────────────────────────────────────────────────────────────────────────
+
+    compose_casda_images.py (1,594줄) — Step 7
+    ─────────────────────────────────────────────
+    512×512 합성 이미지를 1600×256 원본 크기로 Poisson Blending.
+    BackgroundPool로 배경 매칭, jitter/scale 변형.
+    compose_casda_images.py가 generated/ + hints/를 직접 처리하므로
+    중간 패키징 단계(package_casda_data.py) 불필요.
+
+    [강점]
+    - --compositions-per-roi N으로 pruning pool 확대 (v5.6 핵심)
+    - 배경 밝기 매칭 (brightness-tolerance)
+    - jitter/scale로 합성 다양성 확보
+    - 마스크 경계 Gaussian smoothing
+    - bg-cache로 재실행 시 배경 분석 스킵
+    - 1,594줄이지만 기능이 복합적이라 크기가 정당화됨
+
+    [개선점]
+    - BackgroundPool 클래스가 스크립트 내 정의 → src/preprocessing/으로 이동 권장
+    - Poisson blending 실패 시 fallback이 alpha blend → 품질 차이 발생 가능
+    - 합성 실패 카운트가 로그에만 기록 → 메타데이터에도 반영 필요
+
+    score_casda_quality.py (795줄) — Step 8
+    ────────────────────────────────────────
+    합성 이미지 3-메트릭 품질 점수 산출:
+    color_score(0.4) + artifact_score(0.3) + blur_score(0.3).
+
+    [강점]
+    - run_validation_phases.py의 스코어링 함수 재사용 (with fallback)
+    - metadata.json in-place 업데이트로 파이프라인 연속성 유지
+    - --dry-run 모드 지원
+    - 가중치 합계 1.0 검증
+
+    [개선점]
+    - 스코어링 함수가 다른 스크립트에서 import → 순환 의존 위험
+    - fallback 함수가 인라인 복사 → DRY 원칙 위반
+    - LPIPS/SSIM 등 참조 기반 메트릭 미포함 (참조 이미지 없이 단독 평가)
+
+    validate_augmented_quality.py (509줄) — Step 9
+    ─────────────────────────────────────────────────
+    QualityValidator: 5개 가중 메트릭으로 합성 샘플 개별 검증.
+    pass/reject 분류, 통계 보고서 생성.
+
+    [강점]
+    - 개별 샘플 수준 pass/reject 판정
+    - 5개 메트릭 (blur, artifact, color, consistency, defect metrics)
+    - 병렬 처리 완료
+
+    [개선점]
+    - score_casda_quality.py와 메트릭 중복 → 통합 권장
+    - min_quality_score=0.7 기본값이 너무 높을 수 있음 (많은 샘플 reject)
+
+  ──────────────────────────────────────────────────────────────────────────
+  4.4 Stage D (Steps 10-11): 평가
+  ──────────────────────────────────────────────────────────────────────────
+
+    run_fid.py (939줄) — Step 10
+    ─────────────────────────────
+    FID 평가: FID-ROI (생성 품질) + FID-Composed (최종 합성 품질).
+    세분화 FID: defect_subtype별, background_type별, 교차.
+
+    [강점]
+    - scripts/utils.py 공통 유틸 활용
+    - roi/composed/both 모드 선택
+    - 세분화 FID로 약점 클래스/서브타입 식별 가능
+    - min_samples 필터로 소수 그룹 FID 불안정성 방지
+
+    [개선점]
+    - InceptionV3 특성 추출이 매번 실행됨 → 캐싱 연동 미흡
+    - 939줄 → 모드별 분리 고려
+
+    run_benchmark.py (1,543줄) — Step 11
+    ─────────────────────────────────────
+    3 models × 4 dataset groups 벤치마크. 내부 CASDA 자동 병합.
+    가설 검정 (H1-H6), --reference-results 교차 비교.
+
+    [강점]
+    - Detection: inject_casda_to_baseline() → 심링크 주입 → 학습 → 정리
+    - Segmentation: ConcatDataset 자동 병합
+    - --resume으로 중단 후 재개 가능
+    - --casda-ratio로 비율 실험 통합
+    - Google Drive 건강 체크 (_check_drive_health) 내장
+    - 가설 검정으로 통계적 유의성 판단
+
+    [개선점]
+    - 1,543줄 단일 파일 → 실험 실행, 데이터 관리, 보고서 분리 권장
+    - inject/clean 패턴이 race condition 가능 (동시 실행 시)
+    - 가설 검정이 run별 단일 결과 → 다중 시드 통계 미지원
+
+
+================================================================================
+  5. configs/ 설정 파일 리뷰
+================================================================================
+
+  benchmark_experiment.yaml (242줄)
+  ──────────────────────────────────
+
+  [구조]
+  experiment → dataset → dataset_groups(4) → models(3) → evaluation → 
+  casda_ratio → reporting
+
+  [강점]
+  - 실험 전체를 단일 YAML로 선언적 정의
+  - 6개 가설(H1-H6)을 설정으로 명세
+  - ratio 실험 프리셋 포함
+  - CLI 오버라이드와 계층적 병합
+
+  [개선점]
+  - suitability_threshold: 0.0은 실질적으로 threshold 비활성화 → v5.6에서
+    score_casda_quality.py 결과를 반영하도록 업데이트 필요
+  - casda.composed_dir 경로가 로컬 상대경로 → Colab 절대경로와 불일치 시 혼란
+  - models 섹션에 검증 간격(validation interval) 미설정
+
+
+================================================================================
+  6. 코드 품질 평가
+================================================================================
+
+  ──────────────────────────────────────────────────────────────────────────
+  6.1 강점
+  ──────────────────────────────────────────────────────────────────────────
+
+  (1) 일관된 CLI 설계 패턴
+    - 모든 스크립트가 argparse 기반 동일 패턴
+    - --workers N 병렬화 인터페이스 통일 (0=순차, -1=자동, N=고정)
+    - 하위 호환성 유지 (새 파라미터 = 기존 동작 기본값)
+
+  (2) 견고한 오류 처리
+    - Poisson blending 실패 시 alpha-blend fallback
+    - Google Drive 건강 체크 + 재시도
+    - pickle 직렬화 이슈 해결 (모듈 레벨 워커 함수)
+
+  (3) 파이프라인 재현성
+    - seed=42 전역 고정
+    - 중간 산출물 디스크 영속화
+    - --resume 지원으로 장시간 실행 안정성
+
+  (4) 도메인 지식 통합
+    - Severstal 이미지 특성(1600×256, 그레이스케일) 반영
+    - 결함 서브타입/배경 유형 호환성 매트릭스
+    - grayscale 강제로 SD v1.5 컬러 아티팩트 방지
+
+  (5) 상세한 작업 문서화
+    - 41개 작업일지 (.docs) 파일
+    - 변경 이유/실험 결과/의사결정 과정 기록
+
+  ──────────────────────────────────────────────────────────────────────────
+  6.2 개선 필요 사항
+  ──────────────────────────────────────────────────────────────────────────
+
+  (1) 대형 파일 분할 필요
+
+    | 파일                          | 줄 수  | 권장 분할                              |
+    |-------------------------------|--------|----------------------------------------|
+    | run_validation_phases.py      | 2,332  | phase1-4 각각 모듈화                   |
+    | compose_casda_images.py       | 1,594  | BackgroundPool → src/, compose 로직 분리 |
+    | run_benchmark.py              | 1,543  | 실험 실행 / 데이터 관리 / 보고서 분리  |
+    | train_controlnet.py           | 1,481  | 데이터셋 / 학습 루프 / 유틸 분리       |
+
+  (2) 메트릭 함수 중복
+
+    score_casda_quality.py, validate_augmented_quality.py,
+    run_validation_phases.py에서 동일한 품질 메트릭 함수가 중복 정의되거나
+    import + fallback 복사됨.
+
+    권장: src/quality/ 패키지 신설 → 3-metric 함수 통합
+
+  (3) 하드코딩된 상수
+
+    분류 임계값, 가중치, 매직 넘버가 코드 내 산재.
+    일부는 이미 CLI 파라미터화되었으나, src/ 라이브러리 내부에는 여전히 존재.
+
+  (4) EB-YOLOv8 BiFPN 미통합
+
+    eb_yolov8.py에 BiFPNFuse 클래스가 정의되어 있으나, 팩토리 함수가
+    표준 YOLOv8s를 반환. 벤치마크에서 "EB-YOLOv8"으로 레이블되지만
+    실제 모델은 vanilla YOLOv8s.
+
+    권장: BiFPN 통합 완료 또는 레이블을 "YOLOv8s (vanilla)"로 수정
+
+  (5) 테스트 커버리지 부족
+
+    tests/ 디렉토리에 test_augmentation_pipeline.py 1개만 존재.
+    핵심 로직(RLE 인코딩/디코딩, 마스크 추출, 품질 메트릭)에 대한
+    유닛 테스트 부재.
+
+  ──────────────────────────────────────────────────────────────────────────
+  6.3 기술 부채
+  ──────────────────────────────────────────────────────────────────────────
+
+  (1) 레거시 스크립트
+
+    scripts/ 디렉토리에 현재 파이프라인에서 사용하지 않는 스크립트 존재:
+
+    | 스크립트                         | 상태                         |
+    |----------------------------------|------------------------------|
+    | package_casda_data.py            | 불필요 (compose가 직접 처리) |
+    | generate_augmented_data.py       | 레거시 (compose가 대체)      |
+    | run_augmentation_pipeline.py     | 레거시                       |
+    | stage3_generate_augmentations.py | 레거시                       |
+    | run_background_extraction.py     | extract_clean_backgrounds 대체 |
+    | merge_datasets.py               | 불필요 확인됨 (벤치마크 내부 처리) |
+
+  (2) 루트 디렉토리 오염
+
+    루트에 14개 .py 스크립트와 22개 .md 파일이 산재.
+    이들은 초기 탐색/디버깅 용도의 일회성 스크립트.
+
+    권장: scripts/legacy/ 또는 scripts/debug/로 이동
+
+  (3) pyright/LSP 타입 에러
+
+    cv2, numpy, pandas, torch 관련 pyright 에러가 다수 존재.
+    실행에는 영향 없으나 (런타임 정상), IDE 지원 저하.
+    이는 기존 알려진 이슈로 무시 중.
+
+
+================================================================================
+  7. 보안 및 안정성
+================================================================================
+
+  7.1 보안 사항
+
+    - 외부 모델 다운로드: SD v1.5 (runwayml), ControlNet (lllyasviel) — 
+      HuggingFace 공식 모델만 사용
+    - 사용자 데이터: 로컬/Google Drive 내 처리 — 외부 전송 없음
+    - 민감 정보: API 키, 크리덴셜 등 하드코딩 없음
+
+  7.2 안정성 사항
+
+    - Google Drive I/O: _check_drive_health()로 건강 상태 모니터링
+    - Colab 런타임 제한: --resume으로 세션 재연결 후 재개 가능
+    - OOM 방지: gradient_checkpointing, mixed_precision(fp16) 지원
+    - 디스크 부족: 체크포인트 제한(3개), FP16 저장, pipeline 저장 스킵
+
+
+================================================================================
+  8. 테스트 커버리지
+================================================================================
+
+  현재 상태: 매우 부족
+
+  | 영역                     | 테스트 존재 | 비고                            |
+  |--------------------------|------------|----------------------------------|
+  | RLE encode/decode        | 없음       | src/utils/rle_utils.py 핵심 로직 |
+  | 마스크 추출              | 없음       | 힌트 → 바이너리 마스크 변환      |
+  | 품질 메트릭              | 없음       | color/artifact/blur 스코어링     |
+  | 데이터셋 로딩            | 없음       | CASDA metadata.json 파싱         |
+  | YOLO 포맷 변환           | 없음       | bbox 정규화, 디렉토리 구조       |
+  | 전체 파이프라인           | 1개        | test_augmentation_pipeline.py   |
+
+  권장 추가 테스트:
+  - rle_utils: encode → decode 왕복 테스트
+  - 마스크 추출: 알려진 hint 이미지로 expected mask 비교
+  - 품질 메트릭: 합성/실제 이미지 점수 범위 검증
+  - metadata.json: 스키마 검증 (필수 필드, 타입)
+  - YOLO bbox: 정규화 범위 [0, 1] 검증
+
+
+================================================================================
+  9. 종합 평가 및 권장 사항
+================================================================================
+
+  9.1 종합 평가
+
+    | 항목          | 평가   | 설명                                        |
+    |---------------|--------|---------------------------------------------|
+    | 아키텍처      | B+     | 명확한 분리, 일부 대형 파일 분할 필요        |
+    | 코드 품질     | B      | 일관된 패턴, 하드코딩 상수 산재              |
+    | 문서화        | A      | 41개 작업일지 + README + 인라인 주석 우수    |
+    | 테스트        | D      | 유닛 테스트 거의 부재                        |
+    | 재현성        | A-     | seed 고정, 중간 산출물 영속화, resume 지원   |
+    | 병렬화        | A-     | 8개 스크립트 통일된 패턴으로 완료            |
+    | 도메인 특화   | A      | Severstal 데이터 특성 잘 반영               |
+    | 확장성        | B-     | 단일 GPU 전제, 대규모 데이터셋 미고려        |
+
+  9.2 단기 권장 (v5.6 실행 전)
+
+    1. benchmark_experiment.yaml의 suitability_threshold를 score_casda_quality 결과
+       기반으로 업데이트 (현재 0.0은 무효화 상태)
+    2. EB-YOLOv8 레이블 정정 또는 BiFPN 통합
+
+  9.3 중기 권장 (v5.7 이후)
+
+    1. src/quality/ 패키지 신설 — 품질 메트릭 함수 통합
+    2. 대형 스크립트 4개 모듈 분할
+    3. 핵심 유닛 테스트 추가 (rle, mask, metrics)
+    4. 레거시 스크립트 정리 (scripts/legacy/ 이동)
+    5. 루트 디렉토리 정리
+
+  9.4 장기 권장
+
+    1. 실험 추적 도구 통합 (Wandb/MLflow)
+    2. CLIP-FID 등 최신 생성 품질 메트릭 도입
+    3. 다중 시드 실험으로 통계적 유의성 강화
+    4. 분산 학습 지원 (multi-GPU)
+    5. CI/CD 파이프라인 구축 (자동 테스트 + 코드 품질 검사)
+
+
+================================================================================
+  부록 A: 파일 크기 분포 (scripts/ + src/)
+================================================================================
+
+    2,332 ┤ ████████████████████████ run_validation_phases.py
+    1,594 ┤ ████████████████ compose_casda_images.py
+    1,543 ┤ ███████████████ run_benchmark.py
+    1,481 ┤ ███████████████ train_controlnet.py
+    1,058 ┤ ██████████ visualize_roi_samples.py
+      939 ┤ █████████ run_fid.py
+      888 ┤ ████████ controlnet_packager.py
+      884 ┤ ████████ dataset.py
+      833 ┤ ████████ metrics.py
+      821 ┤ ████████ poisson_blender.py
+      795 ┤ ████████ score_casda_quality.py
+      792 ┤ ████████ package_casda_data.py
+      729 ┤ ███████ generate_augmented_data.py
+      695 ┤ ██████ test_controlnet.py
+      553 ┤ █████ extract_clean_backgrounds.py
+      523 ┤ █████ background_extraction.py
+      518 ┤ █████ merge_datasets.py
+      509 ┤ █████ validate_augmented_quality.py (x2 files)
+      ...
+
+================================================================================
+  부록 B: 의존성 그래프 (핵심 모듈)
+================================================================================
+
+    train.csv + train_images/
+        │
+        ├──→ src/analysis/
+        │      defect_characterization → roi_suitability
+        │      background_characterization → roi_suitability
+        │
+        ├──→ src/preprocessing/
+        │      roi_extraction ←── analysis/*
+        │      hint_generator ←── (독립)
+        │      prompt_generator ←── analysis/*
+        │      controlnet_packager ←── hint_gen + prompt_gen
+        │      background_extraction ←── analysis/background
+        │      background_library ←── background_extraction
+        │      poisson_blender ←── (독립, cv2)
+        │
+        ├──→ src/training/
+        │      dataset ←── utils/rle_utils
+        │      dataset_yolo ←── (독립)
+        │      trainer ←── (독립)
+        │      ultralytics_trainer ←── (독립)
+        │      metrics ←── (독립, torch)
+        │
+        └──→ src/models/
+               yolo_mfd ←── (ultralytics 커스텀)
+               eb_yolov8 ←── (ultralytics)
+               deeplabv3plus ←── (torchvision)
+
+
+================================================================================
+  END OF REVIEW
+================================================================================

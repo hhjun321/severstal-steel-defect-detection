@@ -1159,8 +1159,8 @@ scripts/run_fid.py로 분리하여 단일 책임 원칙(SRP)을 적용한다.
 16. v5.6 실행 계획 — 누락 스크립트 보완 + 완전한 파이프라인
 ================================================================================
 
-  v5.5에서는 13개 파이프라인 스크립트 중 6개만 실행했다.
-  v5.6에서는 누락된 7개 스크립트를 포함하여 전체 파이프라인을 순서대로 실행한다.
+  v5.5에서는 파이프라인 스크립트 중 6개만 실행했다.
+  v5.6에서는 누락된 스크립트를 포함하여 전체 파이프라인을 순서대로 실행한다.
 
   16.1 v5.5 실행 순서 (누락 분석)
 
@@ -1174,18 +1174,28 @@ scripts/run_fid.py로 분리하여 단일 책임 원칙(SRP)을 적용한다.
     | 5    | run_fid.py                  | FID 평가                       |
     | 6    | run_benchmark.py            | 모델 학습 + 평가 (GPU)         |
 
-    v5.5에서 누락된 7개 스크립트:
+    v5.5에서 누락된 5개 스크립트:
     | 스크립트                        | 누락 위치           | 영향                                    |
     |--------------------------------|--------------------|-----------------------------------------|
     | extract_rois.py                | 1번 이전 (맨 처음)  | ROI 재추출 없이 이전 결과 재사용          |
     | extract_clean_backgrounds.py   | 4번 이전            | compose 시 원본 이미지에서 직접 배경 선택  |
-    | package_casda_data.py          | 3→4번 사이          | casda_full/casda_pruning 미생성           |
     | score_casda_quality.py         | 4→5번 사이          | 품질 점수 없이 pruning → top-k만 동작     |
     | validate_augmented_quality.py  | 4→5번 사이          | 품질 검증 미수행                          |
-    | merge_datasets.py             | 5→6번 사이          | 병합 CSV 미생성 → benchmark에서 직접 처리 |
     | run_validation_phases.py       | 2→3번 사이 (선택적) | ControlNet 모델 품질 검증 미수행          |
 
-  16.2 v5.6 완전한 실행 순서 (13단계)
+    참고:
+    - package_casda_data.py: compose_casda_images.py가 generated/ + hints/를
+      직접 처리하므로 불필요 (사용자 2회 확인). 초기에는 누락 스크립트로 분류했으나
+      파이프라인에서 완전 제외함.
+    - merge_datasets.py: 파이프라인에서 제외.
+    run_benchmark.py가 CASDA 디렉토리의 metadata.json을 직접 읽어
+    자체적으로 데이터셋을 병합한다:
+    - Detection (YOLO): inject_casda_to_baseline()으로 심링크 주입 → 학습 후 정리
+    - Segmentation (DeepLabV3+): ConcatDataset([train, CASDASyntheticDataset])
+    따라서 merge_datasets.py의 출력물(train_augmented.csv)은
+    벤치마크 파이프라인에서 참조되지 않는다.
+
+  16.2 v5.6 완전한 실행 순서 (11단계)
 
     Colab 경로 기준: BASE=/content/drive/MyDrive/data/Severstal
     코드 경로: REPO=/content/severstal-steel-defect-detection
@@ -1205,239 +1215,47 @@ scripts/run_fid.py로 분리하여 단일 책임 원칙(SRP)을 적용한다.
     ├─────────────────────────────────────────────────────────────────────┤
     │ Stage C: 후처리 + 품질 관리 (CPU)                                  │
     ├─────────────────────────────────────────────────────────────────────┤
-    │ Step 7. package_casda_data.py       — 생성 데이터 패키징           │
-    │ Step 8. compose_casda_images.py     — Poisson Blending 합성        │
-    │ Step 9. score_casda_quality.py      — 합성 품질 점수 산출          │
-    │ Step 10. validate_augmented_quality.py — 품질 검증                 │
-    │ Step 11. merge_datasets.py          — 데이터셋 병합                │
+    │ Step 7. compose_casda_images.py     — Poisson Blending 합성        │
+    │ Step 8. score_casda_quality.py      — 합성 품질 점수 산출          │
+    │ Step 9. validate_augmented_quality.py — 품질 검증                  │
     ├─────────────────────────────────────────────────────────────────────┤
     │ Stage D: 평가 (GPU)                                                │
     ├─────────────────────────────────────────────────────────────────────┤
-    │ Step 12. run_fid.py                 — FID 평가                     │
-    │ Step 13. run_benchmark.py           — 모델 학습 + 평가             │
+    │ Step 10. run_fid.py                 — FID 평가                     │
+    │ Step 11. run_benchmark.py           — 모델 학습 + 평가             │
     └─────────────────────────────────────────────────────────────────────┘
 
-  16.3 v5.6 실행 명령어 (Colab)
+    * package_casda_data.py: compose_casda_images.py가 generated/ + hints/를
+      직접 처리하므로 불필요 — 사용자가 명시적으로 2회 확인하여 제외함
+    * merge_datasets.py: run_benchmark.py 내부에서 자동 병합 처리 — 불필요
 
-    # ── 경로 변수 설정 ──
-    BASE=/content/drive/MyDrive/data/Severstal
-    REPO=/content/severstal-steel-defect-detection
-    VER=v5.6
+  16.3 단계별 입출력 요약
 
-    TRAIN_CSV=$BASE/train.csv
-    TRAIN_IMAGES=$BASE/train_images
-    ROI_DIR=$BASE/data/processed/roi_patches
-    BG_DIR=$BASE/data/backgrounds
-    CN_DATASET=$BASE/controlnet_dataset_${VER}
-    CN_MODEL=$BASE/controlnet_training_${VER}
-    GEN_DIR=$BASE/augmented_images_${VER}
-    CASDA_DIR=$BASE/augmented_dataset_${VER}
-    SPLIT_CSV=$BASE/casda/splits/split_70_15_15_seed42.csv
-    OUTPUT=$BASE/casda/outputs/${VER}
-
-    # ================================================================
-    # Stage A: 데이터 전처리 (CPU, 1회성 — 이전 결과 재사용 가능)
-    # ================================================================
-
-    # Step 1. ROI 추출
-    # 입력: train.csv + train_images/
-    # 출력: data/processed/roi_patches/ (roi_metadata.csv + patches)
-    # 비고: 이전 v5.5 결과를 재사용하려면 이 단계 건너뛰기
-    python $REPO/scripts/extract_rois.py \
-        --image_dir $TRAIN_IMAGES \
-        --train_csv $TRAIN_CSV \
-        --output_dir $ROI_DIR \
-        --roi_size 256 \
-        --min_suitability 0.5 \
-        --num_workers -1
-
-    # Step 2. 깨끗한 배경 추출
-    # 입력: train.csv + train_images/
-    # 출력: data/backgrounds/ (512x512 패치)
-    # 비고: compose 시 배경 매칭 품질 향상 목적. 이전 결과 재사용 가능.
-    python $REPO/scripts/extract_clean_backgrounds.py \
-        --train_csv $TRAIN_CSV \
-        --image_dir $TRAIN_IMAGES \
-        --output_dir $BG_DIR \
-        --patch_size 512 \
-        --patches_per_image 5 \
-        --min_quality 0.7 \
-        --workers -1
-
-    # Step 3. ControlNet 학습 데이터 준비
-    # 입력: roi_metadata.csv + train_images/ + train.csv
-    # 출력: controlnet_dataset/ (train.jsonl + hints/ + packaged_roi_metadata.csv)
-    python $REPO/scripts/prepare_controlnet_data.py \
-        --roi_metadata $ROI_DIR/roi_metadata.csv \
-        --train_images $TRAIN_IMAGES \
-        --train_csv $TRAIN_CSV \
-        --output_dir $CN_DATASET \
-        --prompt_style detailed \
-        --per_class_cap 1200 \
-        --rare_class_threshold 200 \
-        --workers -1
-
-    # ================================================================
-    # Stage B: ControlNet 학습 + 생성 (GPU)
-    # ================================================================
-
-    # Step 4. ControlNet 학습
-    # 입력: controlnet_dataset/ (train.jsonl)
-    # 출력: controlnet_training/ (best_model/ + training_log.json)
-    python $REPO/scripts/train_controlnet.py \
-        --data_dir $CN_DATASET \
-        --image_root $CN_DATASET \
-        --output_dir $CN_MODEL \
-        --resolution 512 \
-        --train_batch_size 1 \
-        --num_train_epochs 100 \
-        --gradient_accumulation_steps 4 \
-        --gradient_checkpointing \
-        --mixed_precision fp16 \
-        --learning_rate 1e-5 \
-        --lr_scheduler cosine \
-        --lr_warmup_steps 50 \
-        --snr_gamma 5.0 \
-        --early_stopping_patience 20 \
-        --force_grayscale_target \
-        --save_fp16 \
-        --skip_save_pipeline \
-        --seed 42
-
-    # Step 5. ControlNet 모델 검증 (선택적 — 학습 품질 확인)
-    # 입력: best_model/ + train.jsonl + roi_metadata.csv
-    # 출력: test_results/ (4단계 검증 보고서)
-    python $REPO/scripts/run_validation_phases.py \
-        --model_path $CN_MODEL/best_model \
-        --jsonl_path $CN_DATASET/train.jsonl \
-        --image_root $CN_DATASET \
-        --roi_metadata_path $ROI_DIR/roi_metadata.csv \
-        --training_log_path $CN_MODEL/training_log.json \
-        --output_base $OUTPUT/validation \
-        --phases 1 2 3 4 \
-        --controlnet_conditioning_scale 0.7 \
-        --resolution 512 \
-        --workers -1
-
-    # Step 6. 합성 이미지 생성
-    # 입력: best_model/ + train.jsonl
-    # 출력: augmented_images/ (generated/ + generation_summary.json)
-    python $REPO/scripts/test_controlnet.py \
-        --model_path $CN_MODEL/best_model \
-        --jsonl_path $CN_DATASET/train.jsonl \
-        --image_root $CN_DATASET \
-        --output_dir $GEN_DIR \
-        --num_inference_steps 30 \
-        --guidance_scale 7.5 \
-        --controlnet_conditioning_scale 0.7 \
-        --resolution 512 \
-        --grayscale_postprocess \
-        --seed 42
-
-    # ================================================================
-    # Stage C: 후처리 + 품질 관리 (CPU)
-    # ================================================================
-
-    # Step 7. 생성 데이터 패키징
-    # 입력: generated/ + generation_summary.json + hints/
-    # 출력: casda_full/ + casda_pruning/ (이미지 + metadata.json)
-    python $REPO/scripts/package_casda_data.py \
-        --generated-dir $GEN_DIR/generated \
-        --summary-json $GEN_DIR/generation_summary.json \
-        --hint-dir $CN_DATASET/hints \
-        --output-dir $CASDA_DIR \
-        --pruning-top-k 2000 \
-        --workers -1
-
-    # Step 8. Poisson Blending 합성
-    # 입력: generated/ + hints/ + packaged_roi_metadata.csv + train_images/ + train.csv
-    # 출력: casda_composed/ (1600x256 합성 이미지 + metadata.json)
-    python $REPO/scripts/compose_casda_images.py \
-        --generated-dir $GEN_DIR/generated \
-        --hint-dir $CN_DATASET/hints \
-        --metadata-csv $CN_DATASET/packaged_roi_metadata.csv \
-        --summary-json $GEN_DIR/generation_summary.json \
-        --clean-images-dir $TRAIN_IMAGES \
-        --train-csv $TRAIN_CSV \
-        --output-dir $CASDA_DIR/casda_composed \
-        --compositions-per-roi 3 \
-        --dilation-px 8 \
-        --blend-mode NORMAL_CLONE \
-        --brightness-tolerance 30.0 \
-        --seed 42 \
-        --workers -1
-
-    # Step 9. 합성 품질 점수 산출
-    # 입력: casda_composed/ (images/ + metadata.json)
-    # 출력: casda_composed/metadata.json (quality_score 필드 업데이트)
-    python $REPO/scripts/score_casda_quality.py \
-        --casda-dir $CASDA_DIR/casda_composed \
-        --workers -1
-
-    # Step 10. 품질 검증
-    # 입력: casda_composed/ 또는 casda_full/
-    # 출력: validation/ (validation_results.json + 시각화)
-    python $REPO/scripts/validate_augmented_quality.py \
-        --augmented_dir $CASDA_DIR/casda_composed \
-        --output_dir $OUTPUT/quality_validation \
-        --min_quality_score 0.7 \
-        --workers -1
-
-    # Step 11. 데이터셋 병합
-    # 입력: train.csv + casda_composed/
-    # 출력: final_dataset/ (train_augmented.csv)
-    python $REPO/scripts/merge_datasets.py \
-        --original_csv $TRAIN_CSV \
-        --original_images $TRAIN_IMAGES \
-        --augmented_dir $CASDA_DIR/casda_composed \
-        --output_csv $CASDA_DIR/final_dataset/train_augmented.csv \
-        --output_dir $CASDA_DIR/final_dataset \
-        --use_only_passed \
-        --workers -1
-
-    # ================================================================
-    # Stage D: 평가 (GPU)
-    # ================================================================
-
-    # Step 12. FID 평가
-    # 입력: train_images/ + train.csv + casda_composed/ + generated/
-    # 출력: fid_results.json
-    python $REPO/scripts/run_fid.py \
-        --config $REPO/configs/benchmark_experiment.yaml \
-        --data-dir $TRAIN_IMAGES \
-        --csv $TRAIN_CSV \
-        --casda-dir $CASDA_DIR \
-        --casda-roi-dir $GEN_DIR/generated \
-        --output-dir $OUTPUT/fid \
-        --fid-mode both
-
-    # Step 13. 모델 학습 + 평가 (Benchmark)
-    # 입력: config + 데이터 경로들
-    # 출력: benchmark_results.json + 모델별 결과
-    python $REPO/scripts/run_benchmark.py \
-        --config $REPO/configs/benchmark_experiment.yaml \
-        --data-dir $TRAIN_IMAGES \
-        --csv $TRAIN_CSV \
-        --casda-dir $CASDA_DIR \
-        --casda-roi-dir $GEN_DIR/generated \
-        --split-csv $SPLIT_CSV \
-        --output-dir $OUTPUT/benchmark \
-        --models eb_yolov8 \
-        --groups pruning \
-        --casda-ratio 0.1 0.2 0.3 0.5 \
-        --casda-ratio-source composed
+    | Step | 스크립트                        | 입력                                | 출력                                | --workers |
+    |------|---------------------------------|-------------------------------------|-------------------------------------|-----------|
+    | 1    | extract_rois.py                 | train.csv, train_images/            | roi_patches/roi_metadata.csv        | -1        |
+    | 2    | extract_clean_backgrounds.py    | train.csv, train_images/            | backgrounds/ (512x512 패치)         | -1        |
+    | 3    | prepare_controlnet_data.py      | roi_metadata.csv, train_images/     | controlnet_dataset/ (jsonl, hints)  | -1        |
+    | 4    | train_controlnet.py             | controlnet_dataset/                 | best_model/, training_log.json      | GPU       |
+    | 5    | run_validation_phases.py        | best_model/, train.jsonl            | validation/ (검증 보고서)           | -1        |
+    | 6    | test_controlnet.py              | best_model/, train.jsonl            | generated/, generation_summary.json | GPU       |
+    | 7    | compose_casda_images.py         | generated/, hints/, train_images/   | casda_composed/ (1600x256)          | -1        |
+    | 8    | score_casda_quality.py          | casda_composed/                     | metadata.json (quality_score 갱신)  | -1        |
+    | 9    | validate_augmented_quality.py   | casda_composed/                     | validation_results.json             | -1        |
+    | 10   | run_fid.py                      | train_images/, casda_composed/      | fid_results.json                    | GPU       |
+    | 11   | run_benchmark.py                | config, 데이터 경로들               | benchmark_results.json              | GPU       |
 
   16.4 v5.5 대비 v5.6 개선 포인트
 
     | 항목                          | v5.5                   | v5.6                                |
     |-------------------------------|------------------------|-------------------------------------|
-    | 파이프라인 단계               | 6단계                  | 13단계 (완전)                       |
+    | 파이프라인 단계               | 6단계                  | 11단계 (완전)                       |
     | ROI 추출                      | 이전 결과 재사용       | 명시적 재추출 또는 재사용 선택      |
     | 배경 추출                     | 미수행                 | extract_clean_backgrounds.py 추가   |
-    | 생성 데이터 패키징            | 미수행                 | package_casda_data.py 추가          |
+    | 생성 데이터 패키징            | 미수행                 | 불필요 (compose가 직접 처리)        |
     | 품질 점수                     | 미산출 (전부 0.5)      | score_casda_quality.py로 실측       |
     | 품질 검증                     | 미수행                 | validate_augmented_quality.py 추가  |
-    | 데이터셋 병합                 | benchmark 내부 처리    | merge_datasets.py로 명시적 병합     |
+    | 데이터셋 병합                 | benchmark 내부 자동    | 동일 (benchmark 내부 자동 처리)     |
     | ControlNet 검증               | 미수행                 | run_validation_phases.py 추가       |
     | compositions-per-roi          | 1 (기본값)             | 3 (pruning 풀 3배 확대)             |
     | 병렬 처리                     | 미사용                 | --workers -1 (전 스크립트)          |
@@ -1451,14 +1269,12 @@ scripts/run_fid.py로 분리하여 단일 책임 원칙(SRP)을 적용한다.
         │                 ├──→ [4] train_controlnet.py → best_model/
         │                 │        ├──→ [5] run_validation_phases.py (선택)
         │                 │        └──→ [6] test_controlnet.py → generated/
-        │                 │                 └──→ [7] package_casda_data.py → casda_full/, casda_pruning/
-        │                 └──→ [8] compose_casda_images.py → casda_composed/
-        │                          └──→ [9] score_casda_quality.py
-        │                               └──→ [10] validate_augmented_quality.py
-        │                                    └──→ [11] merge_datasets.py → train_augmented.csv
-        └──→ [2] extract_clean_backgrounds.py → backgrounds/
-        └──→ [12] run_fid.py
-             └──→ [13] run_benchmark.py
+        │                 └──→ [7] compose_casda_images.py → casda_composed/
+        │                          └──→ [8] score_casda_quality.py
+        │                               └──→ [9] validate_augmented_quality.py
+        ├──→ [2] extract_clean_backgrounds.py → backgrounds/
+        ├──→ [10] run_fid.py
+        └──→ [11] run_benchmark.py (내부에서 casda_composed/ 직접 병합)
 
   16.6 재사용 가능한 단계 (v5.5 결과 유효 시)
 
@@ -1471,10 +1287,83 @@ scripts/run_fid.py로 분리하여 단일 책임 원칙(SRP)을 적용한다.
     - Step 6 (test_controlnet.py): 생성 설정 변경 없으면 재사용
 
     반드시 재실행해야 하는 단계 (v5.6 핵심):
-    - Step 7 (package_casda_data.py): v5.5에서 미실행
-    - Step 8 (compose_casda_images.py): compositions-per-roi=3 적용
-    - Step 9 (score_casda_quality.py): v5.5에서 미실행
-    - Step 10 (validate_augmented_quality.py): v5.5에서 미실행
-    - Step 11 (merge_datasets.py): v5.5에서 미실행
-    - Step 12 (run_fid.py): 새 데이터로 재평가
-    - Step 13 (run_benchmark.py): 새 데이터로 재벤치마크
+    - Step 7 (compose_casda_images.py): compositions-per-roi=3 적용
+    - Step 8 (score_casda_quality.py): v5.5에서 미실행
+    - Step 9 (validate_augmented_quality.py): v5.5에서 미실행
+    - Step 10 (run_fid.py): 새 데이터로 재평가
+    - Step 11 (run_benchmark.py): 새 데이터로 재벤치마크
+
+
+================================================================================
+17. Colab 노트북 작성 + 전체 코드 리뷰
+================================================================================
+
+  이번 세션(3/7 후반)에서는 다음 두 가지 산출물을 작성하였다.
+
+  17.1 docs/colab_notebook.ipynb — v5.6 Colab 실행 노트북
+
+    v5.6 11단계 파이프라인을 Google Colab에서 순차 실행하기 위한
+    Jupyter 노트북. 전체 파이프라인을 셀 단위로 분할하여 단계별 실행 가능.
+
+    구성:
+    - 환경 설정 셀 (Google Drive 마운트, pip install, 경로 설정)
+    - Step 1~6: 재사용 판단 로직 포함 (이전 결과 존재 시 스킵 옵션)
+    - Step 7 (compose): --compositions-per-roi 3 적용
+    - Step 8 (score): 품질 점수 산출
+    - Step 9 (validate): 품질 검증
+    - Step 10 (FID): 세분화 FID 평가
+    - Step 11 (benchmark): pruning 수정 반영, --reference-results 적용
+    - P3 ratio 실험 셀 (10%, 20%, 30%, 50% 비율 순차 실행)
+
+    특징:
+    - package_casda_data.py 완전히 제외 (사용자 2차 확인 후 재작성)
+    - 각 셀에 예상 실행 시간 주석 포함
+    - 결과 확인용 pandas 출력 셀 포함
+
+  17.2 docs/project_code_review.docs — 전체 프로젝트 코드 리뷰
+
+    프로젝트 전체 코드베이스(~32,000줄)에 대한 체계적 리뷰 문서.
+    9개 섹션으로 구성:
+
+    1. 프로젝트 개요 및 통계 (규모, 기술 스택, 데이터 특성)
+    2. 아키텍처 총평 (디렉토리 구조, 의존성, 설정 관리, 데이터 흐름)
+    3. src/ 라이브러리 코드 리뷰
+       - analysis/ (3 모듈, ~885줄): 결함·배경 분석
+       - preprocessing/ (8 모듈, ~4,200줄): 데이터 전처리 파이프라인
+       - training/ (5 모듈, ~3,215줄): 학습 인프라
+       - models/ (3 모듈, ~702줄): 탐지·세그멘테이션 모델
+       - utils/ (2 모듈, ~585줄): 유틸리티
+    4. scripts/ 파이프라인 스크립트 리뷰 (11단계, Stage A~D)
+    5. configs/ 설정 파일 리뷰
+    6. 코드 품질 평가 (강점 5개, 개선 5개, 기술 부채 3개)
+    7. 보안 및 안정성
+    8. 테스트 커버리지 (현재: 매우 부족)
+    9. 종합 평가 및 권장 사항 (단기/중기/장기)
+
+    종합 평가:
+    | 항목        | 등급 |
+    |-------------|------|
+    | 아키텍처    | B+   |
+    | 코드 품질   | B    |
+    | 문서화      | A    |
+    | 테스트      | D    |
+    | 재현성      | A-   |
+    | 병렬화      | A-   |
+    | 도메인 특화 | A    |
+    | 확장성      | B-   |
+
+    수정 이력:
+    - 초기 작성: 12단계 파이프라인 기준 (package_casda_data.py 포함)
+    - 수정 (본 세션): 11단계로 변경 — package_casda_data.py를
+      파이프라인에서 제외하고 레거시 스크립트 목록에 추가
+
+  17.3 20260307.docs 섹션 16 수정
+
+    섹션 16 "v5.6 실행 계획"을 12단계에서 11단계로 전면 수정:
+    - 16.1: package_casda_data.py를 누락 스크립트 목록에서 제거,
+      불필요 확인 주석 추가
+    - 16.2: 11단계 실행 순서도 + package_casda_data.py 제외 사유 명시
+    - 16.3: 단계별 입출력 테이블에서 Step 7→11로 재번호
+    - 16.4: v5.5 대비 v5.6 비교에서 "패키징" 항목을 "불필요" 처리
+    - 16.5: 의존성 그래프에서 package_casda_data.py 노드 제거
+    - 16.6: 재실행 필수 단계를 Step 7~11 (5단계)로 수정

@@ -1,0 +1,172 @@
+# 작업일지 — 2026-03-09
+
+## 목적
+SCI 논문 투고를 위한 Gap Analysis 결과(`docs/plans/2026-03-09-sci-paper-gap-analysis.md`) 기반으로
+추가 실험 스크립트 구현 및 벤치마크 파이프라인 확장.
+
+---
+
+## 작업 내역
+
+### 1. `scripts/create_copypaste_baseline.py` (신규)
+
+**목적**: Gap 1 (추가 Baseline 부족) 해소 — CopyPaste Baseline 생성
+
+**구현 내용**:
+- 원본 결함 ROI 패치(`roi_patches/images/`, `roi_patches/masks/`)를
+  결함 없는 배경(clean background)에 Poisson Blending **없이** 직접 mask-based paste
+- `compose_casda_images.py`의 `BackgroundPool`, `find_clean_images` 재사용 (중복 코드 방지)
+- 배경 호환성 매칭 (defect_subtype × background_type 호환성 행렬) 및 밝기 매칭 유지
+- ROI 패치 경로는 메타데이터의 basename만 사용 (Colab 절대경로 의존성 제거)
+- 출력 형식: `casda_composed/`와 동일 (`images/`, `masks/`, `metadata.json`)
+- `blend_method: "direct_paste"` 로 기록 (CASDA와 구분)
+
+**CLI 주요 인자**:
+```
+--roi-dir           ROI 패치 디렉토리 (images/ + masks/ 포함)
+--metadata-csv      roi_metadata.csv 경로
+--clean-images-dir  원본 이미지 디렉토리
+--train-csv         train.csv 경로
+--output-dir        출력 디렉토리
+--workers           병렬 처리 워커 수 (-1=CPU 자동)
+--bg-cache          배경 유형 캐시 JSON 경로
+--jitter-range      x축 오프셋 ±N px (기본: 100)
+```
+
+---
+
+### 2. `scripts/compose_casda_images.py` (수정)
+
+**목적**: Gap 2 (Ablation Study 전무) 해소 — w/o Blending ablation variant 생성
+
+**변경 내용**:
+- `--no-blend` CLI 플래그 추가
+  - 활성화 시: ControlNet 생성 이미지를 Poisson Blending 없이 직접 paste
+  - 순차 모드 및 멀티프로세싱 병렬 모드 모두 지원
+- `compose_all()` 함수에 `no_blend: bool = False` 파라미터 추가
+- `_compose_single_task()` 워커 함수에 직접 paste 로직 추가:
+  - 힌트 Red 채널에서 마스크 추출 (기존 방식 유지)
+  - `scale_factor` 및 `jitter_x` 적용 (기존 Tier-1 증강과 동일)
+  - `seamlessClone` 없이 mask_bool 기반 직접 덮어씌우기
+  - `blend_method: "direct_paste"` 로 기록
+
+**용도**: ablation_no_blending 그룹 데이터 생성
+```bash
+python scripts/compose_casda_images.py \
+  --generated-dir .../generated \
+  ... \
+  --output-dir .../casda_no_blend \
+  --no-blend
+```
+
+---
+
+### 3. `configs/benchmark_experiment.yaml` (수정)
+
+**목적**: 새 실험 그룹을 벤치마크 설정에 등록
+
+**추가된 dataset groups**:
+
+| 그룹 키 | 이름 | 목적 |
+|---------|------|------|
+| `ablation_no_blending` | CASDA-NoBlending | Ablation: Poisson Blending 제거 효과 측정 |
+| `ablation_no_pruning` | CASDA-NoPruning | Ablation: suitability 기반 pruning 제거 효과 측정 |
+| `copypaste` | CopyPaste | Baseline: 단순 ROI 직접 붙여넣기 |
+
+- `ablation_no_blending`, `copypaste`는 `casda_dir_override` 필드로 독립 데이터 디렉토리 지정
+- `ablation_no_pruning`은 `casda_composed`와 동일 (전체 CASDA 이미지 사용, pruning 없음)
+
+---
+
+### 4. `scripts/run_benchmark.py` (수정)
+
+**목적**: 새 그룹이 벤치마크 파이프라인에서 정상 동작하도록 지원
+
+**변경 내용**:
+- `CASDA_GROUPS`에 3개 그룹 추가: `ablation_no_blending`, `ablation_no_pruning`, `copypaste`
+- `CASDA_GROUP_TO_SUBDIR`에 디렉토리 매핑 추가:
+  - `ablation_no_blending` → `casda_no_blend`
+  - `ablation_no_pruning` → `casda_composed`
+  - `copypaste` → `copypaste_baseline`
+- CASDA data directory resolution에 `casda_dir_override` 지원 추가:
+  - 그룹 설정의 `casda_dir_override` 필드 확인 → `args.casda_dir`와 조합하여 경로 결정
+  - 우선순위: `casda_dir_override` > `args.casda_dir` > config casda
+- `GROUP_ALIASES`에 단축키 추가:
+  - `no_blend`, `no_blending` → `ablation_no_blending`
+  - `no_pruning` → `ablation_no_pruning`
+  - `copypaste` → `copypaste`
+
+---
+
+## Colab 실행 순서
+
+### Step 1: CopyPaste Baseline 데이터 생성
+
+```bash
+python scripts/create_copypaste_baseline.py \
+  --roi-dir /content/drive/MyDrive/data/Severstal/roi_patches \
+  --metadata-csv data/processed/roi_patches/roi_metadata.csv \
+  --clean-images-dir /content/drive/MyDrive/data/Severstal/train_images \
+  --train-csv /content/drive/MyDrive/data/Severstal/train.csv \
+  --output-dir /content/drive/MyDrive/data/Severstal/copypaste_baseline \
+  --workers -1 \
+  --bg-cache /content/drive/MyDrive/data/Severstal/cache/bg_types.json
+```
+
+### Step 2: w/o Blending ablation 데이터 생성
+
+```bash
+python scripts/compose_casda_images.py \
+  --generated-dir /content/drive/MyDrive/data/Severstal/augmented_dataset_v5.6/generated \
+  --hint-dir data/processed/controlnet_dataset/hints \
+  --metadata-csv data/processed/roi_patches/roi_metadata.csv \
+  --summary-json /content/drive/MyDrive/data/Severstal/augmented_dataset_v5.6/generation_summary.json \
+  --clean-images-dir /content/drive/MyDrive/data/Severstal/train_images \
+  --train-csv /content/drive/MyDrive/data/Severstal/train.csv \
+  --output-dir /content/drive/MyDrive/data/Severstal/casda_no_blend \
+  --no-blend \
+  --workers -1 \
+  --bg-cache /content/drive/MyDrive/data/Severstal/cache/bg_types.json
+```
+
+### Step 3: Ablation + CopyPaste 벤치마크 실행 (YOLO-MFD만)
+
+```bash
+python scripts/run_benchmark.py \
+  --config configs/benchmark_experiment.yaml \
+  --models yolo_mfd \
+  --groups copypaste ablation_no_blending ablation_no_pruning \
+  --casda-dir /content/drive/MyDrive/data/Severstal \
+  --yolo-dir /content/drive/MyDrive/data/Severstal/yolo_datasets \
+  --output-dir /content/drive/MyDrive/data/Severstal/benchmark_results_ablation
+```
+
+---
+
+## 미완료 (향후 작업)
+
+| 항목 | 우선순위 | 비고 |
+|------|----------|------|
+| w/o Multi-hint ablation | P0 | ControlNet 재추론 필요 (GPU) — 1채널 hint로 재생성 |
+| GAN Baseline (DCGAN) | P1 | scripts/train_dcgan.py 신규 구현 필요 |
+| 다중 Seed 통계 실험 | P2 | Seed 42, 123, 456 × YOLO-MFD × paired t-test |
+
+### w/o Multi-hint 실행 방법 (향후)
+`test_controlnet.py`에 `--single-channel-hint` 플래그 추가 필요:
+- 힌트 이미지 로딩 시 Red 채널(결함 마스크)만 사용
+- Green/Blue 채널(배경 구조선, 텍스처) 제거
+- 이후 `compose_casda_images.py`로 일반 합성 진행
+
+---
+
+## 논문 Table 업데이트 목표 (ablation 포함)
+
+| Method | YOLO-MFD mAP | Class2 AP | 비고 |
+|--------|-------------|-----------|------|
+| Baseline (Raw) | 0.5546 | 0.4525 | ✅ 완료 |
+| Baseline (Trad) | 🔄 | 🔄 | 학습 중 |
+| CopyPaste | ❌ | ❌ | 이번 작업으로 데이터 생성 준비 완료 |
+| CASDA w/o Pruning | ❌ | ❌ | 이번 작업으로 그룹 등록 완료 |
+| CASDA w/o Blending | ❌ | ❌ | 이번 작업으로 데이터 생성 준비 완료 |
+| CASDA w/o Multi-hint | ❌ | ❌ | 향후 구현 |
+| **CASDA-Full (Ours)** | **0.5835** | **0.5317** | ✅ 완료 |

@@ -805,7 +805,105 @@ def _compose_single_task(args: dict) -> Optional[dict]:
         blend_mode=blend_mode,
         mask_threshold=mask_threshold,
     )
-    
+
+    no_blend = args.get('no_blend', False)
+
+    if no_blend:
+        # ── 직접 paste 모드 (w/o Blending ablation) ──
+        gen_img = cv2.imread(img_path_str, cv2.IMREAD_COLOR)
+        hint_img = cv2.imread(hint_path_str, cv2.IMREAD_COLOR)
+        clean_bg = cv2.imread(bg_path_str, cv2.IMREAD_COLOR)
+
+        if gen_img is None or hint_img is None or clean_bg is None:
+            return {'__fail__': 'load', 'filename': filename}
+
+        # 힌트 Red 채널에서 마스크 추출
+        mask_512 = blender.extract_mask_from_hint(hint_img)
+        if np.count_nonzero(mask_512) == 0:
+            return {'__fail__': 'empty_mask', 'filename': filename}
+
+        x1, y1, x2, y2 = roi_bbox
+        roi_w = x2 - x1
+        roi_h = y2 - y1
+
+        # scale_factor 적용
+        scaled_h = max(1, round(roi_h * scale_factor))
+        scaled_w = max(1, round(roi_w * scale_factor))
+
+        gen_resized = cv2.resize(gen_img, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
+        mask_resized = cv2.resize(mask_512, (scaled_w, scaled_h), interpolation=cv2.INTER_NEAREST)
+
+        if np.count_nonzero(mask_resized) == 0:
+            return {'__fail__': 'empty_mask_scaled', 'filename': filename}
+
+        target_h, target_w = clean_bg.shape[:2]
+
+        # jitter 적용
+        x1_j = x1 + jitter_x
+        x2_j = x1_j + scaled_w
+
+        # target 경계 클리핑
+        px1 = max(0, x1_j)
+        py1 = max(0, y1)
+        px2 = min(target_w, x2_j)
+        py2 = min(target_h, y1 + scaled_h)
+
+        if px2 <= px1 or py2 <= py1:
+            return {'__fail__': 'out_of_bounds', 'filename': filename}
+
+        sx1 = px1 - x1_j
+        sy1 = 0
+        sx2 = sx1 + (px2 - px1)
+        sy2 = sy1 + (py2 - py1)
+
+        mask_bool = mask_resized[sy1:sy2, sx1:sx2] > 127
+        if not mask_bool.any():
+            return {'__fail__': 'empty_mask_clipped', 'filename': filename}
+
+        composited = clean_bg.copy()
+        composited[py1:py2, px1:px2][mask_bool] = gen_resized[sy1:sy2, sx1:sx2][mask_bool]
+
+        # 전체 크기 마스크 + YOLO bbox
+        roi_bbox_jittered = (x1_j, y1, x2_j, y1 + scaled_h)
+        full_mask = blender.generate_full_mask(mask_resized, roi_bbox_jittered, (target_h, target_w))
+        bboxes, labels = blender.compute_yolo_bboxes(full_mask, class_id)
+
+        if not bboxes:
+            return {'__fail__': 'no_bbox', 'filename': filename}
+
+        # 출력 저장
+        png_params = [cv2.IMWRITE_PNG_COMPRESSION, png_compression]
+        cv2.imwrite(out_img_path_str, composited, png_params)
+        cv2.imwrite(out_mask_path_str, full_mask, png_params)
+
+        out_img_name = Path(out_img_path_str).name
+        out_mask_name = Path(out_mask_path_str).name
+
+        entry = {
+            "image_path": f"images/{out_img_name}",
+            "class_id": class_id,
+            "suitability_score": round(quality_score, 6),
+            "mask_path": f"masks/{out_mask_name}",
+            "bboxes": [[round(v, 6) for v in bbox] for bbox in bboxes],
+            "labels": labels,
+            "bbox_format": "yolo",
+            "image_width": composited.shape[1],
+            "image_height": composited.shape[0],
+            "source_generated": filename,
+            "source_background": bg_name,
+            "blend_method": "direct_paste",
+            "roi_bbox": list(roi_bbox),
+            "jitter_x": jitter_x,
+            "scale_factor": round(scale_factor, 6),
+        }
+        if defect_bbox_original:
+            entry["defect_bbox_original"] = list(defect_bbox_original)
+        if defect_subtype != 'unknown':
+            entry["defect_subtype"] = defect_subtype
+        if background_type != 'unknown':
+            entry["background_type"] = background_type
+        return entry
+
     result = blender.compose_from_paths(
         generated_path=img_path_str,
         hint_path=hint_path_str,
@@ -818,7 +916,7 @@ def _compose_single_task(args: dict) -> Optional[dict]:
         smooth_ksize=smooth_ksize,
         smooth_sigma=smooth_sigma,
     )
-    
+
     if not result.success:
         return {'__fail__': 'blend', 'filename': filename}
     
@@ -889,6 +987,7 @@ def compose_all(
     smooth_sigma: float = 7.0,
     brightness_tolerance: float = 30.0,
     compositions_per_roi: int = 1,
+    no_blend: bool = False,
 ):
     """
     전체 합성 파이프라인 실행.
@@ -925,6 +1024,9 @@ def compose_all(
     pipeline_start = time.time()
     rng = random.Random(seed)
     
+    if no_blend:
+        logger.info("⚠️  --no-blend 모드: Poisson Blending 없이 직접 paste (w/o Blending ablation)")
+
     # ── Tier-1 증강 옵션 로깅 ──
     augmentation_active = jitter_range > 0 or scale_min < 1.0 or use_smooth_mask
     if augmentation_active:
@@ -1165,6 +1267,7 @@ def compose_all(
                 'smooth_sigma': smooth_sigma,
                 # 합성 변형 인덱스 (metadata 추적용)
                 'composition_variant': comp_idx,
+                'no_blend': no_blend,
             }
             tasks.append(task)
     
@@ -1180,7 +1283,8 @@ def compose_all(
     
     # ── Step 6: 합성 실행 (순차 또는 병렬) ──
     logger.info("=" * 60)
-    logger.info(f"Step 6: Poisson Blending 합성 시작 "
+    blend_label = "DirectPaste" if no_blend else "PoissonBlending"
+    logger.info(f"Step 6: {blend_label} 합성 시작 "
                 f"(workers={num_workers if num_workers > 1 else 'sequential'}, "
                 f"png_compression={png_compression})")
     logger.info("=" * 60)
@@ -1191,10 +1295,11 @@ def compose_all(
     if num_workers > 1 and len(tasks) > 1:
         # 멀티프로세싱 병렬 합성
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            blend_tqdm = f"{blend_label} (workers={num_workers})"
             results = list(tqdm(
                 executor.map(_compose_single_task, tasks, chunksize=4),
                 total=len(tasks),
-                desc=f"Poisson 합성 (workers={num_workers})",
+                desc=blend_tqdm,
             ))
         
         for result in results:
@@ -1232,7 +1337,8 @@ def compose_all(
         
         png_params = [cv2.IMWRITE_PNG_COMPRESSION, png_compression]
         
-        for task in tqdm(tasks, desc="Poisson 합성"):
+        tqdm_label = "DirectPaste 합성" if no_blend else "Poisson 합성"
+        for task in tqdm(tasks, desc=tqdm_label):
             # 이미지 로드 (배경만 캐시)
             generated = cv2.imread(task['img_path'], cv2.IMREAD_COLOR)
             if generated is None:
@@ -1249,6 +1355,21 @@ def compose_all(
                 stats['fail_blend'] += 1
                 continue
             
+            if no_blend:
+                # no_blend 모드: 워커 함수 재사용 (직접 paste)
+                worker_result = _compose_single_task(task)
+                if worker_result is None or '__fail__' in worker_result:
+                    stats['fail_blend'] += 1
+                    logger.debug(f"직접 paste 실패: {task['filename']}")
+                    continue
+                all_metadata.append(worker_result)
+                stats['success'] += 1
+                bm = worker_result.get('blend_method', 'direct_paste')
+                stats['blend_methods'][bm] = stats['blend_methods'].get(bm, 0) + 1
+                cid = worker_result['class_id']
+                stats['class_counts'][cid] = stats['class_counts'].get(cid, 0) + 1
+                continue
+
             result = blender.compose_single(
                 generated, hint, clean_bg,
                 tuple(task['roi_bbox']), task['class_id'],
@@ -1258,19 +1379,19 @@ def compose_all(
                 smooth_ksize=task['smooth_ksize'],
                 smooth_sigma=task['smooth_sigma'],
             )
-            
+
             if not result.success:
                 stats['fail_blend'] += 1
                 logger.debug(f"합성 실패: {task['filename']} — {result.message}")
                 continue
-            
+
             # 출력 저장
             cv2.imwrite(task['out_img_path'], result.composited_image, png_params)
             cv2.imwrite(task['out_mask_path'], result.full_mask, png_params)
-            
+
             out_img_name = Path(task['out_img_path']).name
             out_mask_name = Path(task['out_mask_path']).name
-            
+
             entry = {
                 "image_path": f"images/{out_img_name}",
                 "class_id": task['class_id'],
@@ -1545,7 +1666,14 @@ def main():
              "N>1이면 각 ROI에 대해 서로 다른 (배경, jitter, scale) 조합으로 "
              "N개의 합성 이미지를 생성하여 pruning 풀을 N배 확대. GPU 비용 없음",
     )
-    
+    # ── Ablation Study 옵션 ──
+    parser.add_argument(
+        "--no-blend", action="store_true", default=False,
+        help="Poisson Blending 없이 직접 paste (w/o Blending ablation study용). "
+             "생성 이미지를 마스크 기반으로 배경에 직접 덮어씌움. "
+             "출력 디렉토리를 casda_no_blend 등으로 변경 권장.",
+    )
+
     args = parser.parse_args()
     
     # blend_mode 문자열 → OpenCV 상수 변환
@@ -1587,6 +1715,7 @@ def main():
         smooth_sigma=args.smooth_sigma,
         brightness_tolerance=args.brightness_tolerance,
         compositions_per_roi=args.compositions_per_roi,
+        no_blend=args.no_blend,
     )
 
 

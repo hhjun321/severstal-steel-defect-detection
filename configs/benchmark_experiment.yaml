@@ -86,6 +86,39 @@ dataset_groups:
       top_k: 2500
       stratified: true
 
+  # ── Ablation Study Groups ──
+  ablation_no_blending:
+    name: "CASDA-NoBlending"
+    description: "Ablation: Poisson Blending 제거 — ControlNet 생성 ROI 직접 paste"
+    use_original: true
+    augmentation: "none"
+    casda_data: "composed"
+    casda_dir_override: "data/augmented/casda_no_blend"  # compose --no-blend 출력 디렉토리
+    casda_pruning:
+      enabled: true
+      suitability_threshold: 0.0
+      top_k: 2500
+      stratified: true
+
+  ablation_no_pruning:
+    name: "CASDA-NoPruning"
+    description: "Ablation: Pruning 제거 — suitability 필터 없이 전체 CASDA 이미지 사용"
+    use_original: true
+    augmentation: "none"
+    casda_data: "composed"
+    # casda_pruning 없음 = 전체 casda_composed 사용 (casda_composed와 동일)
+
+  # ── CopyPaste Baseline ──
+  copypaste:
+    name: "CopyPaste"
+    description: "Baseline: 원본 ROI를 clean background에 직접 paste (Poisson Blending 없음)"
+    use_original: true
+    augmentation: "none"
+    casda_data: "composed"
+    casda_dir_override: "data/augmented/copypaste_baseline"  # create_copypaste_baseline.py 출력
+    casda_pruning:
+      enabled: false  # 전체 사용 (ROI 수 통제)
+
 # ----------------------------------------------------------------------------
 # 3 Benchmark Models
 # ----------------------------------------------------------------------------

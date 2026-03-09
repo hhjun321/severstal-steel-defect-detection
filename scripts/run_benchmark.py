@@ -107,6 +107,11 @@ GROUP_ALIASES = {
     "pruning":   "casda_pruning",
     "composed":  "casda_composed",
     "composed_pruning": "casda_composed_pruning",
+    # Ablation study & CopyPaste baseline
+    "no_blend":   "ablation_no_blending",
+    "no_blending": "ablation_no_blending",
+    "no_pruning": "ablation_no_pruning",
+    "copypaste":  "copypaste",
     # Special
     "all":       "__ALL__",
 }
@@ -1287,12 +1292,20 @@ Examples:
     run_idx = 0
     start_time = time.time()
 
-    CASDA_GROUPS = {"casda_full", "casda_pruning", "casda_composed", "casda_composed_pruning"}
+    CASDA_GROUPS = {
+        "casda_full", "casda_pruning", "casda_composed", "casda_composed_pruning",
+        # Ablation study & CopyPaste baseline
+        "ablation_no_blending", "ablation_no_pruning", "copypaste",
+    }
     CASDA_GROUP_TO_SUBDIR = {
         "casda_full": "casda_full",
         "casda_pruning": "casda_pruning",
         "casda_composed": "casda_composed",
         "casda_composed_pruning": "casda_composed",
+        # Ablation & CopyPaste: casda_dir_override 사용 (아래 resolution 로직 참조)
+        "ablation_no_blending": "casda_no_blend",
+        "ablation_no_pruning": "casda_composed",
+        "copypaste": "copypaste_baseline",
     }
 
     # ratio 그룹도 CASDA 그룹으로 취급 (소스에 따라 casda_full 또는 casda_composed)
@@ -1338,7 +1351,17 @@ Examples:
             casda_data_dir = None
 
             # Resolve CASDA data directory from config
-            if args.casda_dir:
+            # 우선순위: casda_dir_override (그룹 설정) > args.casda_dir > config casda
+            group_cfg_for_dir = config.get('dataset_groups', {}).get(group_key, {})
+            dir_override = group_cfg_for_dir.get('casda_dir_override', '')
+
+            if dir_override:
+                # casda_dir_override: 절대 경로 또는 args.casda_dir 기준 상대 경로
+                if args.casda_dir and not os.path.isabs(dir_override):
+                    casda_data_dir = os.path.join(args.casda_dir, os.path.basename(dir_override))
+                else:
+                    casda_data_dir = dir_override
+            elif args.casda_dir:
                 casda_data_dir = os.path.join(args.casda_dir, casda_subdir)
             else:
                 casda_cfg = config.get('dataset', {}).get('casda', {})

@@ -868,3 +868,100 @@ CASDA v5.6 파이프라인의 벤치마크 실행 과정을 개선하고, 다음
   (9) Split 실험 --data-dir 필수화: 경로 해석 오류 방지 (Colab 환경 대응)
   (10) 이미지 존재 사전 필터링: DataLoader worker crash 원천 차단 (create_data_loaders)
   (11) Ratio 그룹 suitability pruning: YOLO/DeepLabV3+ 동일 품질 기준 보장
+
+
+20. build_transforms() RandomScale 후 Resize 누락 버그 수정
+================================================================================
+
+20.1 문제 상황
+--------------------------------------------------------------------------------
+  baseline_trad 그룹의 DeepLabV3+ 학습 시 DataLoader에서 RuntimeError 발생:
+
+    RuntimeError: stack expects each tensor to be equal size,
+    but got [3, 282, 565] at entry 0 and [3, 256, 512] at entry 1
+
+  원인: build_transforms()의 transform 파이프라인에서 A.RandomScale이
+  A.Resize 뒤에 적용되어, 최종 출력 텐서 크기가 이미지마다 달라짐.
+
+    파이프라인 순서 (수정 전):
+      1. A.Resize(256, 512)      ← 고정 크기
+      2. A.HorizontalFlip(...)
+      3. A.VerticalFlip(...)
+      4. A.Rotate(...)
+      5. A.RandomScale(0.8~1.2)  ← 크기 변경! (256×512 → 282×565 등)
+      6. A.Normalize(...)         ← 크기 복원 없음
+      7. ToTensorV2()
+
+  282 ≈ 256 × 1.1, 565 ≈ 512 × 1.1 — RandomScale이 1.1배 확대 적용된 것.
+
+20.2 수정 내용
+--------------------------------------------------------------------------------
+  파일: src/training/dataset.py (L670-680)
+
+  수정 전:
+  ```python
+  if scale_range and isinstance(scale_range, (list, tuple)) and len(scale_range) == 2:
+      transforms_list.append(
+          A.RandomScale(
+              scale_limit=(scale_range[0] - 1.0, scale_range[1] - 1.0),
+              p=0.5,
+          )
+      )
+  ```
+
+  수정 후:
+  ```python
+  if scale_range and isinstance(scale_range, (list, tuple)) and len(scale_range) == 2:
+      transforms_list.append(
+          A.RandomScale(
+              scale_limit=(scale_range[0] - 1.0, scale_range[1] - 1.0),
+              p=0.5,
+          )
+      )
+      # RandomScale 후 크기가 변경되므로 다시 고정 크기로 resize (batch stack 보장)
+      transforms_list.append(A.Resize(height=input_size[0], width=input_size[1]))
+  ```
+
+  최종 파이프라인 순서 (수정 후):
+    1. A.Resize(256, 512)
+    2. A.HorizontalFlip(...)
+    3. A.VerticalFlip(...)
+    4. A.Rotate(...)
+    5. A.RandomScale(0.8~1.2)  ← crop/zoom 효과 (다양한 스케일 학습)
+    6. A.Resize(256, 512)      ← 고정 크기 복원 (batch stack 보장)
+    7. A.Normalize(...)
+    8. ToTensorV2()
+
+20.3 영향 범위
+--------------------------------------------------------------------------------
+  | 그룹           | 모델       | 영향 |
+  |---------------|-----------|------|
+  | baseline_trad | DeepLabV3+ | 수정됨 (이번 에러 해결) |
+  | baseline_trad | YOLO       | 영향 없음 (Ultralytics 네이티브 augmentation 사용) |
+  | baseline_raw  | 모두       | 영향 없음 (augmentation="none", RandomScale 미추가) |
+  | CASDA 그룹     | 모두       | 영향 없음 (augmentation="none") |
+
+20.4 검증
+--------------------------------------------------------------------------------
+    | 파일                     | 결과 |
+    |--------------------------|------|
+    | src/training/dataset.py  | PASS |
+
+    줄 수: 961 → 962 (+1줄)
+
+
+21. 핵심 설계 결정 요약 (업데이트)
+================================================================================
+
+  (1) --no-fid: 명시적 FID skip — run_fid.py 분리 후 자연스러운 UI 완성
+  (2) Pre-clean: inject 전 잔류 파일 제거 — 중단 후 재실행 안전성 보장
+  (3) Symlink 사전 테스트: 1회 테스트로 6,000회 예외 발생 방지
+  (4) 라벨 일괄 생성: 로컬 tmpdir → 대상 디렉토리 복사 (Drive FUSE 최적화)
+  (5) split_info 역산: CSV 사용 시 실제 비율 반영 (정확한 메타데이터)
+  (6) FileNotFoundError graceful degradation (CASDA): 학습 중단 대신 경고+skip
+  (7) Split 실험: subprocess 격리 (OOM 시 단일 비율만 실패, 나머지 계속)
+  (8) Baseline (Trad): 코드 변경 불필요 — config + CLI 옵션으로 충분
+  (9) Split 실험 --data-dir 필수화: 경로 해석 오류 방지 (Colab 환경 대응)
+  (10) 이미지 존재 사전 필터링: DataLoader worker crash 원천 차단 (create_data_loaders)
+  (11) Ratio 그룹 suitability pruning: YOLO/DeepLabV3+ 동일 품질 기준 보장
+  (12) RandomScale 후 Resize: scale augmentation 후 고정 크기 복원 (batch stack 보장)

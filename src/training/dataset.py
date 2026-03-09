@@ -676,6 +676,8 @@ def build_transforms(
                     p=0.5,
                 )
             )
+            # RandomScale 후 크기가 변경되므로 다시 고정 크기로 resize (batch stack 보장)
+            transforms_list.append(A.Resize(height=input_size[0], width=input_size[1]))
 
     # Normalize and convert to tensor
     transforms_list.extend([

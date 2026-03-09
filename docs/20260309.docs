@@ -665,3 +665,103 @@ CASDA v5.6 파이프라인의 벤치마크 실행 과정을 개선하고, 다음
   (7) Split 실험: subprocess 격리 (OOM 시 단일 비율만 실패, 나머지 계속)
   (8) Baseline (Trad): 코드 변경 불필요 — config + CLI 옵션으로 충분
   (9) Split 실험 --data-dir 필수화: 경로 해석 오류 방지 (Colab 환경 대응)
+
+
+16. create_data_loaders() 이미지 존재 사전 필터링 추가
+================================================================================
+
+16.1 문제 상황
+--------------------------------------------------------------------------------
+  Split 실험 실행 중 deeplabv3plus + baseline_raw 조합에서 학습 도중 FileNotFoundError 발생:
+
+    FileNotFoundError: Image not found: /content/drive/.../train_images/b568146ec.jpg
+
+  원인: train.csv에 기재된 이미지 중 일부가 실제 train_images/ 디렉토리에 존재하지 않음.
+  CSV → split → Dataset.__init__ → __getitem__ 전체 체인에서 파일 존재 검증이 없어
+  DataLoader worker 프로세스 내에서 런타임 crash 발생.
+
+  기존 코드의 검증 현황:
+    | 컴포넌트                          | 디스크 파일 검증 |
+    |----------------------------------|-----------------|
+    | get_image_ids_with_defects()     | 없음 (CSV만)    |
+    | split_dataset()                  | 없음            |
+    | SeverstalDetectionDataset.__init__| 없음            |
+    | SeverstalSegmentationDataset.__init__| 없음         |
+    | CASDASyntheticDataset.__init__   | 있음 (L368-385) |
+    | __getitem__() (모든 클래스)       | crash-time only |
+
+16.2 수정 내용
+--------------------------------------------------------------------------------
+  파일: src/training/dataset.py
+
+  (A) _filter_existing_images() 헬퍼 함수 추가 (L699-736)
+
+    수정 후:
+    ```python
+    def _filter_existing_images(
+        image_ids: List[str],
+        image_dir: str,
+        split_name: str,
+    ) -> List[str]:
+        """디스크에 실제 존재하는 이미지만 필터링하고 누락 이미지는 경고 로그 출력."""
+        existing = []
+        missing = []
+        for img_id in image_ids:
+            if os.path.exists(os.path.join(image_dir, img_id)):
+                existing.append(img_id)
+            else:
+                missing.append(img_id)
+
+        if missing:
+            examples = missing[:5]
+            logging.warning(
+                f"[{split_name}] {len(missing)}/{len(image_ids)} images not found "
+                f"in {image_dir}, removed from dataset. Examples: {examples}"
+            )
+        if not existing:
+            raise ValueError(
+                f"[{split_name}] No images found in {image_dir}! "
+                f"Total {len(image_ids)} IDs were all missing. Check --data-dir path."
+            )
+        return existing
+    ```
+
+  (B) create_data_loaders() 내부에 필터링 호출 삽입 (L804-807)
+
+    수정 후 (DatasetClass 생성 직전):
+    ```python
+    # 디스크에 실제 존재하는 이미지만 유지 (CSV에는 있지만 파일 누락된 경우 제거)
+    train_ids = _filter_existing_images(train_ids, image_dir, "train")
+    val_ids = _filter_existing_images(val_ids, image_dir, "val")
+    test_ids = _filter_existing_images(test_ids, image_dir, "test")
+    ```
+
+16.3 동작 방식
+--------------------------------------------------------------------------------
+  - 누락 이미지 발견 시: 경고 로그 출력 (최대 5개 예시) + 해당 ID 제거 후 계속 진행
+  - 전체 split에 이미지가 하나도 없으면: ValueError raise (경로 오류 명확 안내)
+  - 이미지가 모두 존재하면: 기존 동작과 완전히 동일 (하위 호환성 유지)
+  - Detection과 Segmentation 모두 적용: create_data_loaders() 레벨에서 필터링
+
+16.4 검증
+--------------------------------------------------------------------------------
+    | 파일                     | 결과 |
+    |--------------------------|------|
+    | src/training/dataset.py  | PASS |
+
+    줄 수: 915 → 960 (+45줄)
+
+
+17. 핵심 설계 결정 요약 (업데이트)
+================================================================================
+
+  (1) --no-fid: 명시적 FID skip — run_fid.py 분리 후 자연스러운 UI 완성
+  (2) Pre-clean: inject 전 잔류 파일 제거 — 중단 후 재실행 안전성 보장
+  (3) Symlink 사전 테스트: 1회 테스트로 6,000회 예외 발생 방지
+  (4) 라벨 일괄 생성: 로컬 tmpdir → 대상 디렉토리 복사 (Drive FUSE 최적화)
+  (5) split_info 역산: CSV 사용 시 실제 비율 반영 (정확한 메타데이터)
+  (6) FileNotFoundError graceful degradation (CASDA): 학습 중단 대신 경고+skip
+  (7) Split 실험: subprocess 격리 (OOM 시 단일 비율만 실패, 나머지 계속)
+  (8) Baseline (Trad): 코드 변경 불필요 — config + CLI 옵션으로 충분
+  (9) Split 실험 --data-dir 필수화: 경로 해석 오류 방지 (Colab 환경 대응)
+  (10) 이미지 존재 사전 필터링: DataLoader worker crash 원천 차단 (create_data_loaders)

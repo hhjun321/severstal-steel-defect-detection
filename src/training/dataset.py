@@ -696,6 +696,46 @@ def build_transforms(
         return A.Compose(transforms_list)
 
 
+def _filter_existing_images(
+    image_ids: List[str],
+    image_dir: str,
+    split_name: str,
+) -> List[str]:
+    """디스크에 실제 존재하는 이미지만 필터링하고 누락 이미지는 경고 로그 출력.
+
+    Args:
+        image_ids: 필터링할 이미지 ID 목록
+        image_dir: 이미지 파일이 위치한 디렉토리 경로
+        split_name: 로그에 표시할 split 이름 (train/val/test)
+
+    Returns:
+        디스크에 존재하는 이미지 ID만 포함된 리스트
+
+    Raises:
+        ValueError: 존재하는 이미지가 하나도 없을 경우
+    """
+    existing = []
+    missing = []
+    for img_id in image_ids:
+        if os.path.exists(os.path.join(image_dir, img_id)):
+            existing.append(img_id)
+        else:
+            missing.append(img_id)
+
+    if missing:
+        examples = missing[:5]
+        logging.warning(
+            f"[{split_name}] {len(missing)}/{len(image_ids)} images not found "
+            f"in {image_dir}, removed from dataset. Examples: {examples}"
+        )
+    if not existing:
+        raise ValueError(
+            f"[{split_name}] No images found in {image_dir}! "
+            f"Total {len(image_ids)} IDs were all missing. Check --data-dir path."
+        )
+    return existing
+
+
 def create_data_loaders(
     config: Dict,
     dataset_group: str,
@@ -760,6 +800,11 @@ def create_data_loaders(
     # Build transforms
     train_transform = build_transforms(model_type, input_size, augmentation, trad_config)
     eval_transform = build_transforms(model_type, input_size, "none")
+
+    # 디스크에 실제 존재하는 이미지만 유지 (CSV에는 있지만 파일 누락된 경우 제거)
+    train_ids = _filter_existing_images(train_ids, image_dir, "train")
+    val_ids = _filter_existing_images(val_ids, image_dir, "val")
+    test_ids = _filter_existing_images(test_ids, image_dir, "test")
 
     # Create base datasets
     DatasetClass = SeverstalDetectionDataset if model_type == "detection" else SeverstalSegmentationDataset

@@ -552,7 +552,108 @@ CASDA v5.6 파이프라인의 벤치마크 실행 과정을 개선하고, 다음
     6. dataset 필드는 config의 dataset_groups.*.name과 정확히 일치해야 매칭
 
 
-14. 핵심 설계 결정 요약
+14. run_split_experiment.py FileNotFoundError 수정
+================================================================================
+
+  14.1 증상
+
+    Colab에서 split 비율 실험 실행 시 FileNotFoundError 발생:
+
+      FileNotFoundError: Image not found:
+        /content/severstal-steel-defect-detection/train_images/d30ad2e83.jpg
+
+    실제 이미지 위치:
+      /content/drive/MyDrive/data/Severstal/train_images/d30ad2e83.jpg
+
+  14.2 원인 분석
+
+    경로 해석 흐름:
+      1. YAML config: image_dir: "train_images" (상대경로)
+      2. run_benchmark.py: --data-dir 미지정 → config 값 그대로 유지
+      3. dataset.py L728-730: 상대경로 → project_root / "train_images"
+         = /content/severstal-steel-defect-detection/train_images/ (존재하지 않음)
+
+    run_split_experiment.py가 run_benchmark.py를 subprocess로 호출할 때
+    --data-dir과 --csv를 전달하지 않았기 때문에, config의 상대경로가
+    프로젝트 루트 기준으로 해석되어 잘못된 경로가 사용됨.
+
+    run_benchmark.py에는 이미 --data-dir (L948-949)과 --csv (L950-951)
+    CLI 인자가 존재하므로, 전달만 하면 해결됨.
+
+  14.3 수정 내용 (scripts/run_split_experiment.py, 6곳)
+
+    (a) parse_args(): --data-dir 필수 인자 추가
+
+        수정 후:
+          parser.add_argument(
+              '--data-dir', required=True,
+              help='학습 이미지 디렉토리 경로 (예: /content/drive/.../train_images). '
+                   'run_benchmark.py에 --data-dir로 전달됩니다.',
+          )
+
+    (b) run_benchmark() 시그니처 확장
+
+        수정 전:
+          def run_benchmark(
+              config_path, split_csv_path, output_dir, epochs, seed,
+              extra_args=None,
+          ) -> bool:
+
+        수정 후:
+          def run_benchmark(
+              config_path, split_csv_path, output_dir, epochs, seed,
+              data_dir=None, annotation_csv=None, extra_args=None,
+          ) -> bool:
+
+    (c) run_benchmark() subprocess 명령에 --data-dir, --csv 조건부 전달
+
+        추가:
+          if data_dir:
+              cmd.extend(['--data-dir', data_dir])
+          if annotation_csv:
+              cmd.extend(['--csv', annotation_csv])
+
+    (d) main() 입력 검증: --data-dir 디렉토리 존재 검증 추가
+
+        추가:
+          if not os.path.isdir(args.data_dir):
+              logger.error(f"이미지 디렉토리를 찾을 수 없습니다: {args.data_dir}")
+              sys.exit(1)
+
+    (e) main() 로깅: data_dir 출력 추가
+
+    (f) main() run_benchmark 호출: data_dir, annotation_csv 전달
+
+        수정 후:
+          run_benchmark(
+              ...,
+              data_dir=args.data_dir,
+              annotation_csv=args.csv,
+              extra_args=args.benchmark_args,
+          )
+
+  14.4 수정 후 Colab 실행 명령
+
+    python scripts/run_split_experiment.py \
+        --csv /content/drive/MyDrive/data/Severstal/train.csv \
+        --data-dir /content/drive/MyDrive/data/Severstal/train_images \
+        --config configs/benchmark_experiment.yaml \
+        --output-dir /content/drive/MyDrive/data/Severstal/casda/split_experiment_v5.6 \
+        --ratios "50/25/25,60/20/20,80/10/10" \
+        --epochs 100 --seed 42
+
+    기존 명령어에서 --data-dir 1줄만 추가.
+
+  14.5 검증
+
+    | 파일                             | 결과 |
+    |----------------------------------|------|
+    | scripts/run_split_experiment.py  | PASS |
+
+    줄 수: 666 → 688 (+22줄)
+
+
+15. 핵심 설계 결정 요약
 ================================================================================
 
   (1) --no-fid: 명시적 FID skip — run_fid.py 분리 후 자연스러운 UI 완성
@@ -563,3 +664,4 @@ CASDA v5.6 파이프라인의 벤치마크 실행 과정을 개선하고, 다음
   (6) FileNotFoundError graceful degradation: 학습 중단 대신 경고+skip
   (7) Split 실험: subprocess 격리 (OOM 시 단일 비율만 실패, 나머지 계속)
   (8) Baseline (Trad): 코드 변경 불필요 — config + CLI 옵션으로 충분
+  (9) Split 실험 --data-dir 필수화: 경로 해석 오류 방지 (Colab 환경 대응)

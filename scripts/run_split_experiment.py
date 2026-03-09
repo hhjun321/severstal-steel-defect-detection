@@ -15,6 +15,7 @@ DeepLabV3+ 모델을 순차 학습하여, 최적 split 비율 선택의 근거�
 사용 예시 (Colab):
   python scripts/run_split_experiment.py \\
       --csv /content/drive/MyDrive/data/Severstal/train.csv \\
+      --data-dir /content/drive/MyDrive/data/Severstal/train_images \\
       --config configs/benchmark_experiment.yaml \\
       --output-dir /content/drive/MyDrive/data/Severstal/casda/outputs/split_experiment \\
       --ratios "50/25/25,60/20/20,70/15/15,80/10/10" \\
@@ -187,6 +188,8 @@ def run_benchmark(
     output_dir: str,
     epochs: int,
     seed: int,
+    data_dir: Optional[str] = None,
+    annotation_csv: Optional[str] = None,
     extra_args: Optional[List[str]] = None,
 ) -> bool:
     """
@@ -198,6 +201,8 @@ def run_benchmark(
         output_dir: 실험 출력 디렉토리
         epochs: 학습 에폭 수
         seed: 랜덤 시드
+        data_dir: 학습 이미지 디렉토리 (--data-dir로 전달)
+        annotation_csv: annotation CSV 경로 (--csv로 전달)
         extra_args: 추가 CLI 인자 목록
 
     Returns:
@@ -228,6 +233,10 @@ def run_benchmark(
         '--seed', str(seed),
         '--no-fid',  # FID는 split 실험에 불필요
     ]
+    if data_dir:
+        cmd.extend(['--data-dir', data_dir])
+    if annotation_csv:
+        cmd.extend(['--csv', annotation_csv])
     if extra_args:
         cmd.extend(extra_args)
 
@@ -437,6 +446,7 @@ def parse_args():
 예시 (Colab):
   python scripts/run_split_experiment.py \\
       --csv /content/drive/MyDrive/data/Severstal/train.csv \\
+      --data-dir /content/drive/MyDrive/data/Severstal/train_images \\
       --config configs/benchmark_experiment.yaml \\
       --output-dir /content/drive/MyDrive/data/Severstal/casda/outputs/split_experiment \\
       --ratios "50/25/25,60/20/20,70/15/15,80/10/10" \\
@@ -450,7 +460,13 @@ def parse_args():
     )
     parser.add_argument(
         '--csv', required=True,
-        help='Severstal train.csv 경로 (annotation CSV)',
+        help='Severstal train.csv 경로 (annotation CSV). '
+             'run_benchmark.py에 --csv로도 전달됩니다.',
+    )
+    parser.add_argument(
+        '--data-dir', required=True,
+        help='학습 이미지 디렉토리 경로 (예: /content/drive/.../train_images). '
+             'run_benchmark.py에 --data-dir로 전달됩니다.',
     )
     parser.add_argument(
         '--config', required=True,
@@ -507,6 +523,9 @@ def main():
     if not os.path.exists(args.csv):
         logger.error(f"Annotation CSV를 찾을 수 없습니다: {args.csv}")
         sys.exit(1)
+    if not os.path.isdir(args.data_dir):
+        logger.error(f"이미지 디렉토리를 찾을 수 없습니다: {args.data_dir}")
+        sys.exit(1)
     if not os.path.exists(args.config):
         logger.error(f"Config 파일을 찾을 수 없습니다: {args.config}")
         sys.exit(1)
@@ -535,6 +554,7 @@ def main():
     logger.info("  Split 비율 실험 시작")
     logger.info("=" * 70)
     logger.info(f"  Annotation CSV : {args.csv}")
+    logger.info(f"  Data dir       : {args.data_dir}")
     logger.info(f"  Config         : {args.config}")
     logger.info(f"  Output dir     : {output_dir}")
     logger.info(f"  Splits dir     : {splits_dir}")
@@ -613,6 +633,8 @@ def main():
                 output_dir=exp_output_dir,
                 epochs=args.epochs,
                 seed=args.seed,
+                data_dir=args.data_dir,
+                annotation_csv=args.csv,
                 extra_args=args.benchmark_args,
             ):
                 logger.error(f"  ✗ 벤치마크 실패 — {label}")

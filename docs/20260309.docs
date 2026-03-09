@@ -765,3 +765,106 @@ CASDA v5.6 파이프라인의 벤치마크 실행 과정을 개선하고, 다음
   (8) Baseline (Trad): 코드 변경 불필요 — config + CLI 옵션으로 충분
   (9) Split 실험 --data-dir 필수화: 경로 해석 오류 방지 (Colab 환경 대응)
   (10) 이미지 존재 사전 필터링: DataLoader worker crash 원천 차단 (create_data_loaders)
+
+
+18. CASDA ratio 그룹에 suitability pruning 적용
+================================================================================
+
+18.1 문제 상황
+--------------------------------------------------------------------------------
+  프로젝트 규칙: "증강 ratio별 모델 성능 비교는 무조건 pruning 데이터만 사용"
+
+  --casda-ratio 0.1 0.2 0.3 사용 시 동적 그룹 생성 과정에서
+  YOLO inject 쪽에 suitability_thresh가 None으로 설정되어
+  casda_mode="full"로 분기 → suitability score 정렬 없이 랜덤 N장 선택.
+
+  DeepLabV3+ 쪽은 CASDASyntheticDataset._load_metadata()가 항상
+  suitability score 내림차순 정렬 후 top-k를 적용하므로 이미 정상 동작.
+
+  결과: 동일 ratio 실험에서 YOLO와 DeepLabV3+가 서로 다른 품질의 데이터를 사용.
+
+  | 모델        | 수정 전 동작                    | 문제 |
+  |------------|-------------------------------|------|
+  | YOLO       | 전체 풀에서 순서 무관 N장 선택    | 저품질 포함 |
+  | DeepLabV3+ | suitability score 상위 N장 선택 | 정상 |
+
+18.2 수정 내용
+--------------------------------------------------------------------------------
+  파일: scripts/run_benchmark.py
+
+  (A) YOLO inject 시 ratio 그룹에도 suitability 적용 (L1360-1364)
+
+    수정 전:
+    ```python
+    if group_key in casda_ratio_map:
+        # ratio 그룹: 비율 기반 max_samples
+        _, ratio_max_samples = casda_ratio_map[group_key]
+    ```
+
+    수정 후:
+    ```python
+    if group_key in casda_ratio_map:
+        # ratio 그룹: suitability score 기준 정렬 후 비율 기반 top-k 선택
+        # (프로젝트 규칙: 증강 ratio별 모델 성능 비교는 pruning 데이터만 사용)
+        _, ratio_max_samples = casda_ratio_map[group_key]
+        suitability_thresh = 0.0
+    ```
+
+    효과: suitability_thresh=0.0 → inject_casda_to_baseline()에서 casda_mode="pruning"
+    분기 진입 → _add_casda_to_training()에서 suitability score 내림차순 정렬 + top-k.
+
+  (B) 동적 그룹 생성 로그에 pruning 적용 명시 (L1237-1239)
+
+    수정 전:
+    ```python
+    logging.info(f"  Created ratio group: {ratio_key} "
+                 f"(ratio={ratio:.0%}, max_samples={max_samples}, source={ratio_source_label})")
+    ```
+
+    수정 후:
+    ```python
+    logging.info(f"  Created ratio group: {ratio_key} "
+                 f"(ratio={ratio:.0%}, max_samples={max_samples}, "
+                 f"source={ratio_source_label}, pruning=suitability_top_k)")
+    ```
+
+18.3 동작 흐름 (수정 후)
+--------------------------------------------------------------------------------
+  --casda-ratio 0.1 --casda-ratio-source composed 실행 시:
+
+  1. 동적 그룹 생성: casda_ratio_10 (casda_data='composed', max_samples=518)
+  2. YOLO inject:
+     a. casda_composed/metadata.json 로드
+     b. suitability_threshold=0.0 → casda_mode="pruning" 분기
+     c. suitability score >= 0.0 필터 (실질적 필터링 없음, 하지만 정렬 활성화)
+     d. suitability score 내림차순 정렬
+     e. 상위 518장 선택 (top-k)
+     f. baseline_raw YOLO 디렉토리에 inject
+  3. DeepLabV3+:
+     a. CASDASyntheticDataset(data_dir=casda_composed, max_samples=518)
+     b. _load_metadata(): 항상 suitability score 내림차순 정렬 + [:518]
+     → YOLO와 동일한 품질 기준으로 데이터 선택
+
+18.4 검증
+--------------------------------------------------------------------------------
+    | 파일                       | 결과 |
+    |----------------------------|------|
+    | scripts/run_benchmark.py   | PASS |
+
+    줄 수: 1554 → 1557 (+3줄)
+
+
+19. 핵심 설계 결정 요약 (업데이트)
+================================================================================
+
+  (1) --no-fid: 명시적 FID skip — run_fid.py 분리 후 자연스러운 UI 완성
+  (2) Pre-clean: inject 전 잔류 파일 제거 — 중단 후 재실행 안전성 보장
+  (3) Symlink 사전 테스트: 1회 테스트로 6,000회 예외 발생 방지
+  (4) 라벨 일괄 생성: 로컬 tmpdir → 대상 디렉토리 복사 (Drive FUSE 최적화)
+  (5) split_info 역산: CSV 사용 시 실제 비율 반영 (정확한 메타데이터)
+  (6) FileNotFoundError graceful degradation (CASDA): 학습 중단 대신 경고+skip
+  (7) Split 실험: subprocess 격리 (OOM 시 단일 비율만 실패, 나머지 계속)
+  (8) Baseline (Trad): 코드 변경 불필요 — config + CLI 옵션으로 충분
+  (9) Split 실험 --data-dir 필수화: 경로 해석 오류 방지 (Colab 환경 대응)
+  (10) 이미지 존재 사전 필터링: DataLoader worker crash 원천 차단 (create_data_loaders)
+  (11) Ratio 그룹 suitability pruning: YOLO/DeepLabV3+ 동일 품질 기준 보장

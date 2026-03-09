@@ -1235,7 +1235,8 @@ Examples:
                 group_keys.append(ratio_key)
 
             logging.info(f"  Created ratio group: {ratio_key} "
-                         f"(ratio={ratio:.0%}, max_samples={max_samples}, source={ratio_source_label})")
+                         f"(ratio={ratio:.0%}, max_samples={max_samples}, "
+                         f"source={ratio_source_label}, pruning=suitability_top_k)")
 
     logging.info(f"Models: {model_keys}")
     logging.info(f"Dataset groups: {group_keys}")
@@ -1357,8 +1358,10 @@ Examples:
                 use_stratified = False
 
                 if group_key in casda_ratio_map:
-                    # ratio 그룹: 비율 기반 max_samples
+                    # ratio 그룹: suitability score 기준 정렬 후 비율 기반 top-k 선택
+                    # (프로젝트 규칙: 증강 ratio별 모델 성능 비교는 pruning 데이터만 사용)
                     _, ratio_max_samples = casda_ratio_map[group_key]
+                    suitability_thresh = 0.0
                 else:
                     # 그룹 config에서 casda_pruning 설정 읽기
                     group_cfg = config.get('dataset_groups', {}).get(group_key, {})

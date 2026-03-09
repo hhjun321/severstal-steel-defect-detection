@@ -1,0 +1,565 @@
+20260309 작업 일지 #10 - FID 분석, 벤치마크 개선, Split 실험 스크립트, Baseline(Trad) 분석
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+CASDA v5.6 파이프라인의 벤치마크 실행 과정을 개선하고, 다음 실험 단계를
+준비하기 위한 복수의 작업을 수행한다:
+
+  (1) v5.6 FID 결과 + 벤치마크 결과 분석
+  (2) run_benchmark.py 개선: --no-fid, pre-clean, inject 최적화
+  (3) DeepLabV3+ CASDASyntheticDataset FileNotFoundError 수정
+  (4) split_info 메타데이터 버그 수정
+  (5) train/val/test split 비율 실험 스크립트 신규 생성
+  (6) Baseline (Trad) 실행 과정 분석 — 코드 변경 불필요 확인
+
+  설계 제약:
+  - 하위 호환성 유지: 새 파라미터는 기존 동작과 동일한 기본값
+  - 한국어 주석/문서
+  - cv2/numpy/pandas/torch LSP 에러 무시 (pyright 이슈)
+  - Google Colab 실행 환경 기준
+
+
+2. FID 결과 분석 (v5.6, Colab 실행 완료)
+================================================================================
+
+  2.1 FID-ROI 결과
+
+    | 구분         | FID 값  | 판정                    |
+    |--------------|---------|-------------------------|
+    | Overall      | 79.40   | 보통 (100 미만 = 양호)  |
+    | Class 1      | 66.36   | 양호                    |
+    | Class 2      | 140.83  | 불량 — 합성 품질 최저   |
+    | Class 3      | 99.12   | 보통                    |
+    | Class 4      | 74.56   | 양호                    |
+
+    Subtype별 분석:
+    | Subtype             | FID 값  | 판정                       |
+    |---------------------|---------|----------------------------|
+    | linear_scratch      | 167.99  | 취약                       |
+    | irregular           | 128.65  | 취약                       |
+    | horizontal_stripe   | 261.93  | 매우 취약 — 개선 필요      |
+    | vertical_stripe     | 275.95  | 매우 취약 — 개선 필요      |
+
+    horizontal_stripe(261.93)과 vertical_stripe(275.95)은 FID > 250으로,
+    해당 subtype의 ControlNet 생성 품질이 크게 부족함을 나타낸다.
+
+  2.2 FID-Composed 결과 (pruned 2,000장 기준)
+
+    | 구분         | FID 값  | 판정                         |
+    |--------------|---------|------------------------------|
+    | Overall      | 240.17  | 불량 — 합성 전체 이미지 품질 |
+    | Class 1      | 313.43  | 불량                         |
+    | Class 2      | 378.95  | 최악                         |
+    | Class 3      | 290.82  | 불량                         |
+    | Class 4      | 310.52  | 불량                         |
+
+    FID-Composed가 FID-ROI보다 전반적으로 높은 이유:
+    (1) ROI는 결함 패턴만 비교하지만, Composed는 전체 이미지 비교
+    (2) 합성 과정(compose)에서 추가 아티팩트 발생 (경계 불일치, 조명 불연속 등)
+    (3) 1600x256 크기의 전체 이미지가 패턴 다양성이 훨씬 높아 분포 차이 확대
+
+  2.3 FID vs 모델 성능 상관관계
+
+    Class 2: FID-ROI 최악 (140.83) + 모델 성능 최저 (아래 벤치마크 참조)
+    → 합성 품질이 낮은 클래스가 학습 성능도 가장 낮음.
+    → P1 (Class 2 품질 개선) 필요성 재확인.
+
+
+3. v5.6 벤치마크 결과 분석
+================================================================================
+
+  3.1 CASDA-Composed-Pruning (5 epochs, 비수렴)
+
+    | 항목                | 값                                         |
+    |---------------------|--------------------------------------------|
+    | 모델                | EB-YOLOv8 (BiFPN, yolov8s backbone)        |
+    | 데이터셋            | CASDA-Composed-Pruning                     |
+    | Pruning 설정        | top_k=2,000 → 실제 inject 1,615장         |
+    | 누락 이미지         | 385장 (metadata에 존재, 파일 미존재)       |
+    | 학습 Epochs         | 5 (수렴 전)                                |
+    | mAP@0.5             | 0.4098                                     |
+    | 판정                | 비교 불가 (수렴 전 수치)                   |
+
+    385장 누락 원인:
+    - metadata.json에 엔트리 존재하나 실제 이미지 파일이 디스크에 없음
+    - YOLO inject: os.path.exists() 체크로 skip (정상 동작)
+    - DeepLabV3+: 이번 세션에서 graceful degradation 추가 (섹션 5 참조)
+
+  3.2 Standard Baseline 결과 비교 (300 epochs, 수렴)
+
+    | 모델         | 데이터셋       | 주요 메트릭     | 비고         |
+    |--------------|----------------|-----------------|--------------|
+    | EB-YOLOv8    | Baseline (Raw) | mAP@0.5=0.5819  | 기준선       |
+    | YOLO-MFD     | Baseline (Raw) | mAP@0.5=0.5546  | 참고         |
+    | DeepLabV3+   | Baseline (Raw) | Dice=0.6290      | Segmentation |
+
+    DeepLabV3+ 클래스별 Dice:
+    | 클래스  | Dice   |
+    |---------|--------|
+    | Class 1 | 0.4926 |
+    | Class 2 | 0.5170 |
+    | Class 3 | 0.7297 |
+    | Class 4 | 0.7767 |
+
+    Class 1, 2가 상대적으로 낮음 — FID 분석과 일치하는 패턴.
+
+  3.3 다음 실험 요구사항
+
+    (a) Epochs 증가 (300ep)하여 CASDA 수렴 후 비교
+    (b) Baseline (Trad) 학습하여 가설 H1 검증 기반 확보
+    (c) --reference-results로 Baseline 결과 합쳐서 가설 검정 실행
+
+
+4. run_benchmark.py 개선
+================================================================================
+
+  4.1 --no-fid CLI 인자 추가
+
+    배경:
+      FID 평가를 scripts/run_fid.py로 분리한 후(작업일지 #9), 벤치마크만
+      실행하고 FID를 건너뛰는 명시적 방법이 필요.
+
+    수정 위치: scripts/run_benchmark.py
+
+    (a) L965-966: argparse에 --no-fid 추가
+
+        수정 후:
+          parser.add_argument('--no-fid', action='store_true',
+                              help='FID 평가를 건너뜁니다. (run_fid.py로 별도 실행 시 사용)')
+
+    (b) L1273-1279: FID 실행부에 분기 추가
+
+        수정 후:
+          if args.no_fid:
+              logging.info("Skipping FID evaluation (--no-fid flag)")
+          elif has_casda and config.get('evaluation', {}).get('fid', {}).get('compute', True):
+              logging.info("FID evaluation delegated to scripts/run_fid.py (deprecated wrapper)")
+              fid_results = _run_fid_deprecated_wrapper(config, experiment_dir, device)
+          elif not has_casda:
+              logging.info("Skipping FID evaluation (no CASDA groups selected)")
+
+    하위 호환성: --no-fid 미지정 시 기존과 동일하게 deprecated wrapper 호출.
+
+  4.2 Inject 전 사전 Clean (Pre-clean) 추가
+
+    배경:
+      이전 벤치마크 실행이 중단되어 CLEAN 단계가 실행되지 않은 경우,
+      baseline_raw YOLO 디렉토리에 이전 CASDA 파일이 잔류할 수 있다.
+      이 상태에서 새로운 inject를 수행하면 이전+현재 CASDA가 중복된다.
+
+    수정 위치: scripts/run_benchmark.py L1329-1334
+
+    수정 후:
+      # 사전 정리: 이전 실행 잔류 casda_* 파일 제거
+      pre_removed = clean_casda_from_baseline(
+          baseline_dir=baseline_yolo_dir, expected_count=0)
+      if pre_removed > 0:
+          logging.info(f"  Pre-clean: removed {pre_removed} stale CASDA files")
+
+    clean_casda_from_baseline()은 기존 함수로, 'casda_' prefix 파일만 제거.
+    expected_count=0으로 호출하면 모든 CASDA 파일을 stale로 취급.
+
+
+5. DeepLabV3+ FileNotFoundError 수정
+================================================================================
+
+  5.1 문제
+
+    CASDASyntheticDataset._load_metadata()가 metadata.json의 모든 엔트리를
+    무조건 로드하여, 이미지 파일이 실제 존재하지 않으면 학습 중
+    FileNotFoundError (또는 cv2.imread → NoneType)가 발생.
+
+    v5.6 실험에서 385장이 metadata에만 존재하고 파일은 누락된 상태.
+
+  5.2 수정 위치
+
+    src/training/dataset.py L368-385 (_load_metadata 반환 직전)
+
+  5.3 수정 내용
+
+    수정 전:
+      return all_samples
+
+    수정 후:
+      # 이미지 파일 존재 여부 검증 — 누락 파일은 학습 중 crash를 유발하므로 제거
+      before_count = len(all_samples)
+      verified = []
+      missing_count = 0
+      for s in all_samples:
+          img_path = s.get('image_path', '')
+          if not os.path.isabs(img_path):
+              img_path = str(self.data_dir / img_path)
+          if os.path.exists(img_path):
+              verified.append(s)
+          else:
+              missing_count += 1
+      if missing_count > 0:
+          logging.warning(
+              f"[CASDASyntheticDataset] {missing_count}/{before_count} images not found, "
+              f"skipped. ({before_count - missing_count} remaining)"
+          )
+      return verified
+
+  5.4 동작
+
+    - 절대경로와 상대경로 모두 처리 (상대경로는 data_dir 기준)
+    - 누락 파일 수를 경고 로그로 출력
+    - 학습은 존재하는 파일만으로 정상 진행 (graceful degradation)
+
+
+6. split_info 메타데이터 버그 수정
+================================================================================
+
+  6.1 문제
+
+    create_data_loaders()가 반환하는 split_info['split_config']가
+    split CSV 사용 시에도 항상 YAML config의 비율(70/15/15)을 보고.
+    CSV가 다른 비율(예: 80/10/10)로 생성되었을 때 메타데이터가 부정확.
+
+  6.2 수정 위치
+
+    src/training/dataset.py L886-913
+
+  6.3 수정 내용
+
+    수정 전:
+      _split_config = {
+          'train_ratio': ds_config['split']['train_ratio'],
+          'val_ratio': ds_config['split']['val_ratio'],
+          'test_ratio': ds_config['split']['test_ratio'],
+          'seed': ds_config['split']['seed'],
+      }
+
+    수정 후:
+      # split_info: split CSV 사용 시 실제 비율을 계산하여 반영
+      _total = len(train_ids) + len(val_ids) + len(test_ids)
+      if split_csv is not None and os.path.exists(split_csv) and _total > 0:
+          # CSV 기반 split — 실제 개수에서 비율 역산
+          _split_config = {
+              'train_ratio': round(len(train_ids) / _total, 4),
+              'val_ratio': round(len(val_ids) / _total, 4),
+              'test_ratio': round(len(test_ids) / _total, 4),
+              'seed': ds_config['split'].get('seed', 42),
+              'source': split_csv,
+          }
+      else:
+          # 동적 split — config 비율 그대로 사용
+          _split_config = {
+              'train_ratio': ds_config['split']['train_ratio'],
+              'val_ratio': ds_config['split']['val_ratio'],
+              'test_ratio': ds_config['split']['test_ratio'],
+              'seed': ds_config['split']['seed'],
+          }
+
+  6.4 효과
+
+    - split CSV 사용 시 실제 데이터 개수에서 비율 역산
+    - 'source' 필드로 사용된 split CSV 경로 기록
+    - 동적 split (CSV 미사용) 시에는 기존과 동일하게 config 비율 사용
+    - split 비율 실험에서 각 실험의 메타데이터가 정확하게 반영됨
+
+
+7. dataset_yolo.py Inject 최적화
+================================================================================
+
+  7.1 배경
+
+    CASDA 이미지를 YOLO baseline에 주입하는 _add_casda_to_training()이
+    Google Drive FUSE 환경에서 느린 문제:
+    - 매번 os.symlink() 시도 후 OSError → shutil.copy2 fallback
+    - 라벨 .txt 파일을 대상 디렉토리(Drive)에 직접 1건씩 write
+    - per-file 메타데이터 오버헤드가 누적
+
+  7.2 리팩토링 내용 (모듈 레벨 함수 분리)
+
+    (a) _test_symlink_support() (L348-365, 신규)
+
+        target_dir에서 symlink 지원 여부를 1회 사전 테스트.
+        임시 파일 생성 → symlink 시도 → 결과 반환 → cleanup.
+
+        기존:
+          각 파일마다 symlink 시도 → OSError catch → copy fallback
+          (6,000장 기준 6,000회 예외 발생)
+
+        수정 후:
+          1회 테스트 → 결과 캐시 → 모든 파일에 일괄 적용
+          (symlink 미지원 시 처음부터 copy 사용, 예외 0회)
+
+    (b) _generate_label_content() (L368-427, 신규)
+
+        샘플 메타데이터로부터 YOLO 라벨 텍스트를 생성 (파일 I/O 없음).
+        기존 _add_casda_to_training() 내부의 라벨 생성 로직을 분리.
+
+        지원 형식:
+        | bbox_format | 동작                                    |
+        |-------------|-----------------------------------------|
+        | "yolo"      | 바로 기록 (cv2 불필요, v5.1+ metadata)  |
+        | "xyxy"      | cv2.imread로 이미지 크기 읽어 정규화    |
+        | (없음)      | mask_path에서 contour → bbox 유도       |
+        | (fallback)  | 전체 이미지 bbox: 0.5 0.5 1.0 1.0      |
+
+    (c) _add_casda_to_training() 리팩토링 (L430-604)
+
+        최적화:
+        1) symlink 1회 사전 테스트 (_test_symlink_support)
+        2) 로컬 tmpdir에 라벨 .txt 일괄 생성 후 대상 디렉토리에 복사
+           (Google Drive FUSE의 per-file 메타데이터 오버헤드 감소)
+        3) 500건마다 progress 로그 출력
+
+  7.3 모듈 레벨 함수로 분리한 이유
+
+    - ProcessPoolExecutor 병렬화 패턴 (프로젝트 전체 일관 적용) 요건
+    - pickle 직렬화: 모듈 레벨 함수만 직렬화 가능 (클래스 메서드/lambda 불가)
+    - 현재는 순차 실행이지만, 추후 병렬화 시 호환성 보장
+
+
+8. scripts/run_split_experiment.py 신규 생성
+================================================================================
+
+  8.1 목적
+
+    여러 train/val/test split 비율로 DeepLabV3+ 모델을 순차 학습하여,
+    최적 split 비율 선택의 근거를 마련하는 오케스트레이터 스크립트.
+
+    각 비율에 대해:
+      Step 1: create_dataset_split.py로 split CSV 생성
+      Step 2: run_benchmark.py로 DeepLabV3+ 학습 + 평가
+      Step 3: benchmark_results.json에서 Dice 등 메트릭 수집
+
+    전체 완료 후: 비교 리포트 (split_comparison.json + 콘솔 테이블) 생성.
+
+  8.2 구조 (666줄)
+
+    | 함수/섹션                     | 줄      | 역할                               |
+    |-------------------------------|---------|-------------------------------------|
+    | parse_ratio_string()          | L53-97  | '70/15/15' → (0.70, 0.15, 0.15)    |
+    | ratio_to_label()              | L100-105| 비율 → 라벨 ('split_70_15_15')     |
+    | create_split_csv()            | L112-177| subprocess 호출, idempotent         |
+    | run_benchmark()               | L184-262| subprocess 호출, 12h 타임아웃       |
+    | collect_results()             | L269-336| benchmark_results.json 파싱         |
+    | generate_comparison_report()  | L343-425| JSON + 콘솔 테이블 생성            |
+    | parse_args()                  | L432-493| CLI argparse                        |
+    | main()                        | L500-666| 실험 루프 + 리포트                  |
+
+  8.3 CLI 인자
+
+    | 인자               | 설명                                    | 기본값                            |
+    |--------------------|-----------------------------------------|-----------------------------------|
+    | --csv              | Severstal train.csv 경로 (필수)         | —                                 |
+    | --config           | benchmark_experiment.yaml 경로 (필수)   | —                                 |
+    | --output-dir       | 실험 결과 루트 디렉토리 (필수)          | —                                 |
+    | --ratios           | 쉼표 구분 split 비율 목록               | "50/25/25,60/20/20,70/15/15,80/10/10" |
+    | --epochs           | 학습 에폭 수                            | 100                               |
+    | --seed             | 랜덤 시드                               | 42                                |
+    | --splits-dir       | split CSV 저장 디렉토리                 | {output-dir}/splits/              |
+    | --skip-existing    | 이미 완료된 실험 건너뜀                 | True                              |
+    | --no-skip-existing | 기존 결과 있어도 재실행                 | False                             |
+    | --benchmark-args   | run_benchmark.py 추가 인자              | None                              |
+
+  8.4 설계 결정
+
+    | 항목                  | 결정                                                  |
+    |-----------------------|-------------------------------------------------------|
+    | 실행 방식             | subprocess (격리성 보장, OOM 시 단일 비율만 실패)     |
+    | 대상 모델             | DeepLabV3+ only (segmentation으로 충분)               |
+    | 대상 그룹             | baseline_raw only (split 효과만 측정)                 |
+    | Idempotent            | benchmark_results.json 존재 시 건너뜀                 |
+    | FID                   | --no-fid 고정 (split 실험에 불필요)                   |
+    | 타임아웃              | 12시간 (DeepLabV3+ 300ep 기준 넉넉히)                 |
+    | 비율 형식             | 백분율('70/15/15') 및 소수('0.7/0.15/0.15') 모두 지원 |
+
+  8.5 실행 예시 (Colab)
+
+    python scripts/run_split_experiment.py \
+        --csv /content/drive/MyDrive/data/Severstal/train.csv \
+        --config configs/benchmark_experiment.yaml \
+        --output-dir /content/drive/MyDrive/data/Severstal/casda/outputs/split_experiment \
+        --ratios "50/25/25,60/20/20,70/15/15,80/10/10" \
+        --epochs 100 --seed 42
+
+  8.6 출력 디렉토리 구조
+
+    split_experiment/
+    ├── experiment_meta.json          # 실험 설정 + 완료 시간
+    ├── split_comparison.json         # 전체 비교 결과
+    ├── splits/
+    │   ├── split_50_25_25_seed42.csv
+    │   ├── split_60_20_20_seed42.csv
+    │   ├── split_70_15_15_seed42.csv
+    │   └── split_80_10_10_seed42.csv
+    ├── split_50_25_25/
+    │   ├── benchmark_results.json
+    │   ├── dataset_split.json
+    │   └── ...
+    ├── split_60_20_20/
+    ├── split_70_15_15/
+    └── split_80_10_10/
+
+  8.7 비교 테이블 출력 예시
+
+    ====================================================================================================
+      Split 비율 실험 결과 비교 (DeepLabV3+ / baseline_raw)
+    ====================================================================================================
+
+    Split        | Train |   Val |  Test |   Dice |     C1 |     C2 |     C3 |     C4 |    IoU | Epoch |       Time
+    -----------------------------------------------------------------------------------------
+    split_50_25  |  3333 |  1666 |  1667 | 0.6100 | 0.4700 | 0.5000 | 0.7100 | 0.7600 | 0.5200 |    95 |   01:23:45
+    split_60_20  |  4000 |  1333 |  1333 | 0.6200 | 0.4800 | 0.5100 | 0.7200 | 0.7700 | 0.5300 |   102 |   01:45:12
+    ...
+
+      ★ 최고 Dice: split_70_15_15 → 0.6290
+
+
+9. Baseline (Trad) 실행 과정 분석
+================================================================================
+
+  9.1 배경
+
+    가설 H1 ("CASDA > Traditional augmentation") 검증을 위해
+    Baseline (Trad) 그룹을 실행해야 한다. 코드 분석 결과,
+    기존 코드만으로 실행 가능하여 코드 변경 불필요.
+
+  9.2 config 설정 (benchmark_experiment.yaml)
+
+    baseline_trad 그룹:
+      augmentation: "traditional"
+      traditional_augmentation:
+        fliplr: 0.5       # 좌우 반전
+        flipud: 0.3       # 상하 반전
+        degrees: 15.0     # 회전 범위 (±15도)
+        scale: 0.2        # 스케일 변화 (80~120%)
+        hsv_v: 0.2        # 밝기 변화 (±20%)
+
+  9.3 모델별 augmentation 적용 경로
+
+    Detection 모델 (EB-YOLOv8, YOLO-MFD):
+      UltralyticsTrainer._build_ultralytics_args()
+      → ultralytics_trainer.py L391-413
+      → fliplr/flipud/degrees/scale/hsv_v를 Ultralytics 학습 파라미터로 매핑
+      → Ultralytics 내부에서 on-the-fly augmentation 적용
+
+    Segmentation 모델 (DeepLabV3+):
+      build_transforms() → dataset.py L635-696
+      → Albumentations 파이프라인 구성:
+        HorizontalFlip(p=0.5)
+        VerticalFlip(p=0.3)
+        Rotate(limit=15, p=0.5)
+        RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5)
+        RandomScale(scale_limit=0.2, p=0.5)
+
+  9.4 공정 비교 보장
+
+    Baseline (Trad)는 Baseline (Raw)와 동일한 split CSV를 사용해야 한다.
+    --split-csv 인자로 동일한 파일을 지정하면 보장됨:
+      --split-csv /content/drive/MyDrive/data/Severstal/casda/splits/split_70_15_15_seed42.csv
+
+  9.5 실행 명령 (Colab)
+
+    python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --groups baseline_trad \
+        --split-csv /content/drive/MyDrive/data/Severstal/casda/splits/split_70_15_15_seed42.csv \
+        --output-dir /content/drive/MyDrive/data/Severstal/casda/outputs/standard_trad \
+        --no-fid --epochs 300
+
+  9.6 예상 결과 활용
+
+    결과 파일: standard_trad/benchmark_results.json
+    → --reference-results로 CASDA 실험에 합쳐서 가설 H1 검증:
+
+    python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --groups casda_composed_pruning --epochs 300 --no-fid \
+        --reference-results \
+            .../standard/yolo/benchmark_results.json \
+            .../standard/deeplabv3plus/benchmark_results.json \
+            .../standard_trad/benchmark_results.json
+
+
+10. 검증 결과
+================================================================================
+
+  10.1 py_compile
+
+    | 파일                                | 결과 |
+    |-------------------------------------|------|
+    | scripts/run_benchmark.py            | PASS |
+    | scripts/run_split_experiment.py     | PASS |
+    | src/training/dataset.py             | PASS |
+    | src/training/dataset_yolo.py        | PASS |
+
+  10.2 줄 수
+
+    | 파일                                | 줄 수 |
+    |-------------------------------------|-------|
+    | scripts/run_benchmark.py            | 1,554 |
+    | scripts/run_split_experiment.py     | 666   |
+    | src/training/dataset.py             | 915   |
+    | src/training/dataset_yolo.py        | 604   |
+
+
+11. 수정/생성 파일 요약
+================================================================================
+
+  수정된 파일:
+
+    | 파일                        | 주요 변경                                         |
+    |-----------------------------|----------------------------------------------------|
+    | scripts/run_benchmark.py    | --no-fid 추가, inject 전 pre-clean 추가            |
+    | src/training/dataset.py     | FileNotFoundError 수정, split_info 비율 역산 수정  |
+    | src/training/dataset_yolo.py| _test_symlink_support, _generate_label_content,    |
+    |                             | _add_casda_to_training 리팩토링                    |
+
+  생성된 파일:
+
+    | 파일                             | 줄 수 | 역할                            |
+    |----------------------------------|-------|---------------------------------|
+    | scripts/run_split_experiment.py   | 666   | Split 비율 실험 오케스트레이터  |
+
+
+12. 남은 작업
+================================================================================
+
+  | 순번 | 작업                                                       | 우선순위 | 상태   |
+  |------|------------------------------------------------------------|----------|--------|
+  | 1    | Colab에서 Baseline (Trad) 학습 실행 (300ep, 3모델)         | 높음     | 미완료 |
+  | 2    | Colab에서 split 비율 실험 실행 (4비율, DeepLabV3+, 100ep)  | 높음     | 미완료 |
+  | 3    | CASDA 재벤치마크 (300ep + --reference-results)             | 높음     | 미완료 |
+  | 4    | 385장 이미지 파일 누락 원인 조사                            | 중간     | 미완료 |
+  | 5    | --pruning-top-k CLI 인자 추가                              | 중간     | 미완료 |
+  | 6    | --report-only 모드 (가설검증만 단독 실행)                  | 낮음     | 미완료 |
+  | 7    | ratio 실험 (10%, 20%, 30%, 50% CASDA 주입 비율)           | 중간     | 미완료 |
+
+  실행 순서 권장:
+    1 → 3 → 2 → 7 순서로 진행.
+    Baseline (Trad) 결과가 나와야 CASDA와 가설 검정 가능.
+    Split 실험은 독립적이므로 병렬 실행 가능 (별도 Colab 세션).
+
+
+13. --reference-results 동작 원리 참조
+================================================================================
+
+  작업일지 #9 (20260307.docs 섹션 9)에서 상세 문서화됨.
+  핵심 동작만 요약:
+
+    1. 현재 실행 결과가 reporter.results에 먼저 저장
+    2. reference JSON 파일 로드 → (model, dataset) 키로 중복 검사
+    3. 현재 결과 우선 (동일 (model, dataset) 쌍이면 reference 결과 무시)
+    4. 합쳐진 결과로 가설 검정 실행
+    5. benchmark_results.json 형식: JSON 배열
+       [{"model": str, "dataset": str, "metrics": {...}}]
+    6. dataset 필드는 config의 dataset_groups.*.name과 정확히 일치해야 매칭
+
+
+14. 핵심 설계 결정 요약
+================================================================================
+
+  (1) --no-fid: 명시적 FID skip — run_fid.py 분리 후 자연스러운 UI 완성
+  (2) Pre-clean: inject 전 잔류 파일 제거 — 중단 후 재실행 안전성 보장
+  (3) Symlink 사전 테스트: 1회 테스트로 6,000회 예외 발생 방지
+  (4) 라벨 일괄 생성: 로컬 tmpdir → 대상 디렉토리 복사 (Drive FUSE 최적화)
+  (5) split_info 역산: CSV 사용 시 실제 비율 반영 (정확한 메타데이터)
+  (6) FileNotFoundError graceful degradation: 학습 중단 대신 경고+skip
+  (7) Split 실험: subprocess 격리 (OOM 시 단일 비율만 실패, 나머지 계속)
+  (8) Baseline (Trad): 코드 변경 불필요 — config + CLI 옵션으로 충분

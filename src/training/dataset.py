@@ -883,16 +883,30 @@ def create_data_loaders(
         num_workers=num_workers, collate_fn=collate_fn, pin_memory=True,
     )
 
-    split_info = {
-        'train_ids': train_ids,
-        'val_ids': val_ids,
-        'test_ids': test_ids,
-        'split_config': {
+    # split_info: split CSV 사용 시 실제 비율을 계산하여 반영
+    _total = len(train_ids) + len(val_ids) + len(test_ids)
+    if split_csv is not None and os.path.exists(split_csv) and _total > 0:
+        # CSV 기반 split — 실제 개수에서 비율 역산
+        _split_config = {
+            'train_ratio': round(len(train_ids) / _total, 4),
+            'val_ratio': round(len(val_ids) / _total, 4),
+            'test_ratio': round(len(test_ids) / _total, 4),
+            'seed': ds_config['split'].get('seed', 42),
+            'source': split_csv,
+        }
+    else:
+        # 동적 split — config 비율 그대로 사용
+        _split_config = {
             'train_ratio': ds_config['split']['train_ratio'],
             'val_ratio': ds_config['split']['val_ratio'],
             'test_ratio': ds_config['split']['test_ratio'],
             'seed': ds_config['split']['seed'],
-        },
+        }
+    split_info = {
+        'train_ids': train_ids,
+        'val_ids': val_ids,
+        'test_ids': test_ids,
+        'split_config': _split_config,
         'num_train': len(train_ids),
         'num_val': len(val_ids),
         'num_test': len(test_ids),

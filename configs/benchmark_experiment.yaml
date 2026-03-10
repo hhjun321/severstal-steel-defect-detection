@@ -102,11 +102,15 @@ dataset_groups:
 
   ablation_no_pruning:
     name: "CASDA-NoPruning"
-    description: "Ablation: Pruning 제거 — suitability 필터 없이 전체 CASDA 이미지 사용"
+    description: "Ablation: Pruning 제거 — suitability 필터 없이 CASDA 이미지 사용 (수량만 제한)"
     use_original: true
     augmentation: "none"
     casda_data: "composed"
-    # casda_pruning 없음 = 전체 casda_composed 사용 (casda_composed와 동일)
+    casda_pruning:
+      enabled: true
+      suitability_threshold: 0.0   # 품질 필터링 없음 (전부 통과)
+      top_k: 5000                  # 수량 제한만 적용 (inject 시간 제한)
+      stratified: false            # stratified pruning 비활성화 (무작위 순서 유지)
 
   # ── CopyPaste Baseline ──
   copypaste:

@@ -159,14 +159,73 @@ python scripts/run_benchmark.py \
 
 ---
 
+## v5.6 벤치마크 결과 확인 (2026-03-10 업로드)
+
+`outputs/v5.6/benchmark_results.json` 업로드 확인. 전체 결과:
+
+### Detection (mAP@0.5)
+
+| Model | Baseline (Raw) | Baseline (Trad) | CASDA | Δ (CASDA vs Raw) |
+|-------|---------------|-----------------|-------|-----------------|
+| YOLO-MFD | 0.5546 | 0.4880 | **0.5835** | **+2.89%p** |
+| EB-YOLOv8 | 0.5819 | 0.5056 | **0.5850** | **+0.31%p** |
+
+### Segmentation (Dice Mean)
+
+| Model | Baseline (Raw) | Baseline (Trad) | CASDA | Δ (CASDA vs Raw) |
+|-------|---------------|-----------------|-------|-----------------|
+| DeepLabV3+ | 0.6290 | **0.6483** | 0.6232 | -0.58%p |
+
+### Class AP (YOLO-MFD 기준)
+
+| Class | Raw | Trad | CASDA | Δ |
+|-------|-----|------|-------|---|
+| Class2 AP | 0.4525 | 0.2444 | **0.5317** | **+7.92%p** |
+
+### DeepLabV3+ Class Dice 상세
+
+| Class | Raw | Trad | CASDA | Δ (CASDA vs Raw) |
+|-------|-----|------|-------|-----------------|
+| Class1 | 0.4926 | 0.5458 | 0.5150 | +2.24%p |
+| Class2 | 0.5170 | 0.5246 | 0.4961 | -2.09%p |
+| Class3 | 0.7296 | 0.7398 | 0.7213 | -0.83%p |
+| Class4 | 0.7767 | 0.7831 | 0.7603 | -1.64%p |
+
+**주목**: Baseline(Trad)가 Raw보다 mAP 낮음 (YOLO-MFD: -6.66%p, EB: -7.63%p)
+→ 전통 증강이 오히려 검출 성능 저하 → CASDA의 상대적 우월성을 더 부각하는 근거
+
+---
+
+## train/val/test 비율 선정 근거 (2026-03-10 확인)
+
+`outputs/v5.6/ratio_benchmark_results.json` 기준.
+DeepLabV3+ Baseline (Raw) 기준 비율별 성능:
+
+| Ratio (train/val/test) | Dice Mean | Test 샘플 수 |
+|------------------------|-----------|-------------|
+| 50_25_25 | 0.6142 | 1,667 |
+| 60_20_20 | 0.6256 | 1,334 |
+| **70_15_15** | **0.6290** | **1,000** |
+| 80_10_10 | 0.6290 | 667 |
+
+**선택 근거 (70_15_15)**:
+- 70%→80% 구간에서 성능 증가 없음 (수렴) → train 비율 추가 확대 불필요
+- 80_10_10 대비 test set 50% 더 확보 (1,000 vs 667) → 평가 신뢰성 우위
+- 논문 서술: "Performance saturated at 70/15/15; increasing training ratio further showed no improvement while reducing test set reliability."
+
+---
+
 ## 논문 Table 업데이트 목표 (ablation 포함)
 
-| Method | YOLO-MFD mAP | Class2 AP | 비고 |
-|--------|-------------|-----------|------|
-| Baseline (Raw) | 0.5546 | 0.4525 | ✅ 완료 |
-| Baseline (Trad) | 🔄 | 🔄 | 학습 중 |
-| CopyPaste | ❌ | ❌ | 이번 작업으로 데이터 생성 준비 완료 |
-| CASDA w/o Pruning | ❌ | ❌ | 이번 작업으로 그룹 등록 완료 |
-| CASDA w/o Blending | ❌ | ❌ | 이번 작업으로 데이터 생성 준비 완료 |
-| CASDA w/o Multi-hint | ❌ | ❌ | 향후 구현 |
-| **CASDA-Full (Ours)** | **0.5835** | **0.5317** | ✅ 완료 |
+| Method | YOLO-MFD mAP | EB-YOLOv8 mAP | DLv3+ Dice | Class2 AP | 비고 |
+|--------|-------------|--------------|-----------|-----------|------|
+| Baseline (Raw) | 0.5546 | 0.5819 | 0.6290 | 0.4525 | ✅ 완료 |
+| Baseline (Trad) | 0.4880 | 0.5056 | 0.6483 | 0.2444 | ✅ 완료 |
+| CopyPaste | ❌ | ❌ | ❌ | ❌ | 데이터 생성 준비 완료 |
+| CASDA w/o Pruning | ❌ | — | — | ❌ | 그룹 등록 완료 (YOLO-MFD만) |
+| CASDA w/o Blending | ❌ | — | — | ❌ | 데이터 생성 준비 완료 (YOLO-MFD만) |
+| CASDA w/o Multi-hint | ❌ | — | — | ❌ | 향후 구현 |
+| **CASDA (Ours)** | **0.5835** | **0.5850** | 0.6232 | **0.5317** | ✅ 완료 |
+
+> CopyPaste: 3종 모델 전체 실행 권장 (Main Table 항목)
+> Ablation (w/o Pruning, w/o Blending, w/o Multi-hint): YOLO-MFD만 (ablation 관례)

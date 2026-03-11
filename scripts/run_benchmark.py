@@ -54,6 +54,7 @@ import sys
 import argparse
 import logging
 import random
+import subprocess
 import shutil
 import time
 import json
@@ -645,11 +646,15 @@ def _resolve_needed_casda_subdirs(
     return needed
 
 
-def _copy_with_progress(src: str, dst: str, label: str) -> bool:
-    """디렉토리 또는 파일을 복사하며 진행률을 표시.
+def _zip_transfer(src: str, dst: str, label: str) -> bool:
+    """디렉토리 또는 파일을 zip → cp → unzip 방식으로 로컬화.
 
-    이미 복사 완료된 경우 (.localized 마커 존재) 건너뜀.
-    Returns True if copy was performed, False if skipped.
+    Drive FUSE의 파일별 I/O 오버헤드를 회피하기 위해:
+      디렉토리: zip(Drive측) → cp(단일파일) → unzip(로컬측)
+      파일:     shutil.copy2 (단일 파일은 zip 불필요)
+
+    이미 로컬화 완료된 경우 (.localized 마커 존재) 건너뜀.
+    Returns True if transfer was performed, False if skipped.
     """
     src_path = Path(src)
     dst_path = Path(dst)
@@ -658,7 +663,7 @@ def _copy_with_progress(src: str, dst: str, label: str) -> bool:
         logging.warning(f"[LocalDir] {label}: 소스 없음 → 건너뜀: {src}")
         return False
 
-    # 마커 파일: 복사 완료 여부 확인 (resume 시 재복사 방지)
+    # 마커 파일: 로컬화 완료 여부 확인 (resume 시 재전송 방지)
     if dst_path.is_dir():
         marker = dst_path / ".localized"
     else:
@@ -671,65 +676,108 @@ def _copy_with_progress(src: str, dst: str, label: str) -> bool:
     t0 = time.time()
 
     if src_path.is_file():
+        # 단일 파일: 직접 복사 (zip 불필요)
         dst_path.parent.mkdir(parents=True, exist_ok=True)
-        logging.info(f"[LocalDir] {label}: 파일 복사 중: {src} → {dst}")
+        logging.info(f"[LocalDir] {label}: 파일 복사: {src} → {dst}")
         shutil.copy2(str(src_path), str(dst_path))
-        # 파일 마커 생성
         marker.touch()
+
     elif src_path.is_dir():
-        dst_path.parent.mkdir(parents=True, exist_ok=True)
-        # 파일 수 사전 계산 (진행률 표시용)
-        total_files = sum(1 for _ in src_path.rglob('*') if _.is_file())
-        logging.info(f"[LocalDir] {label}: 디렉토리 복사 시작 ({total_files:,}개 파일): {src}")
-
-        copied = 0
-        last_pct = -1
-
-        # copytree가 이미 존재하면 에러 → 기존 불완전 복사 제거
+        # 기존 불완전 전송 잔여 제거
         if dst_path.exists():
-            logging.info(f"[LocalDir]   불완전 복사 잔여 제거: {dst}")
+            logging.info(f"[LocalDir]   불완전 전송 잔여 제거: {dst}")
             shutil.rmtree(str(dst_path))
 
-        def _copy_fn(src_f, dst_f):
-            nonlocal copied, last_pct
-            shutil.copy2(src_f, dst_f)
-            copied += 1
-            if total_files > 0:
-                pct = int(copied * 100 / total_files)
-                if pct >= last_pct + 5:  # 5% 단위 출력
-                    last_pct = pct
-                    elapsed = time.time() - t0
-                    logging.info(
-                        f"[LocalDir]   {label}: {pct}% ({copied:,}/{total_files:,}) "
-                        f"[{elapsed:.0f}s]"
-                    )
-            return dst_f
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
 
-        shutil.copytree(str(src_path), str(dst_path), copy_function=_copy_fn)
+        # zip 임시 파일 경로 (dst 부모에 생성 → 로컬 디스크)
+        zip_path = str(dst_path.parent / f"_transfer_{dst_path.name}.zip")
+
+        # Phase 1: zip (Drive 측에서 순차 읽기)
+        # -r 재귀, -q quiet, -0 저장만(압축 안함, 속도 우선)
+        # 작업 디렉토리를 src 부모로 설정하여 zip 내부 경로를 상대경로로 유지
+        src_parent = str(src_path.parent)
+        src_name = src_path.name
+        logging.info(f"[LocalDir] {label}: zip 생성 중: {src}")
+        zip_result = subprocess.run(
+            ["zip", "-r", "-q", "-0", zip_path, src_name],
+            cwd=src_parent,
+            capture_output=True, text=True,
+        )
+        if zip_result.returncode != 0:
+            logging.error(f"[LocalDir] {label}: zip 실패 (rc={zip_result.returncode}): "
+                          f"{zip_result.stderr.strip()}")
+            # fallback: shutil.copytree
+            logging.info(f"[LocalDir] {label}: fallback → shutil.copytree")
+            shutil.copytree(str(src_path), str(dst_path))
+            marker = dst_path / ".localized"
+            marker.touch()
+            elapsed = time.time() - t0
+            logging.info(f"[LocalDir] {label}: fallback 복사 완료 ({elapsed:.1f}s)")
+            return True
+
+        zip_size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+        elapsed_zip = time.time() - t0
+        logging.info(f"[LocalDir] {label}: zip 완료 ({zip_size_mb:.1f}MB, {elapsed_zip:.1f}s)")
+
+        # Phase 2: unzip (로컬 디스크 내 작업 → 매우 빠름)
+        # -q quiet, -o overwrite, -d 출력 디렉토리
+        t1 = time.time()
+        logging.info(f"[LocalDir] {label}: unzip 중 → {dst_path.parent}")
+        unzip_result = subprocess.run(
+            ["unzip", "-q", "-o", zip_path, "-d", str(dst_path.parent)],
+            capture_output=True, text=True,
+        )
+        if unzip_result.returncode != 0:
+            logging.error(f"[LocalDir] {label}: unzip 실패 (rc={unzip_result.returncode}): "
+                          f"{unzip_result.stderr.strip()}")
+            # zip 잔여 정리
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+            return False
+
+        elapsed_unzip = time.time() - t1
+        logging.info(f"[LocalDir] {label}: unzip 완료 ({elapsed_unzip:.1f}s)")
+
+        # Phase 3: zip 임시 파일 삭제
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+
+        # unzip 결과: {dst_path.parent}/{src_name}/ → dst_path로 이름 맞추기
+        unzipped = dst_path.parent / src_name
+        if unzipped != dst_path and unzipped.exists():
+            if dst_path.exists():
+                shutil.rmtree(str(dst_path))
+            unzipped.rename(dst_path)
+
         # 완료 마커 생성
         marker = dst_path / ".localized"
         marker.touch()
 
     elapsed = time.time() - t0
-    logging.info(f"[LocalDir] {label}: 복사 완료 ({elapsed:.1f}s)")
+    logging.info(f"[LocalDir] {label}: 전송 완료 ({elapsed:.1f}s)")
     return True
 
 
 def _localize_data(args, config) -> argparse.Namespace:
-    """--local-dir 지정 시 학습 데이터를 로컬 디스크로 복사하고 args 경로를 갱신.
+    """--local-dir 지정 시 학습 데이터를 zip/unzip으로 로컬 디스크에 전송하고 args 경로를 갱신.
 
-    복사 대상:
+    전송 방식:
+      디렉토리: zip(Drive측, -0 무압축) → unzip(로컬측) — Drive FUSE 파일별 오버헤드 회피
+      파일:     shutil.copy2 (단일 파일은 zip 불필요)
+
+    전송 대상:
       --data-dir   → {local_dir}/images/
       --csv        → {local_dir}/train.csv
       --split-csv  → {local_dir}/split.csv
       --casda-dir  → {local_dir}/casda/{subdir}/ (필요한 그룹 하위만)
       --yolo-dir   → {local_dir}/yolo/
 
-    복사 제외:
+    전송 제외:
       --output-dir (결과/체크포인트는 Drive에 유지)
 
     Resume 지원:
-      각 복사 대상에 .localized 마커를 남겨 재복사 방지.
+      각 전송 대상에 .localized 마커를 남겨 재전송 방지.
     """
     local_base = Path(args.local_dir)
     local_base.mkdir(parents=True, exist_ok=True)
@@ -742,7 +790,7 @@ def _localize_data(args, config) -> argparse.Namespace:
     # ── 1. 이미지 디렉토리 (--data-dir) ──
     if args.data_dir:
         local_images = str(local_base / "images")
-        if _copy_with_progress(args.data_dir, local_images, "images"):
+        if _zip_transfer(args.data_dir, local_images, "images"):
             pass
         args.data_dir = local_images
         logging.info(f"[LocalDir] args.data_dir → {args.data_dir}")
@@ -751,7 +799,7 @@ def _localize_data(args, config) -> argparse.Namespace:
     if args.csv:
         csv_name = os.path.basename(args.csv)
         local_csv = str(local_base / csv_name)
-        _copy_with_progress(args.csv, local_csv, "csv")
+        _zip_transfer(args.csv, local_csv, "csv")
         args.csv = local_csv
         logging.info(f"[LocalDir] args.csv → {args.csv}")
 
@@ -759,7 +807,7 @@ def _localize_data(args, config) -> argparse.Namespace:
     if getattr(args, 'split_csv', None):
         split_name = os.path.basename(args.split_csv)
         local_split = str(local_base / split_name)
-        _copy_with_progress(args.split_csv, local_split, "split_csv")
+        _zip_transfer(args.split_csv, local_split, "split_csv")
         args.split_csv = local_split
         logging.info(f"[LocalDir] args.split_csv → {args.split_csv}")
 
@@ -779,7 +827,7 @@ def _localize_data(args, config) -> argparse.Namespace:
             for subdir in sorted(needed_subdirs):
                 src_sub = os.path.join(args.casda_dir, subdir)
                 dst_sub = os.path.join(local_casda, subdir)
-                _copy_with_progress(src_sub, dst_sub, f"casda/{subdir}")
+                _zip_transfer(src_sub, dst_sub, f"casda/{subdir}")
         else:
             logging.info("[LocalDir] CASDA: 선택된 그룹 중 CASDA가 필요한 그룹 없음 → 건너뜀")
 
@@ -788,7 +836,7 @@ def _localize_data(args, config) -> argparse.Namespace:
         for f in casda_src_path.iterdir():
             if f.is_file() and f.suffix in ('.csv', '.json', '.yaml', '.yml'):
                 dst_f = os.path.join(local_casda, f.name)
-                _copy_with_progress(str(f), dst_f, f"casda/{f.name}")
+                _zip_transfer(str(f), dst_f, f"casda/{f.name}")
 
         args.casda_dir = local_casda
         logging.info(f"[LocalDir] args.casda_dir → {args.casda_dir}")
@@ -796,7 +844,7 @@ def _localize_data(args, config) -> argparse.Namespace:
     # ── 5. YOLO 디렉토리 (--yolo-dir) ──
     if args.yolo_dir:
         local_yolo = str(local_base / "yolo")
-        _copy_with_progress(args.yolo_dir, local_yolo, "yolo")
+        _zip_transfer(args.yolo_dir, local_yolo, "yolo")
         args.yolo_dir = local_yolo
         logging.info(f"[LocalDir] args.yolo_dir → {args.yolo_dir}")
 

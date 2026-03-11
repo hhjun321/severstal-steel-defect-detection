@@ -23,25 +23,35 @@ Drive I/O가 학습 속도의 병목이 됨.
 
 #### 1-1. `_localize_data(args, config)` 함수 (신규)
 
-`--local-dir` 지정 시 학습 데이터를 로컬 디스크로 복사 후 `args.*` 경로를 갱신.
+`--local-dir` 지정 시 학습 데이터를 zip/unzip 방식으로 로컬 디스크에 전송 후 `args.*` 경로를 갱신.
 
-복사 대상 및 로컬 경로:
+**전송 방식** (zip/unzip — Drive FUSE 파일별 I/O 오버헤드 회피):
+```
+디렉토리: zip -r -0 (Drive측, 무압축) → unzip (로컬측)
+파일:     shutil.copy2 (단일 파일은 zip 불필요)
+```
+`shutil.copytree()`는 파일 하나씩 Drive FUSE를 통해 복사하므로 수천 개 소파일에서
+파일별 메타데이터 오버헤드가 심각. zip으로 단일 파일화하면 Drive 순차 읽기 1회로 완료.
+
+전송 대상 및 로컬 경로:
 | CLI 인자 | 로컬 경로 | 설명 |
 |----------|----------|------|
 | `--data-dir` | `{local}/images/` | Severstal 원본 이미지 (~12,568장) |
 | `--csv` | `{local}/{파일명}` | Annotation CSV |
 | `--split-csv` | `{local}/{파일명}` | 사전 생성 분할 CSV |
-| `--casda-dir` | `{local}/casda/` | CASDA 합성 데이터 (스마트 복사) |
+| `--casda-dir` | `{local}/casda/` | CASDA 합성 데이터 (스마트 전송) |
 | `--yolo-dir` | `{local}/yolo/` | YOLO 포맷 데이터셋 |
 
-복사 **제외**: `--output-dir` (결과/체크포인트는 Drive에 유지하여 영구 보존)
+전송 **제외**: `--output-dir` (결과/체크포인트는 Drive에 유지하여 영구 보존)
 
 핵심 기능:
-- **스마트 CASDA 복사**: 선택된 `--groups`가 필요로 하는 CASDA 하위 디렉토리만 복사.
-  예: `--groups copypaste` → `copypaste_baseline/`만 복사, `casda_full/` 등 불필요 디렉토리 건너뜀.
-- **Resume 안전**: `.localized` 마커 파일로 복사 완료 여부 추적, 재복사 방지
-- **불완전 복사 처리**: 마커 없이 디렉토리 존재 시 삭제 후 재복사
-- **진행률 표시**: 5% 단위 로그 출력 (파일 수, 경과 시간)
+- **zip/unzip 전송**: `zip -r -q -0`(무압축, 속도 우선) → `unzip -q -o -d`
+  - `cwd=src_parent` 로 실행하여 zip 내부 절대경로 중첩 방지
+  - zip 실패 시 `shutil.copytree` fallback
+- **스마트 CASDA 전송**: 선택된 `--groups`가 필요로 하는 CASDA 하위 디렉토리만 전송.
+  예: `--groups copypaste` → `copypaste_baseline/`만 전송, `casda_full/` 등 건너뜀.
+- **Resume 안전**: `.localized` 마커 파일로 전송 완료 여부 추적, 재전송 방지
+- **불완전 전송 처리**: 마커 없이 디렉토리 존재 시 삭제 후 재전송
 - **CASDA 상위 파일 복사**: suitability CSV, metadata JSON 등 자동 포함
 
 #### 1-2. `_resolve_needed_casda_subdirs(groups_cli, available_groups, config)` (신규)
@@ -50,11 +60,14 @@ Drive I/O가 학습 속도의 병목이 됨.
 - `casda_dir_override` 있는 그룹 → `os.path.basename(override)` 사용
 - 없는 그룹 → `_CASDA_GROUP_SUBDIRS` 매핑 사용
 
-#### 1-3. `_copy_with_progress(src, dst, label)` (신규)
+#### 1-3. `_zip_transfer(src, dst, label)` (신규)
 
-디렉토리/파일 복사 + 진행률 표시 유틸리티.
-- `shutil.copytree` 기반 (디렉토리), `shutil.copy2` 기반 (파일)
+디렉토리/파일 전송 유틸리티 (zip/unzip 방식).
+- 디렉토리: `subprocess.run(["zip", "-r", "-q", "-0", ...])` → `subprocess.run(["unzip", "-q", "-o", ...])`
+- 파일: `shutil.copy2` (단일 파일은 zip 불필요)
 - `.localized` 마커 존재 시 건너뜀
+- zip 실패 시 `shutil.copytree` fallback
+- unzip 후 디렉토리 이름 불일치 시 자동 rename
 
 #### 1-4. `--local-dir` argparse 인자 (line 1217)
 
@@ -163,10 +176,15 @@ python scripts/run_benchmark.py \
 
 ### _localize_data 설계 결정
 1. **호출 시점**: config override 전 (line 1279) — `args.*` 갱신이 이후 config에 반영됨
-2. **CASDA 스마트 복사**: 선택 그룹의 `casda_dir_override` 또는 `_CASDA_GROUP_SUBDIRS` 매핑으로
-   필요한 하위 디렉토리만 결정. 전체 복사 대비 시간/디스크 절약.
-3. **마커 기반 Resume**: `.localized` 파일 존재 여부로 판단.
-   `shutil.copytree`가 부분 복사 후 중단되면 마커 없음 → 다음 실행에서 삭제 후 재복사.
+2. **zip/unzip 전송**: `shutil.copytree()`는 파일별로 Drive FUSE 메타데이터 오버헤드 발생.
+   `zip -0`(무압축)으로 단일 파일화 → Drive 순차 읽기 1회 → 로컬 unzip.
+   - zip 생성: `cwd=src_parent`로 실행하여 절대경로 중첩 방지
+   - zip 임시 파일은 로컬(dst_path.parent)에 생성 → Drive 쓰기 불필요
+   - zip 실패 시 `shutil.copytree` fallback (zip 미설치 환경 대응)
+3. **CASDA 스마트 전송**: 선택 그룹의 `casda_dir_override` 또는 `_CASDA_GROUP_SUBDIRS` 매핑으로
+   필요한 하위 디렉토리만 결정. 전체 전송 대비 시간/디스크 절약.
+4. **마커 기반 Resume**: `.localized` 파일 존재 여부로 판단.
+   zip/unzip 부분 전송 후 중단되면 마커 없음 → 다음 실행에서 삭제 후 재전송.
 
 ### casda_dir_override 해석의 이중 경로
 - **Detection (run_benchmark.py:1371-1376)**: `args.casda_dir` + `basename(override)` 로 해석

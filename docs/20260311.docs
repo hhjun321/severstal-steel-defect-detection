@@ -1,0 +1,197 @@
+# 작업일지 — 2026-03-11
+
+## 목적
+v5.6 벤치마크 재실행 준비:
+(1) Google Drive I/O 병목 해소를 위한 `--local-dir` 기능 구현
+(2) Segmentation 모델(DeepLabV3+)의 `casda_dir_override` 버그 수정
+
+배경: 2026-03-10 벤치마크 실행이 `ablation_no_pruning` 그룹 CASDA inject 중
+30,300장 이미지 복사 39%에서 Colab 세션이 종료되었음.
+원인 분석 결과 (1) Google Drive FUSE I/O 병목 (2) 과도한 inject 수량으로 진단.
+
+---
+
+## 작업 내역
+
+### 1. `scripts/run_benchmark.py` — `--local-dir` 기능 구현
+
+**목적**: Google Colab 환경에서 Drive FUSE 마운트의 I/O 병목 해소.
+특히 DeepLabV3+(Segmentation)는 매 배치마다 `cv2.imread()`로 이미지를 읽어
+Drive I/O가 학습 속도의 병목이 됨.
+
+**구현 내용** (line 610-807):
+
+#### 1-1. `_localize_data(args, config)` 함수 (신규)
+
+`--local-dir` 지정 시 학습 데이터를 로컬 디스크로 복사 후 `args.*` 경로를 갱신.
+
+복사 대상 및 로컬 경로:
+| CLI 인자 | 로컬 경로 | 설명 |
+|----------|----------|------|
+| `--data-dir` | `{local}/images/` | Severstal 원본 이미지 (~12,568장) |
+| `--csv` | `{local}/{파일명}` | Annotation CSV |
+| `--split-csv` | `{local}/{파일명}` | 사전 생성 분할 CSV |
+| `--casda-dir` | `{local}/casda/` | CASDA 합성 데이터 (스마트 복사) |
+| `--yolo-dir` | `{local}/yolo/` | YOLO 포맷 데이터셋 |
+
+복사 **제외**: `--output-dir` (결과/체크포인트는 Drive에 유지하여 영구 보존)
+
+핵심 기능:
+- **스마트 CASDA 복사**: 선택된 `--groups`가 필요로 하는 CASDA 하위 디렉토리만 복사.
+  예: `--groups copypaste` → `copypaste_baseline/`만 복사, `casda_full/` 등 불필요 디렉토리 건너뜀.
+- **Resume 안전**: `.localized` 마커 파일로 복사 완료 여부 추적, 재복사 방지
+- **불완전 복사 처리**: 마커 없이 디렉토리 존재 시 삭제 후 재복사
+- **진행률 표시**: 5% 단위 로그 출력 (파일 수, 경과 시간)
+- **CASDA 상위 파일 복사**: suitability CSV, metadata JSON 등 자동 포함
+
+#### 1-2. `_resolve_needed_casda_subdirs(groups_cli, available_groups, config)` (신규)
+
+선택된 그룹이 필요로 하는 CASDA 하위 디렉토리 집합 반환.
+- `casda_dir_override` 있는 그룹 → `os.path.basename(override)` 사용
+- 없는 그룹 → `_CASDA_GROUP_SUBDIRS` 매핑 사용
+
+#### 1-3. `_copy_with_progress(src, dst, label)` (신규)
+
+디렉토리/파일 복사 + 진행률 표시 유틸리티.
+- `shutil.copytree` 기반 (디렉토리), `shutil.copy2` 기반 (파일)
+- `.localized` 마커 존재 시 건너뜀
+
+#### 1-4. `--local-dir` argparse 인자 (line 1217)
+
+```
+--local-dir /content/local_data
+```
+
+CLI 도움말(한국어): "로컬 디스크 경로. 지정 시 학습 데이터를 자동 복사 후 로컬에서 학습. --output-dir은 Drive에 유지됨."
+
+#### 1-5. 호출 위치 (line 1279-1280)
+
+`_localize_data(args, config)`는 config override (`args.data_dir → config['dataset']['image_dir']`) 전에 실행.
+→ 로컬 경로로 갱신된 `args.*`가 config override에 그대로 반영됨.
+
+---
+
+### 2. `src/training/dataset.py` — `casda_dir_override` 버그 수정
+
+**목적**: Segmentation 모델(DeepLabV3+)이 그룹별 CASDA 디렉토리를 올바르게 참조하도록 수정.
+
+**버그 상세**:
+- `create_data_loaders()` 함수 내 `casda_data == "composed"` 분기 (기존 line 869-871)에서
+  항상 `config['dataset']['casda']['composed_dir']`만 참조
+- `group_config.get('casda_dir_override')` 확인하지 않음
+- 결과: `ablation_no_blending`과 `copypaste` 그룹의 DeepLabV3+ 학습 시
+  `casda_no_blend/` 또는 `copypaste_baseline/` 대신 `casda_composed/`에서 데이터를 읽음
+
+**영향 범위**: Detection 모델(YOLO-MFD, EB-YOLOv8)은 영향 없음
+(inject/clean 사이클이 `run_benchmark.py`에서 별도로 `casda_dir_override`를 처리하므로)
+
+**수정 내용** (line 869-886):
+```python
+# 수정 전
+elif casda_data == "composed":
+    raw_casda = casda_config.get('composed_dir', 'data/augmented/casda_composed')
+    casda_dir = raw_casda if os.path.isabs(raw_casda) else str(project_root / raw_casda)
+
+# 수정 후
+elif casda_data == "composed":
+    dir_override = group_config.get('casda_dir_override', '')
+    if dir_override:
+        logging.info(f"[CASDA] casda_dir_override 적용: {dir_override}")
+        if os.path.isabs(dir_override):
+            raw_casda = dir_override
+        else:
+            # composed_dir의 부모를 CASDA base로 사용하여 상대경로 해석
+            composed_dir = casda_config.get('composed_dir', ...)
+            casda_base = str(Path(composed_dir).parent)
+            raw_casda = os.path.join(casda_base, os.path.basename(dir_override))
+    else:
+        raw_casda = casda_config.get('composed_dir', 'data/augmented/casda_composed')
+    casda_dir = raw_casda if os.path.isabs(raw_casda) else str(project_root / raw_casda)
+```
+
+**경로 해석 로직** (`run_benchmark.py:1367-1376`과 동일):
+- `casda_dir_override`가 절대 경로 → 그대로 사용
+- `casda_dir_override`가 상대 경로 → `composed_dir`의 부모 + `basename(override)`
+  - 예: `composed_dir="/content/casda/casda_composed"`, `override="data/augmented/copypaste_baseline"`
+  - → `"/content/casda/" + "copypaste_baseline"` = `"/content/casda/copypaste_baseline"`
+
+---
+
+### 3. `configs/benchmark_experiment.yaml` — `ablation_no_pruning` 수량 제한 (이전 세션 완료)
+
+**변경**: `ablation_no_pruning` 그룹에 `casda_pruning` 설정 추가
+```yaml
+casda_pruning:
+  enabled: true
+  suitability_threshold: 0.0   # 품질 필터링 없음
+  top_k: 5000                  # 수량 제한 (기존 30,300 → 5,000)
+  stratified: false
+```
+
+**이유**: 30,300장 inject 시 Colab 세션 timeout 발생. 5,000장으로 제한하여 inject 시간 단축.
+
+---
+
+## Colab 실행 명령어 (예시)
+
+### --local-dir 적용 벤치마크 실행
+
+```bash
+python scripts/run_benchmark.py \
+  --config configs/benchmark_experiment.yaml \
+  --data-dir /content/drive/MyDrive/data/Severstal/train_images \
+  --csv /content/drive/MyDrive/data/Severstal/train.csv \
+  --casda-dir /content/drive/MyDrive/data/Severstal \
+  --yolo-dir /content/drive/MyDrive/data/Severstal/yolo_datasets \
+  --split-csv /content/drive/MyDrive/data/Severstal/casda/splits/split_70_15_15_seed42.csv \
+  --output-dir /content/drive/MyDrive/data/Severstal/casda/benchmark_results_v5.6 \
+  --local-dir /content/local_data \
+  --models yolo_mfd \
+  --groups copypaste ablation_no_blending ablation_no_pruning \
+  --no-fid \
+  --resume
+```
+
+### --resume 시 주의사항
+- `--output-dir`은 기존 타임스탬프 디렉토리 경로를 지정해야 함
+  (예: `.../benchmark_results_v5.6/20260310_014726`)
+- `--local-dir`은 `.localized` 마커로 재복사를 방지하므로 resume과 호환
+
+---
+
+## 기술적 발견사항
+
+### _localize_data 설계 결정
+1. **호출 시점**: config override 전 (line 1279) — `args.*` 갱신이 이후 config에 반영됨
+2. **CASDA 스마트 복사**: 선택 그룹의 `casda_dir_override` 또는 `_CASDA_GROUP_SUBDIRS` 매핑으로
+   필요한 하위 디렉토리만 결정. 전체 복사 대비 시간/디스크 절약.
+3. **마커 기반 Resume**: `.localized` 파일 존재 여부로 판단.
+   `shutil.copytree`가 부분 복사 후 중단되면 마커 없음 → 다음 실행에서 삭제 후 재복사.
+
+### casda_dir_override 해석의 이중 경로
+- **Detection (run_benchmark.py:1371-1376)**: `args.casda_dir` + `basename(override)` 로 해석
+- **Segmentation (dataset.py:877-883)**: `composed_dir.parent` + `basename(override)` 로 해석
+- `--casda-dir` CLI 지정 시 `composed_dir`이 `{casda_dir}/casda_composed`로 설정되므로
+  두 경로의 부모가 동일 → 해석 결과 일치
+
+---
+
+## 변경 파일 요약
+
+| 파일 | 변경 유형 | 변경 라인 수 |
+|------|----------|-------------|
+| `scripts/run_benchmark.py` | 신규 함수 3개 + argparse 1개 | +200 |
+| `src/training/dataset.py` | 버그 수정 (casda_dir_override) | +15 / -2 |
+| `configs/benchmark_experiment.yaml` | 설정 변경 (이전 세션) | +4 |
+
+---
+
+## 미완료 (향후 작업)
+
+| 항목 | 우선순위 | 비고 |
+|------|----------|------|
+| Colab 테스트 실행 | P0 | `--local-dir` + `--resume` 동작 검증 |
+| 벤치마크 재실행 | P0 | ablation + copypaste 그룹, `--no-fid` |
+| benchmark_results.json 증분 저장 | P1 | 현재 전체 완료 후 1회 기록 → 그룹/모델 완료마다 기록으로 변경 |
+| GAN Baseline (DCGAN) | P2 | scripts/train_dcgan.py 신규 구현 필요 |
+| w/o Multi-hint ablation | P2 | ControlNet 재추론 필요 (GPU) |

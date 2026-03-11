@@ -867,7 +867,23 @@ def create_data_loaders(
                 transform=train_transform,
             )
         elif casda_data == "composed":
-            raw_casda = casda_config.get('composed_dir', 'data/augmented/casda_composed')
+            # casda_dir_override: 그룹별 디렉토리 지정 (ablation_no_blending, copypaste 등)
+            # run_benchmark.py의 inject 로직(line 1367-1376)과 동일한 resolution 적용
+            dir_override = group_config.get('casda_dir_override', '')
+            if dir_override:
+                logging.info(f"[CASDA] casda_dir_override 적용: {dir_override}")
+                if os.path.isabs(dir_override):
+                    raw_casda = dir_override
+                else:
+                    # composed_dir의 부모를 CASDA base로 사용하여 상대경로 해석
+                    # 예: composed_dir="/local/casda/casda_composed"
+                    #   → base="/local/casda", override basename="copypaste_baseline"
+                    #   → raw_casda="/local/casda/copypaste_baseline"
+                    composed_dir = casda_config.get('composed_dir', 'data/augmented/casda_composed')
+                    casda_base = str(Path(composed_dir).parent)
+                    raw_casda = os.path.join(casda_base, os.path.basename(dir_override))
+            else:
+                raw_casda = casda_config.get('composed_dir', 'data/augmented/casda_composed')
             casda_dir = raw_casda if os.path.isabs(raw_casda) else str(project_root / raw_casda)
             # casda_pruning 설정 병합 (casda_composed_pruning 그룹용)
             pruning_cfg = group_config.get('casda_pruning', {})

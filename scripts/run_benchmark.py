@@ -608,6 +608,206 @@ def _validate_injected_files(
 
 
 # ============================================================================
+# --local-dir: Drive → Local 데이터 자동 복사
+# ============================================================================
+
+# 그룹별 CASDA 하위 디렉토리 매핑 (smart copy에 사용)
+_CASDA_GROUP_SUBDIRS = {
+    "casda_full": "casda_full",
+    "casda_pruning": "casda_pruning",
+    "casda_composed": "casda_composed",
+    "casda_composed_pruning": "casda_composed",
+    "ablation_no_blending": "casda_no_blend",
+    "ablation_no_pruning": "casda_composed",
+    "copypaste": "copypaste_baseline",
+}
+
+
+def _resolve_needed_casda_subdirs(
+    groups_cli: list,
+    available_groups: list,
+    config: dict,
+) -> set:
+    """선택된 그룹이 필요로 하는 CASDA 하위 디렉토리 집합을 반환.
+
+    casda_dir_override가 있는 그룹은 해당 basename을,
+    없으면 _CASDA_GROUP_SUBDIRS 매핑을 사용.
+    """
+    group_keys = resolve_groups(groups_cli, available_groups)
+    needed = set()
+    for gk in group_keys:
+        group_cfg = config.get('dataset_groups', {}).get(gk, {})
+        dir_override = group_cfg.get('casda_dir_override', '')
+        if dir_override:
+            needed.add(os.path.basename(dir_override))
+        elif gk in _CASDA_GROUP_SUBDIRS:
+            needed.add(_CASDA_GROUP_SUBDIRS[gk])
+    return needed
+
+
+def _copy_with_progress(src: str, dst: str, label: str) -> bool:
+    """디렉토리 또는 파일을 복사하며 진행률을 표시.
+
+    이미 복사 완료된 경우 (.localized 마커 존재) 건너뜀.
+    Returns True if copy was performed, False if skipped.
+    """
+    src_path = Path(src)
+    dst_path = Path(dst)
+
+    if not src_path.exists():
+        logging.warning(f"[LocalDir] {label}: 소스 없음 → 건너뜀: {src}")
+        return False
+
+    # 마커 파일: 복사 완료 여부 확인 (resume 시 재복사 방지)
+    if dst_path.is_dir():
+        marker = dst_path / ".localized"
+    else:
+        marker = dst_path.parent / f".localized_{dst_path.name}"
+
+    if marker.exists():
+        logging.info(f"[LocalDir] {label}: 이미 로컬화됨 → 건너뜀: {dst}")
+        return False
+
+    t0 = time.time()
+
+    if src_path.is_file():
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        logging.info(f"[LocalDir] {label}: 파일 복사 중: {src} → {dst}")
+        shutil.copy2(str(src_path), str(dst_path))
+        # 파일 마커 생성
+        marker.touch()
+    elif src_path.is_dir():
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        # 파일 수 사전 계산 (진행률 표시용)
+        total_files = sum(1 for _ in src_path.rglob('*') if _.is_file())
+        logging.info(f"[LocalDir] {label}: 디렉토리 복사 시작 ({total_files:,}개 파일): {src}")
+
+        copied = 0
+        last_pct = -1
+
+        # copytree가 이미 존재하면 에러 → 기존 불완전 복사 제거
+        if dst_path.exists():
+            logging.info(f"[LocalDir]   불완전 복사 잔여 제거: {dst}")
+            shutil.rmtree(str(dst_path))
+
+        def _copy_fn(src_f, dst_f):
+            nonlocal copied, last_pct
+            shutil.copy2(src_f, dst_f)
+            copied += 1
+            if total_files > 0:
+                pct = int(copied * 100 / total_files)
+                if pct >= last_pct + 5:  # 5% 단위 출력
+                    last_pct = pct
+                    elapsed = time.time() - t0
+                    logging.info(
+                        f"[LocalDir]   {label}: {pct}% ({copied:,}/{total_files:,}) "
+                        f"[{elapsed:.0f}s]"
+                    )
+            return dst_f
+
+        shutil.copytree(str(src_path), str(dst_path), copy_function=_copy_fn)
+        # 완료 마커 생성
+        marker = dst_path / ".localized"
+        marker.touch()
+
+    elapsed = time.time() - t0
+    logging.info(f"[LocalDir] {label}: 복사 완료 ({elapsed:.1f}s)")
+    return True
+
+
+def _localize_data(args, config) -> argparse.Namespace:
+    """--local-dir 지정 시 학습 데이터를 로컬 디스크로 복사하고 args 경로를 갱신.
+
+    복사 대상:
+      --data-dir   → {local_dir}/images/
+      --csv        → {local_dir}/train.csv
+      --split-csv  → {local_dir}/split.csv
+      --casda-dir  → {local_dir}/casda/{subdir}/ (필요한 그룹 하위만)
+      --yolo-dir   → {local_dir}/yolo/
+
+    복사 제외:
+      --output-dir (결과/체크포인트는 Drive에 유지)
+
+    Resume 지원:
+      각 복사 대상에 .localized 마커를 남겨 재복사 방지.
+    """
+    local_base = Path(args.local_dir)
+    local_base.mkdir(parents=True, exist_ok=True)
+
+    logging.info(f"\n{'='*70}")
+    logging.info(f"[LocalDir] 데이터 로컬화 시작: {local_base}")
+    logging.info(f"{'='*70}")
+    t_start = time.time()
+
+    # ── 1. 이미지 디렉토리 (--data-dir) ──
+    if args.data_dir:
+        local_images = str(local_base / "images")
+        if _copy_with_progress(args.data_dir, local_images, "images"):
+            pass
+        args.data_dir = local_images
+        logging.info(f"[LocalDir] args.data_dir → {args.data_dir}")
+
+    # ── 2. Annotation CSV (--csv) ──
+    if args.csv:
+        csv_name = os.path.basename(args.csv)
+        local_csv = str(local_base / csv_name)
+        _copy_with_progress(args.csv, local_csv, "csv")
+        args.csv = local_csv
+        logging.info(f"[LocalDir] args.csv → {args.csv}")
+
+    # ── 3. Split CSV (--split-csv) ──
+    if getattr(args, 'split_csv', None):
+        split_name = os.path.basename(args.split_csv)
+        local_split = str(local_base / split_name)
+        _copy_with_progress(args.split_csv, local_split, "split_csv")
+        args.split_csv = local_split
+        logging.info(f"[LocalDir] args.split_csv → {args.split_csv}")
+
+    # ── 4. CASDA 디렉토리 (--casda-dir) — 스마트 복사 ──
+    if args.casda_dir:
+        local_casda = str(local_base / "casda")
+        Path(local_casda).mkdir(parents=True, exist_ok=True)
+
+        # 선택된 그룹이 필요로 하는 하위 디렉토리만 복사
+        available_groups = list(config.get('dataset_groups', {}).keys())
+        needed_subdirs = _resolve_needed_casda_subdirs(
+            args.groups, available_groups, config
+        )
+
+        if needed_subdirs:
+            logging.info(f"[LocalDir] CASDA 스마트 복사: 필요 하위 디렉토리 = {sorted(needed_subdirs)}")
+            for subdir in sorted(needed_subdirs):
+                src_sub = os.path.join(args.casda_dir, subdir)
+                dst_sub = os.path.join(local_casda, subdir)
+                _copy_with_progress(src_sub, dst_sub, f"casda/{subdir}")
+        else:
+            logging.info("[LocalDir] CASDA: 선택된 그룹 중 CASDA가 필요한 그룹 없음 → 건너뜀")
+
+        # CASDA 상위 파일 (suitability CSV 등) 복사
+        casda_src_path = Path(args.casda_dir)
+        for f in casda_src_path.iterdir():
+            if f.is_file() and f.suffix in ('.csv', '.json', '.yaml', '.yml'):
+                dst_f = os.path.join(local_casda, f.name)
+                _copy_with_progress(str(f), dst_f, f"casda/{f.name}")
+
+        args.casda_dir = local_casda
+        logging.info(f"[LocalDir] args.casda_dir → {args.casda_dir}")
+
+    # ── 5. YOLO 디렉토리 (--yolo-dir) ──
+    if args.yolo_dir:
+        local_yolo = str(local_base / "yolo")
+        _copy_with_progress(args.yolo_dir, local_yolo, "yolo")
+        args.yolo_dir = local_yolo
+        logging.info(f"[LocalDir] args.yolo_dir → {args.yolo_dir}")
+
+    t_total = time.time() - t_start
+    logging.info(f"\n[LocalDir] 데이터 로컬화 완료: {t_total:.1f}s")
+    logging.info(f"{'='*70}\n")
+
+    return args
+
+
+# ============================================================================
 # Single Experiment Run
 # ============================================================================
 
@@ -1014,6 +1214,13 @@ Examples:
                              '로드하여 Hypothesis Test에 활용. '
                              '중복 조합은 현재 실행 결과 우선. '
                              '예: --reference-results /path/to/baseline_raw/benchmark_results.json')
+    parser.add_argument('--local-dir', type=str, default=None,
+                        help='로컬 디스크 경로 (예: /content/local_data). '
+                             '지정 시 --data-dir, --csv, --casda-dir, --yolo-dir 데이터를 '
+                             '이 경로로 자동 복사한 후 로컬에서 학습. '
+                             'Google Drive I/O 병목 해소용. '
+                             '--output-dir은 Drive에 유지됨 (결과 영구 보존). '
+                             'Colab 예: --local-dir /content/local_data')
     args = parser.parse_args()
 
     # Load config
@@ -1065,6 +1272,12 @@ Examples:
             print(f"  {mk:<20s} {mv.get('name', mk):<22s} [{pipeline}]")
         print()
         sys.exit(0)
+
+    # ====== --local-dir: 자동 데이터 로컬화 ======
+    # Drive I/O 병목 해소를 위해 학습 데이터를 로컬 디스크로 복사.
+    # --output-dir은 변경하지 않음 (결과/체크포인트는 Drive에 보존).
+    if args.local_dir:
+        args = _localize_data(args, config)
 
     # Override data paths if specified via CLI
     if args.data_dir:

@@ -1215,20 +1215,23 @@ def compose_all(
         stem = filename.replace(".png", "")
         
         for comp_idx in range(compositions_per_roi):
+            img_seed = hash((filename, comp_idx, seed)) & 0xFFFFFFFF
+            img_rng = random.Random(img_seed)
+
             bg_name = bg_pool.get_compatible_background(
                 defect_subtype=defect_subtype,
                 roi_x_center=roi_x_center,
                 target_brightness=target_brightness,
                 brightness_tolerance=brightness_tolerance,
-                rng=rng,
+                rng=img_rng,
             )
-            
+
             if bg_name is None:
                 stats['fail_no_background'] += 1
                 continue
-            
+
             bg_path = clean_images_dir / bg_name
-            
+
             # 출력 파일명: N=1이면 기존과 동일, N>1이면 _comp{idx} 접미사 추가
             if compositions_per_roi > 1:
                 out_img_name = f"{stem}_comp{comp_idx}.png"
@@ -1236,10 +1239,10 @@ def compose_all(
             else:
                 out_img_name = filename
                 out_mask_name = filename.replace(".png", "_mask.png")
-            
+
             # Tier-1 증강: 변형별 랜덤 jitter_x, scale_factor 생성
-            img_jitter_x = rng.randint(-jitter_range, jitter_range) if jitter_range > 0 else 0
-            img_scale_factor = rng.uniform(scale_min, scale_max) if scale_min < scale_max else scale_min
+            img_jitter_x = img_rng.randint(-jitter_range, jitter_range) if jitter_range > 0 else 0
+            img_scale_factor = img_rng.uniform(scale_min, scale_max) if scale_min < scale_max else scale_min
             
             task = {
                 'img_path': str(img_path),

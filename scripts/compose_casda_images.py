@@ -57,6 +57,7 @@ import ast
 import json
 import logging
 import os
+import hashlib
 import random
 import re
 import sys
@@ -1215,7 +1216,8 @@ def compose_all(
         stem = filename.replace(".png", "")
         
         for comp_idx in range(compositions_per_roi):
-            img_seed = hash((filename, comp_idx, seed)) & 0xFFFFFFFF
+            key = f"{filename}_{comp_idx}_{seed}".encode()
+            img_seed = int(hashlib.md5(key).hexdigest(), 16) & 0xFFFFFFFF
             img_rng = random.Random(img_seed)
 
             bg_name = bg_pool.get_compatible_background(

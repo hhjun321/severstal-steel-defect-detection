@@ -186,34 +186,168 @@ Effect sizes are reported as Cohen's d.
 
 ---
 
+## P3 — 이미지 품질 지표 (FID / KID / LPIPS)
+
+### 배경
+
+Reviewer 지적: *"FID나 KID, LPIPS 같은 평가 지표로 비교해야 한다."*
+
+현재 상태: `run_fid.py` + `FIDCalculator` (InceptionV3 기반 FID만 구현됨).
+
+### 각 지표 역할
+
+| 지표 | 측정 대상 | 현재 | 추가 여부 |
+|------|-----------|------|-----------|
+| **FID** | 분포 거리 (Inception feature) | 구현됨 | 보고 방식 개선 |
+| **KID** | 분포 거리 (불편 추정, 소표본 적합) | 없음 | **필수 추가** |
+| **LPIPS (realism)** | 생성 vs 실제 지각적 거리 | 없음 | 권장 추가 |
+| **LPIPS (diversity)** | 생성 이미지 내부 다양성 | 없음 | 권장 추가 |
+
+### 왜 KID가 필수인가
+
+FID는 소표본에서 편향 추정치를 생성한다.
+CASDA 합성 샘플 수 (~2,238개)는 FID가 안정적이라 보기 어려운 규모다.
+
+```
+FID 오차 ∝ 1/n  →  n=2,238이면 오차가 크고 재현성이 낮음
+
+KID (Kernel Inception Distance):
+  - 동일한 InceptionV3 feature 재사용 (추가 모델 불필요)
+  - MMD (Maximum Mean Discrepancy) with polynomial kernel
+  - 불편 추정량 → 소표본에서 FID보다 신뢰 가능
+  - torch-fidelity 라이브러리로 간단히 구현 가능
+```
+
+### LPIPS 사용 목적 정의
+
+LPIPS는 분포 지표가 아니므로 목적을 명확히 해야 한다.
+
+**Realism (실제와의 거리, ↓ 낮을수록 좋음):**
+```
+동일 클래스의 생성 패치 vs 실제 테스트 패치의 LPIPS 평균
+→ Copy-Paste의 경계 아티팩트를 수치로 드러냄
+```
+
+**Diversity (생성 다양성, ↑ 높을수록 좋음):**
+```
+같은 클래스 생성 이미지들 간의 LPIPS 평균
+→ 모드 붕괴 없이 다양한 샘플을 생성하는지 확인
+```
+
+> **Copy-Paste의 FID/KID 함정:**
+> Copy-Paste는 실제 패치를 복사하므로 분포 거리가 이론적으로 0에 가깝다.
+> 이 경우 FID/KID 단독으로는 두 방법의 차이를 드러내지 못한다.
+> **LPIPS (realism) 가 경계 아티팩트를 정량화하는 핵심 지표가 된다.**
+
+### 비교 테이블 구조 (논문 삽입용)
+
+평가 기준: held-out 실제 패치 (test split의 결함 ROI)
+
+| Metric | Copy-Paste | CASDA (Ours) | 비고 |
+|--------|-----------|--------------|------|
+| FID↓ (ROI) | — | — | Class별 추가 보고 |
+| KID↓ (ROI) | — | — | ×10³ 스케일로 보고 |
+| LPIPS↓ (realism) | — | — | 낮을수록 실제와 유사 |
+| LPIPS↑ (diversity) | — | — | 높을수록 다양한 생성 |
+
+### 신규 스크립트: `scripts/run_image_quality_metrics.py`
+
+**역할:** KID + LPIPS (realism + diversity) 계산. 기존 `run_fid.py`와 독립 실행.
+
+**의존성:**
+```bash
+pip install torch-fidelity   # KID 계산
+pip install lpips            # LPIPS 계산
+```
+
+**입력:**
+```
+train_images/                    # 실제 이미지 (reference)
+augmented_images_v5.5/generated/ # CASDA 생성 ROI 패치
+roi_patches_v5.1/roi_metadata.csv
+augmented_dataset/casda_composed/metadata.json
+```
+
+**출력:**
+```
+fid_results/
+  kid_results.json              # KID (전체 + class별)
+  lpips_results.json            # LPIPS realism + diversity (class별)
+  quality_metrics_table.md      # 논문 삽입용 통합 테이블
+  quality_metrics_table.tex     # LaTeX 버전
+```
+
+**실행:**
+```bash
+python ${SCRIPTS}/run_image_quality_metrics.py \
+  --config        ${CONFIG} \
+  --data-dir      ${TRAIN_IMAGES} \
+  --csv           ${TRAIN_CSV} \
+  --casda-roi-dir ${AUG_IMAGES}/generated \
+  --roi-meta      ${ROI_DIR}/roi_metadata.csv \
+  --metrics       kid lpips \
+  --output-dir    ${FID_RESULTS}
+```
+
+### 논문 본문 추가 (§4.3 Synthesis Quality 섹션)
+
+```
+Image Quality Evaluation:
+We assess synthesis quality using three complementary metrics.
+FID and KID measure the distributional distance between generated
+and real defect patches using InceptionV3 features; KID is preferred
+for our dataset scale (~2,200 samples) as it provides an unbiased
+estimate unlike FID. LPIPS evaluates perceptual quality at the
+patch level: realism (mean distance between generated and real
+patches, lower is better) and diversity (mean pairwise distance
+within generated patches, higher is better). All metrics are
+computed per defect class on held-out test patches.
+```
+
+---
+
 ## 파일 변경 요약
 
 | 파일 | 변경 유형 | 내용 |
 |------|-----------|------|
 | `scripts/aggregate_multiseed_results.py` | **신규** | seed별 결과 집계, mean±std 계산 |
 | `scripts/run_statistical_tests.py` | **신규** | Wilcoxon / Friedman / BH-FDR / Cohen's d |
+| `scripts/run_image_quality_metrics.py` | **신규** | KID + LPIPS (realism / diversity) |
 | `scripts/analyze_benchmark_results.py` | **수정** | mean±std LaTeX 테이블 출력 지원 |
 
-> `run_benchmark.py`는 이미 `--seed` 파라미터가 존재하므로 수정 불필요.
+> `run_benchmark.py`와 `run_fid.py`는 수정 불필요.
 
 ---
 
 ## 작업 순서
 
+**P1 — Multi-Seed**
 - [ ] 1. 브랜치 생성: `feature/statistical-robustness`
 - [ ] 2. `scripts/aggregate_multiseed_results.py` 작성
-- [ ] 3. `scripts/run_statistical_tests.py` 작성
-- [ ] 4. `scripts/analyze_benchmark_results.py` 수정 (mean±std 테이블)
-- [ ] 5. Colab에서 P1 실행 (seed 42, 123, 456 × 3 그룹)
-- [ ] 6. `aggregate_multiseed_results.py` 실행 → aggregated_results.json 생성
+- [ ] 3. `scripts/analyze_benchmark_results.py` 수정 (mean±std 테이블)
+- [ ] 4. Colab에서 P1 실행 (seed 42, 123, 456 × 3 그룹)
+- [ ] 5. `aggregate_multiseed_results.py` 실행 → aggregated_results.json 생성
+
+**P2 — 통계 검정**
+- [ ] 6. `scripts/run_statistical_tests.py` 작성
 - [ ] 7. `run_statistical_tests.py` 실행 → significance_table 생성
-- [ ] 8. 논문 결과 테이블 + 통계 서술 업데이트
-- [ ] 9. main 브랜치에 PR
+
+**P3 — 이미지 품질 지표**
+- [ ] 8. `scripts/run_image_quality_metrics.py` 작성
+- [ ] 9. Colab에서 KID + LPIPS 실행
+- [ ] 10. quality_metrics_table 생성
+
+**논문 반영**
+- [ ] 11. 결과 테이블 mean±std 형식으로 교체
+- [ ] 12. 통계 서술 문구 추가 (§4 Experiments)
+- [ ] 13. KID/LPIPS 비교 테이블 추가 (§4.3 Synthesis Quality)
+- [ ] 14. main 브랜치에 PR
 
 ---
 
 ## 참고
 
 - `run_benchmark.py --seed` 파라미터: L1220–1221 (이미 구현됨)
+- `FIDCalculator` 클래스: `src/training/metrics.py` L372 (InceptionV3 feature 재사용 가능)
 - `benchmark_results.json` 구조: L49–64 in `analyze_benchmark_results.py`
 - 가설 정의: `05-Pipeline-StageD.md`, `08-Dataset-Groups.md`

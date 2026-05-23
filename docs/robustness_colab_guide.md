@@ -142,7 +142,51 @@ fid_results/
   --device              cuda
 ```
 
-> 출력: `fid_results/copypaste/fid_results.json` → P2의 `--copypaste-fid-results` 입력
+> 출력: `fid_results/copypaste/fid_results.json` (참고용; H5는 이제 LPIPS 기반)
+
+### P3-4. CopyPaste LPIPS 저장 (H5 가설 검정용)
+
+> P3-1 이후 CopyPaste에 대해 동일한 LPIPS 계산을 수행한다.  
+> CopyPaste의 "생성" 패치는 `copypaste_baseline/` 폴더의 합성 이미지에서 추출된 ROI를 사용한다.
+
+```python
+# 셀 P3-4: CopyPaste LPIPS 계산
+# CopyPaste composed 이미지를 --casda-roi-dir 로 지정
+# (copypaste_baseline/ 이 CASDA generated/ 와 동일한 구조이면 그대로 사용)
+!python $SCRIPTS/run_image_quality_metrics.py \
+  --casda-roi-dir $AUG_DATASET/copypaste_baseline \
+  --roi-meta      $ROI_DIR/roi_metadata.csv \
+  --metrics       lpips \
+  --output-dir    $FID_RESULTS/copypaste \
+  --device        cuda \
+  --lpips-pairs   500 \
+  --lpips-img-size 64
+```
+
+> 출력: `fid_results/copypaste/lpips_results.json` → P2의 `--copypaste-lpips-results` 입력
+
+**copypaste_baseline/ 구조가 다를 경우 대안 (이미 실험값을 알고 있는 경우):**
+
+```python
+# 셀 P3-4b: 기존 실험값에서 JSON 직접 생성
+import json, os
+# P3 실험에서 직접 얻은 CopyPaste LPIPS 값 (2026-05-23 Colab 실험 결과)
+copypaste_lpips = {
+    "realism": {
+        "per_class": {"Class1": 0.4975, "Class2": 0.4280, "Class3": 0.4838, "Class4": 0.4993},
+        "overall": 0.4907
+    },
+    "diversity": {
+        "per_class": {"Class1": 0.3984, "Class2": 0.3861, "Class3": 0.4119, "Class4": 0.3940},
+        "overall": 0.3937
+    }
+}
+out_dir = os.environ['FID_RESULTS'] + '/copypaste'
+os.makedirs(out_dir, exist_ok=True)
+with open(f"{out_dir}/lpips_results.json", 'w') as f:
+    json.dump(copypaste_lpips, f, indent=2)
+print(f"Saved: {out_dir}/lpips_results.json")
+```
 
 ---
 
@@ -236,15 +280,18 @@ benchmark_results/multiseed_aggregated/
 
 ```python
 # 셀 P2-1
+# H5 is LPIPS realism superiority (FID is biased toward CopyPaste — see p3_image_quality_results.md)
 !python $SCRIPTS/run_statistical_tests.py \
-  --aggregated-results    $BENCHMARK_RESULTS/multiseed_aggregated/aggregated_results.json \
-  --fid-results           $FID_RESULTS/fid_results.json \
-  --copypaste-fid-results $FID_RESULTS/copypaste/fid_results.json \
-  --output-dir            $BENCHMARK_RESULTS/statistical_tests \
+  --aggregated-results      $BENCHMARK_RESULTS/multiseed_aggregated/aggregated_results.json \
+  --lpips-results           $FID_RESULTS/lpips_results.json \
+  --copypaste-lpips-results $FID_RESULTS/copypaste_lpips_results.json \
+  --output-dir              $BENCHMARK_RESULTS/statistical_tests \
   --alpha 0.05
 ```
 
-> `--copypaste-fid-results`가 없으면 H5는 N/A로 처리됨.
+> `--copypaste-lpips-results`가 없으면 H5는 N/A로 처리됨.  
+> H5 재정의: FID(CASDA) < FID(CopyPaste) → LPIPS Realism(CASDA) < LPIPS Realism(CopyPaste).  
+> CopyPaste는 실제 패치를 복사하므로 FID ≈ 0이 되어 단독 평가 지표로 부적합함.
 
 **출력:**
 ```
@@ -261,10 +308,11 @@ benchmark_results/statistical_tests/
 | 단계 | 파일 | Drive 경로 |
 |------|------|------------|
 | P3 | KID 결과 | `fid_results/kid_results.json` |
-| P3 | LPIPS 결과 | `fid_results/lpips_results.json` |
+| P3 | CASDA LPIPS 결과 | `fid_results/lpips_results.json` |
 | P3 | 품질 지표 테이블 | `fid_results/quality_metrics_table.md/tex` |
 | P3 | CASDA FID | `fid_results/fid_results.json` |
 | P3 | CopyPaste FID | `fid_results/copypaste/fid_results.json` |
+| P3 | CopyPaste LPIPS (H5용) | `fid_results/copypaste/lpips_results.json` |
 | P1 | seed별 학습 결과 | `benchmark_results/multiseed/seed_{42,123,456}/` |
 | P1 | 집계 결과 | `benchmark_results/multiseed_aggregated/aggregated_results.json` |
 | P1 | mean±std 테이블 | `benchmark_results/multiseed_aggregated/table_mean_std.md/tex` |

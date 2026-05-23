@@ -5,18 +5,23 @@ Statistical significance tests for CASDA benchmark hypotheses.
 Reads multi-seed aggregated results and runs:
   H3 — Architecture Independence (Friedman test across 3 models)
   H4 — Class 2 Improvement      (Wilcoxon signed-rank, paired by seed)
-  H5 — FID Superiority           (Wilcoxon signed-rank on per-class FID)
+  H5 — LPIPS Realism Superiority (Wilcoxon signed-rank on per-class LPIPS realism)
   H6 — Augmentation Ratio        (Wilcoxon signed-rank, paired by seed)
+
+Note: H5 was originally defined as FID superiority, but FID is structurally biased
+toward CopyPaste (which copies real patches). H5 is re-defined as LPIPS realism
+superiority — CASDA should have lower LPIPS realism (more perceptually similar to
+real patches) due to Poisson Blending removing boundary artifacts.
 
 Multiple-comparison correction: Benjamini-Hochberg FDR (α configurable).
 Effect size: Cohen's d.
 
 Usage:
   python scripts/run_statistical_tests.py \
-    --aggregated-results path/aggregated_results.json \
-    --fid-results        path/fid_results.json \
-    --copypaste-fid-results path/copypaste_fid_results.json \
-    --output-dir         path/statistical_tests \
+    --aggregated-results     path/aggregated_results.json \
+    --lpips-results          path/lpips_results.json \
+    --copypaste-lpips-results path/copypaste_lpips_results.json \
+    --output-dir             path/statistical_tests \
     --alpha 0.05
 """
 
@@ -257,22 +262,47 @@ def test_h4_class2_improvement(aggregated: Dict, models: List[str]) -> Dict:
     return test_result
 
 
-def test_h5_fid_superiority(
-    casda_fid: Optional[Dict],
-    copypaste_fid: Optional[Dict],
+def extract_per_class_lpips_realism(lpips_results: Dict) -> Optional[Dict[str, float]]:
+    """Extract per-class LPIPS realism values from lpips_results.json."""
+    per_class = lpips_results.get('realism', {}).get('per_class', {})
+    if not per_class:
+        return None
+    result = {}
+    for cls_name in ['Class1', 'Class2', 'Class3', 'Class4']:
+        if cls_name in per_class and per_class[cls_name] is not None:
+            result[cls_name] = float(per_class[cls_name])
+    return result if result else None
+
+
+def test_h5_lpips_realism_superiority(
+    casda_lpips: Optional[Dict],
+    copypaste_lpips: Optional[Dict],
 ) -> Dict:
-    """Wilcoxon signed-rank: CASDA FID lower (better) than CopyPaste, per class."""
+    """Wilcoxon signed-rank: CASDA LPIPS realism lower (better) than CopyPaste per class.
+
+    H5 was originally FID superiority, but FID is biased toward CopyPaste (which
+    copies real patches, making FID structurally near-zero). LPIPS realism correctly
+    captures perceptual quality: Poisson Blending should remove boundary artifacts,
+    yielding lower LPIPS realism for CASDA.
+    """
     test_result = {
         'hypothesis': 'H5',
-        'name': 'FID Superiority',
+        'name': 'LPIPS Realism Superiority (Poisson Blending)',
         'test': 'Wilcoxon signed-rank (one-tailed, class-level)',
-        'description': 'CASDA has lower FID than CopyPaste (better image quality)',
+        'description': (
+            'CASDA has lower LPIPS realism than CopyPaste (better perceptual quality). '
+            'H5 redefined from FID superiority: FID is biased toward CopyPaste which '
+            'copies real patches, making FID an invalid quality metric here.'
+        ),
     }
 
-    if casda_fid is None or copypaste_fid is None:
+    if casda_lpips is None or copypaste_lpips is None:
         test_result.update({
             'stat': None, 'p_raw': None, 'effect_d': None,
-            'note': 'Per-class FID data not available. Provide --fid-results and --copypaste-fid-results.',
+            'note': (
+                'Per-class LPIPS realism data not available. '
+                'Provide --lpips-results and --copypaste-lpips-results.'
+            ),
         })
         return test_result
 
@@ -281,16 +311,16 @@ def test_h5_fid_superiority(
         return test_result
 
     classes = [k for k in ['Class1', 'Class2', 'Class3', 'Class4']
-               if k in casda_fid and k in copypaste_fid]
+               if k in casda_lpips and k in copypaste_lpips]
     if len(classes) < 3:
         test_result.update({
             'stat': None, 'p_raw': None, 'effect_d': None,
-            'note': f'Insufficient class-level FID data: found {len(classes)} classes',
+            'note': f'Insufficient class-level LPIPS data: found {len(classes)} classes',
         })
         return test_result
 
-    casda_vals = [casda_fid[c] for c in classes]
-    cp_vals = [copypaste_fid[c] for c in classes]
+    casda_vals = [casda_lpips[c] for c in classes]
+    cp_vals = [copypaste_lpips[c] for c in classes]
 
     diffs = [a - b for a, b in zip(casda_vals, cp_vals)]
     if all(d == 0 for d in diffs):
@@ -299,9 +329,9 @@ def test_h5_fid_superiority(
         return test_result
 
     try:
-        # CASDA should have LOWER FID → alternative='less'
+        # CASDA should have LOWER LPIPS realism → alternative='less'
         stat, p = wilcoxon(casda_vals, cp_vals, alternative='less')
-        d = cohens_d(cp_vals, casda_vals)  # positive d means CopyPaste > CASDA
+        d = cohens_d(cp_vals, casda_vals)  # positive d: CopyPaste > CASDA
         test_result.update({
             'stat': float(stat),
             'p_raw': float(p),
@@ -309,8 +339,9 @@ def test_h5_fid_superiority(
             'stat_label': f"W={stat:.1f}",
             'interpretation': 'supported_if_significant',
             'note': (
-                f"Paired per-class FID (n={len(classes)} classes: {classes}). "
-                f"CASDA FID: {casda_vals}, CopyPaste FID: {cp_vals}"
+                f"Paired per-class LPIPS realism (n={len(classes)} classes: {classes}). "
+                f"CASDA: {[round(v, 4) for v in casda_vals]}, "
+                f"CopyPaste: {[round(v, 4) for v in cp_vals]}"
             ),
         })
     except Exception as e:
@@ -475,10 +506,15 @@ def main():
     parser = argparse.ArgumentParser(description="Run statistical tests on multi-seed benchmark results")
     parser.add_argument('--aggregated-results', type=str, required=True,
                         help='Path to aggregated_results.json (from aggregate_multiseed_results.py)')
+    parser.add_argument('--lpips-results', type=str, default=None,
+                        help='Path to CASDA lpips_results.json (from run_image_quality_metrics.py) — required for H5')
+    parser.add_argument('--copypaste-lpips-results', type=str, default=None,
+                        help='Path to CopyPaste lpips_results.json — required for H5')
+    # Legacy FID args kept for backward compatibility (no longer used for H5)
     parser.add_argument('--fid-results', type=str, default=None,
-                        help='Path to CASDA fid_results.json (from run_fid.py) — required for H5')
+                        help='[unused for H5] Path to CASDA fid_results.json')
     parser.add_argument('--copypaste-fid-results', type=str, default=None,
-                        help='Path to CopyPaste fid_results.json — required for H5')
+                        help='[unused for H5] Path to CopyPaste fid_results.json')
     parser.add_argument('--output-dir', type=str, required=True,
                         help='Output directory for test results')
     parser.add_argument('--alpha', type=float, default=0.05,
@@ -496,36 +532,34 @@ def main():
     models = all_models(aggregated)
     print(f"Models: {models}")
 
-    # Load FID results (optional)
-    casda_fid_per_class = None
-    copypaste_fid_per_class = None
+    # Load LPIPS results for H5 (optional)
+    casda_lpips_per_class = None
+    copypaste_lpips_per_class = None
 
-    if args.fid_results:
-        with open(args.fid_results) as f:
-            casda_fid_data = json.load(f)
-        casda_fid_per_class = extract_per_class_fid(casda_fid_data, suffix='composed')
-        if casda_fid_per_class:
-            print(f"CASDA per-class FID: {casda_fid_per_class}")
+    if args.lpips_results:
+        with open(args.lpips_results) as f:
+            casda_lpips_data = json.load(f)
+        casda_lpips_per_class = extract_per_class_lpips_realism(casda_lpips_data)
+        if casda_lpips_per_class:
+            print(f"CASDA per-class LPIPS realism: {casda_lpips_per_class}")
         else:
-            print("WARNING: Could not extract per-class FID from CASDA fid_results.json")
+            print("WARNING: Could not extract per-class LPIPS realism from CASDA lpips_results.json")
 
-    if args.copypaste_fid_results:
-        with open(args.copypaste_fid_results) as f:
-            cp_fid_data = json.load(f)
-        copypaste_fid_per_class = extract_per_class_fid(cp_fid_data, suffix='composed')
-        if copypaste_fid_per_class is None:
-            copypaste_fid_per_class = extract_per_class_fid(cp_fid_data, suffix='roi')
-        if copypaste_fid_per_class:
-            print(f"CopyPaste per-class FID: {copypaste_fid_per_class}")
+    if args.copypaste_lpips_results:
+        with open(args.copypaste_lpips_results) as f:
+            cp_lpips_data = json.load(f)
+        copypaste_lpips_per_class = extract_per_class_lpips_realism(cp_lpips_data)
+        if copypaste_lpips_per_class:
+            print(f"CopyPaste per-class LPIPS realism: {copypaste_lpips_per_class}")
         else:
-            print("WARNING: Could not extract per-class FID from CopyPaste fid_results.json")
+            print("WARNING: Could not extract per-class LPIPS realism from CopyPaste lpips_results.json")
 
     # ====== Run Hypothesis Tests ======
     print(f"\nRunning hypothesis tests (α = {args.alpha})...")
 
     h3 = test_h3_architecture_independence(aggregated, models)
     h4 = test_h4_class2_improvement(aggregated, models)
-    h5 = test_h5_fid_superiority(casda_fid_per_class, copypaste_fid_per_class)
+    h5 = test_h5_lpips_realism_superiority(casda_lpips_per_class, copypaste_lpips_per_class)
     h6 = test_h6_augmentation_ratio(aggregated, models)
 
     all_tests = [h3, h4, h5, h6]

@@ -102,16 +102,27 @@ fid_results/
 > `fid_results/fid_results.json`이 이미 있으면 건너뜀.
 
 ```python
-# 셀 P3-2
+# 셀 P3-2  (H5 per-class 비교용 → per_class 유지)
+# --workers 0  : Colab multiprocessing 오류 방지
+# --max-images 500 : 기본 1000 → 500으로 줄여 약 2배 속도 향상 (FID 신뢰도 충분)
+# --batch-size 128 : GPU 메모리 여유 시 64→128 (InceptionV3 추론 2배 빠름)
 !python $SCRIPTS/run_fid.py \
-  --config     $CONFIG \
-  --data-dir   $TRAIN_IMAGES \
-  --csv        $TRAIN_CSV \
-  --casda-dir  $AUG_DATASET \
-  --output-dir $FID_RESULTS \
-  --fid-mode   composed \
-  --device     cuda
+  --config      $CONFIG \
+  --data-dir    $TRAIN_IMAGES \
+  --csv         $TRAIN_CSV \
+  --casda-dir   $AUG_DATASET \
+  --output-dir  $FID_RESULTS \
+  --fid-mode    composed \
+  --max-images  500 \
+  --batch-size  128 \
+  --workers     0 \
+  --device      cuda
 ```
+
+> **per-class가 필요 없으면** (H5 검정 생략 시) `--no-per-class` 추가 → 약 4배 빠름:
+> ```python
+> !python $SCRIPTS/run_fid.py ... --no-per-class
+> ```
 
 ### P3-3. FID 계산 — CopyPaste (H5 가설 검정용)
 
@@ -125,6 +136,9 @@ fid_results/
   --casda-composed-dir  $AUG_DATASET/copypaste_baseline \
   --output-dir          $FID_RESULTS/copypaste \
   --fid-mode            composed \
+  --max-images          500 \
+  --batch-size          128 \
+  --workers             0 \
   --device              cuda
 ```
 

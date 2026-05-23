@@ -1062,6 +1062,15 @@ Examples:
                         help='합성 이미지 디렉토리를 직접 지정 (config casda.composed_dir override). '
                              'CopyPaste 등 대체 합성 데이터 FID 계산 시 사용. '
                              '예: --casda-composed-dir $AUG_DATASET/copypaste_baseline')
+    parser.add_argument('--max-images', type=int, default=None,
+                        help='각 세트에서 샘플링할 최대 이미지 수 (config fid.max_images override). '
+                             '낮출수록 빠름. 최소 500 권장. 기본값: config 설정(1000).')
+    parser.add_argument('--batch-size', type=int, default=None,
+                        help='InceptionV3 추론 배치 크기 (config fid.batch_size override). '
+                             'GPU 메모리에 맞게 조정. 기본값: config 설정(64).')
+    parser.add_argument('--no-per-class', action='store_true', default=False,
+                        help='클래스별 FID 계산 비활성화 (전체 FID만 계산). '
+                             '속도 우선 시 사용. H5 검정 불필요 시 적합.')
 
     args = parser.parse_args()
 
@@ -1130,6 +1139,21 @@ Examples:
         fid_cfg['use_pruning'] = False
         print(f"[INFO] casda composed_dir overridden to: {args.casda_composed_dir}")
         print(f"[INFO] FID-Composed pruning disabled (no metadata.json expected)")
+
+    if args.max_images is not None:
+        fid_cfg = config.setdefault('evaluation', {}).setdefault('fid', {})
+        fid_cfg['max_images'] = args.max_images
+        print(f"[INFO] fid max_images overridden to: {args.max_images}")
+
+    if args.batch_size is not None:
+        fid_cfg = config.setdefault('evaluation', {}).setdefault('fid', {})
+        fid_cfg['batch_size'] = args.batch_size
+        print(f"[INFO] fid batch_size overridden to: {args.batch_size}")
+
+    if args.no_per_class:
+        fid_cfg = config.setdefault('evaluation', {}).setdefault('fid', {})
+        fid_cfg['per_class'] = False
+        print(f"[INFO] per-class FID disabled (--no-per-class)")
 
     # ── Device 설정 ──
     import torch

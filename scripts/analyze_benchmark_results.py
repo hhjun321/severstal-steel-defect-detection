@@ -362,13 +362,111 @@ def compute_improvement_summary(results: List[Dict]) -> Dict:
 # Main
 # ============================================================================
 
+def generate_markdown_table_mean_std(aggregated: Dict) -> str:
+    """Generate mean±std Markdown table from aggregated multi-seed results."""
+    entries = sorted(aggregated.values(), key=lambda e: (e['model'], e['dataset']))
+    lines = [
+        "| Model | Dataset | mAP@0.5 | Dice | C1 AP | C2 AP | C3 AP | C4 AP |",
+        "|-------|---------|---------|------|-------|-------|-------|-------|",
+    ]
+    for e in entries:
+        m, s = e['mean'], e['std']
+
+        def fmt(metric: str) -> str:
+            return f"{m.get(metric, 0):.4f} ± {s.get(metric, 0):.4f}"
+
+        row = (
+            f"| {e['model']:<12} | {e['dataset']:<25} | "
+            f"{fmt('mAP@0.5')} | {fmt('dice_mean')} | "
+            f"{fmt('class_ap_Class1')} | {fmt('class_ap_Class2')} | "
+            f"{fmt('class_ap_Class3')} | {fmt('class_ap_Class4')} |"
+        )
+        lines.append(row)
+    return "\n".join(lines)
+
+
+def generate_latex_table_mean_std(aggregated: Dict) -> str:
+    """Generate mean±std LaTeX table from aggregated multi-seed results."""
+    entries = sorted(aggregated.values(), key=lambda e: (e['model'], e['dataset']))
+    col_metrics = ['mAP@0.5', 'dice_mean'] + [f'class_ap_Class{i}' for i in range(1, 5)]
+    best = {col: max(e['mean'].get(col, 0) for e in entries) for col in col_metrics}
+
+    lines = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\caption{CASDA Multi-Seed Benchmark Results (Mean $\pm$ Std, $n=3$ seeds)}",
+        r"\label{tab:multiseed}",
+        r"\begin{tabular}{llcccccc}",
+        r"\toprule",
+        r"Model & Dataset & mAP@0.5 & Dice & C1 AP & C2 AP & C3 AP & C4 AP \\",
+        r"\midrule",
+    ]
+
+    prev_model = None
+    for e in entries:
+        m, s = e['mean'], e['std']
+        model_str = e['model'] if e['model'] != prev_model else ""
+        if e['model'] != prev_model and prev_model is not None:
+            lines.append(r"\midrule")
+        prev_model = e['model']
+
+        def cell(metric: str) -> str:
+            val_str = f"${m.get(metric, 0):.4f} \\pm {s.get(metric, 0):.4f}$"
+            if abs(m.get(metric, 0) - best[metric]) < 1e-6:
+                return r"\textbf{" + val_str.strip('$') + r"}"
+            return val_str
+
+        row = (
+            f"{model_str} & {e['dataset']} & "
+            f"{cell('mAP@0.5')} & {cell('dice_mean')} & "
+            f"{cell('class_ap_Class1')} & {cell('class_ap_Class2')} & "
+            f"{cell('class_ap_Class3')} & {cell('class_ap_Class4')} \\\\"
+        )
+        lines.append(row)
+
+    lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Analyze benchmark experiment results")
-    parser.add_argument('--results-dir', type=str, required=True,
+    parser.add_argument('--results-dir', type=str, default=None,
                         help='Path to benchmark results directory')
     parser.add_argument('--output-dir', type=str, default=None,
                         help='Output directory for analysis (defaults to results-dir/analysis)')
+    parser.add_argument('--aggregated-results', type=str, default=None,
+                        help='Path to aggregated_results.json for mean±std table output '
+                             '(from scripts/aggregate_multiseed_results.py)')
     args = parser.parse_args()
+
+    if args.aggregated_results:
+        agg_path = Path(args.aggregated_results)
+        if not agg_path.exists():
+            print(f"Error: aggregated results not found: {agg_path}")
+            sys.exit(1)
+        with open(agg_path) as f:
+            aggregated = json.load(f)
+
+        output_dir = Path(args.output_dir) if args.output_dir else agg_path.parent / "analysis"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        md_table = generate_markdown_table_mean_std(aggregated)
+        print("\n" + md_table)
+        with open(output_dir / "comparison_table_mean_std.md", 'w', encoding='utf-8') as f:
+            f.write("# Multi-Seed Benchmark Results (Mean ± Std)\n\n")
+            f.write(md_table)
+            f.write("\n")
+
+        tex_table = generate_latex_table_mean_std(aggregated)
+        with open(output_dir / "comparison_table_mean_std.tex", 'w', encoding='utf-8') as f:
+            f.write(tex_table)
+
+        print(f"\nMean±std tables saved to: {output_dir}")
+        return
+
+    if not args.results_dir:
+        print("Error: --results-dir is required when --aggregated-results is not specified")
+        sys.exit(1)
 
     results_dir = Path(args.results_dir)
     output_dir = Path(args.output_dir) if args.output_dir else results_dir / "analysis"

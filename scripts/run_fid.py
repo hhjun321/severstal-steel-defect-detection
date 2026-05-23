@@ -1058,6 +1058,10 @@ Examples:
     parser.add_argument('--no-fid-pruning', action='store_true', default=False,
                         help='FID-Composed 계산 시 pruning 없이 composed 전체 사용. '
                              '기본: pruning 적용 (metadata.json의 suitability_score 기반 top-k)')
+    parser.add_argument('--casda-composed-dir', type=str, default=None,
+                        help='합성 이미지 디렉토리를 직접 지정 (config casda.composed_dir override). '
+                             'CopyPaste 등 대체 합성 데이터 FID 계산 시 사용. '
+                             '예: --casda-composed-dir $AUG_DATASET/copypaste_baseline')
 
     args = parser.parse_args()
 
@@ -1116,6 +1120,16 @@ Examples:
         fid_cfg = config.setdefault('evaluation', {}).setdefault('fid', {})
         fid_cfg['use_pruning'] = False
         print(f"[INFO] FID-Composed pruning disabled (--no-fid-pruning)")
+
+    if args.casda_composed_dir:
+        if 'casda' not in config['dataset']:
+            config['dataset']['casda'] = {}
+        config['dataset']['casda']['composed_dir'] = args.casda_composed_dir
+        # CopyPaste 등 외부 디렉토리는 pruning metadata가 없으므로 pruning 비활성
+        fid_cfg = config.setdefault('evaluation', {}).setdefault('fid', {})
+        fid_cfg['use_pruning'] = False
+        print(f"[INFO] casda composed_dir overridden to: {args.casda_composed_dir}")
+        print(f"[INFO] FID-Composed pruning disabled (no metadata.json expected)")
 
     # ── Device 설정 ──
     import torch

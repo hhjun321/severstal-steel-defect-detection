@@ -109,8 +109,7 @@ fid_results/
   --csv        $TRAIN_CSV \
   --casda-dir  $AUG_DATASET \
   --output-dir $FID_RESULTS \
-  --mode       composed \
-  --per-class \
+  --fid-mode   composed \
   --device     cuda
 ```
 
@@ -119,15 +118,14 @@ fid_results/
 ```python
 # 셀 P3-3
 !python $SCRIPTS/run_fid.py \
-  --config     $CONFIG \
-  --data-dir   $TRAIN_IMAGES \
-  --csv        $TRAIN_CSV \
-  --casda-dir  $AUG_DATASET \
-  --casda-dir-override $AUG_DATASET/copypaste_baseline \
-  --output-dir $FID_RESULTS/copypaste \
-  --mode       composed \
-  --per-class \
-  --device     cuda
+  --config              $CONFIG \
+  --data-dir            $TRAIN_IMAGES \
+  --csv                 $TRAIN_CSV \
+  --casda-dir           $AUG_DATASET \
+  --casda-composed-dir  $AUG_DATASET/copypaste_baseline \
+  --output-dir          $FID_RESULTS/copypaste \
+  --fid-mode            composed \
+  --device              cuda
 ```
 
 > 출력: `fid_results/copypaste/fid_results.json` → P2의 `--copypaste-fid-results` 입력

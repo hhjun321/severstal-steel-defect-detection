@@ -12,16 +12,15 @@
 
 ### 1.1 비교 대상 모델 (Benchmark Models)
 
-증강 데이터의 범용성을 입증하기 위해 서로 다른 아키텍처 특성을 가진 3종의 모델을 선정한다.
+증강 데이터의 범용성을 입증하기 위해 서로 다른 아키텍처 특성을 가진 2종의 Detection 모델을 선정한다.
 
 | 모델         | 연도 | 특징                                                        |
 |--------------|------|-------------------------------------------------------------|
 | YOLO-MFD     | 2025 | 다중 스케일 엣지 특징 강화(MEFE) 모듈 탑재, 미세 결함 특화  |
 | EB-YOLOv8    | 2025 | BiFPN 기반 복합 특징 융합, Severstal 주요 벤치마크 모델      |
-| DeepLabV3+   | 2024 | Severstal 데이터셋 분석의 표준 세그멘테이션 기반 통합 시스템 |
 
 **모델 선정 근거:**
-- Detection(YOLO 계열)과 Segmentation(DeepLabV3+) 양쪽 패러다임을 모두 포함
+- 서로 다른 백본 및 Neck 구조(MEFE vs BiFPN)를 가진 Detection 모델 2종으로 아키텍처 독립성 검증
 - Severstal 데이터셋에서 이미 벤치마크 결과가 공개된 모델만 선정 (재현성 확보)
 - 각 모델의 아키텍처를 고정하고, 동일 하이퍼파라미터로 학습하여 데이터 효과만 비교
 
@@ -170,9 +169,9 @@ v4 학습에서는 이전 버전에서 확인된 RGB 색상 아티팩트 문제�
 
 ### 5.2 Phase 2: 벤치마크 모델 학습 및 평가
 
-각 벤치마크 모델(YOLO-MFD, EB-YOLOv8, DeepLabV3+)에 대해:
+각 벤치마크 모델(YOLO-MFD, EB-YOLOv8)에 대해:
 
-1. 4개 데이터셋 그룹별로 독립 학습 실행 (총 12회)
+1. 4개 데이터셋 그룹별로 독립 학습 실행 (총 8회)
    - Baseline (Raw) / Baseline (Trad) / CASDA-Full / CASDA-Pruning
 2. 동일 테스트 세트에 대해 추론 실행
 3. 성능 지표(mAP, Dice Score) 산출
@@ -190,20 +189,16 @@ v4 학습에서는 이전 버전에서 확인된 RGB 색상 아티팩트 문제�
 
 ### 6.1 성능 비교 테이블 (목표 형식)
 
-| 모델       | 데이터셋         | mAP@0.5 | Dice  | Class1 AP | Class2 AP | Class3 AP | Class4 AP |
-|------------|------------------|---------|-------|-----------|-----------|-----------|-----------|
-| YOLO-MFD   | Baseline (Raw)   |         |       |           |           |           |           |
-| YOLO-MFD   | Baseline (Trad)  |         |       |           |           |           |           |
-| YOLO-MFD   | CASDA-Full       |         |       |           |           |           |           |
-| YOLO-MFD   | CASDA-Pruning    |         |       |           |           |           |           |
-| EB-YOLOv8  | Baseline (Raw)   |         |       |           |           |           |           |
-| EB-YOLOv8  | Baseline (Trad)  |         |       |           |           |           |           |
-| EB-YOLOv8  | CASDA-Full       |         |       |           |           |           |           |
-| EB-YOLOv8  | CASDA-Pruning    |         |       |           |           |           |           |
-| DeepLabV3+ | Baseline (Raw)   |         |       |           |           |           |           |
-| DeepLabV3+ | Baseline (Trad)  |         |       |           |           |           |           |
-| DeepLabV3+ | CASDA-Full       |         |       |           |           |           |           |
-| DeepLabV3+ | CASDA-Pruning    |         |       |           |           |           |           |
+| 모델       | 데이터셋         | mAP@0.5 | Class1 AP | Class2 AP | Class3 AP | Class4 AP |
+|------------|------------------|---------|-----------|-----------|-----------|-----------|
+| YOLO-MFD   | Baseline (Raw)   | 0.5546  | 0.5090    | 0.4525    | 0.6806    | 0.5764    |
+| YOLO-MFD   | Baseline (Trad)  | 0.4880  | 0.5126    | 0.2444    | 0.6379    | 0.5572    |
+| YOLO-MFD   | Copy-Paste       | 0.5257  | 0.5076    | 0.3811    | 0.6501    | 0.5641    |
+| YOLO-MFD   | CASDA (Pruning)  | 0.5835  | 0.5298    | 0.5317    | 0.6886    | 0.5839    |
+| EB-YOLOv8  | Baseline (Raw)   |         |           |           |           |           |
+| EB-YOLOv8  | Baseline (Trad)  |         |           |           |           |           |
+| EB-YOLOv8  | Copy-Paste       |         |           |           |           |           |
+| EB-YOLOv8  | CASDA (Pruning)  |         |           |           |           |           |
 
 ### 6.2 핵심 검증 가설
 
@@ -211,7 +206,7 @@ v4 학습에서는 이전 버전에서 확인된 RGB 색상 아티팩트 문제�
 |------|-------------------------------------------------------------------|------------------------------|
 | H1   | CASDA 증강 데이터는 전통 증강보다 mAP를 유의미하게 향상시킨다     | CASDA-Full vs Baseline(Trad) |
 | H2   | 품질 기반 선별(Pruning)이 전수 사용보다 효율적이다                | CASDA-Pruning vs CASDA-Full  |
-| H3   | CASDA 증강 효과는 모델 아키텍처에 독립적이다 (범용성)             | 3종 모델 전체에서 일관된 향상|
+| H3   | CASDA 증강 효과는 모델 아키텍처에 독립적이다 (범용성)             | YOLO-MFD·EB-YOLOv8 양쪽에서 방향 일치 확인 |
 | H4   | CASDA는 소수 클래스(Class 3, 4)의 성능을 특히 개선한다            | 클래스별 AP 비교             |
 | H5   | CASDA 합성 이미지는 물리적으로 타당하다 (FID 기준)                | FID Score 비교               |
 

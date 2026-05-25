@@ -355,11 +355,23 @@ class UltralyticsTrainer:
 
         # Check for resume
         resume_path = None
+        current_epoch = 0  # epoch already trained (read from checkpoint)
         if self.resume:
             last_pt = Path(train_dir) / run_name / "weights" / "last.pt"
             if last_pt.exists():
                 resume_path = str(last_pt)
-                logger.info(f"Resuming from: {resume_path}")
+                try:
+                    import torch as _torch
+                    ckpt = _torch.load(resume_path, map_location='cpu', weights_only=False)
+                    # Ultralytics stores 0-indexed last completed epoch in 'epoch'
+                    current_epoch = int(ckpt.get('epoch', -1)) + 1
+                    logger.info(
+                        f"Resuming from: {resume_path} "
+                        f"(checkpoint epoch {current_epoch} / target {self.epochs})"
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not read checkpoint epoch: {e}")
+                    logger.info(f"Resuming from: {resume_path}")
 
         # Run training
         train_kwargs = dict(
@@ -412,11 +424,67 @@ class UltralyticsTrainer:
                         f"degrees={train_kwargs['degrees']}, scale={train_kwargs['scale']}, "
                         f"hsv_v={train_kwargs['hsv_v']}, mosaic=0, mixup=0, copy_paste=0")
 
+        epochs_to_train = self.epochs  # used later for early_stopped detection
+
         if resume_path:
-            # For resume, load from last.pt and continue
-            from ultralytics import YOLO
-            model = YOLO(resume_path)
-            train_kwargs['resume'] = True
+            from ultralytics import YOLO as _YOLO
+            remaining_epochs = self.epochs - current_epoch
+
+            # ── Case 1: already at/past target ──────────────────────────────
+            if remaining_epochs <= 0:
+                logger.info(
+                    f"Checkpoint epoch {current_epoch} >= target {self.epochs}. "
+                    f"Skipping training, evaluating best model."
+                )
+                best_pt = Path(train_dir) / run_name / "weights" / "best.pt"
+                eval_path = str(best_pt) if best_pt.exists() else resume_path
+                _model = _YOLO(eval_path)
+                test_metrics = self._evaluate_test(_model, dataset_yaml)
+
+                # Read history from existing results.csv
+                history: Dict = {
+                    'train_loss': [], 'val_loss': [], 'val_metric': [],
+                    'learning_rate': [], 'best_epoch': 0, 'best_metric': 0.0,
+                }
+                results_csv = Path(train_dir) / run_name / "results.csv"
+                if results_csv.exists():
+                    try:
+                        df = pd.read_csv(results_csv)
+                        df.columns = [c.strip() for c in df.columns]
+                        if 'metrics/mAP50(B)' in df.columns:
+                            history['val_metric'] = df['metrics/mAP50(B)'].tolist()
+                            best_idx = int(df['metrics/mAP50(B)'].idxmax())
+                            history['best_epoch'] = best_idx
+                            history['best_metric'] = float(df['metrics/mAP50(B)'].iloc[best_idx])
+                    except Exception as e:
+                        logger.warning(f"Could not parse results.csv: {e}")
+                history.update({
+                    'early_stopped': False,
+                    'stopped_epoch': current_epoch,
+                    'max_epochs': self.epochs,
+                    'total_time_seconds': 0.0,
+                    'use_amp': self.use_amp,
+                })
+                history_path = self.output_dir / f"{run_name}_history.json"
+                with open(history_path, 'w') as f:
+                    json.dump(history, f, indent=2)
+                logger.info(f"Training history saved to: {history_path}")
+                self.history = history
+                return test_metrics
+
+            # ── Case 2: continue training ────────────────────────────────────
+            # Load weights from checkpoint WITHOUT Ultralytics resume=True.
+            # resume=True causes Ultralytics to re-read args.yaml from the run
+            # directory, overriding our epochs kwarg with the original value.
+            # Instead: load weights directly → optimizer resets, but epochs
+            # target is respected exactly.
+            model = _YOLO(resume_path)
+            train_kwargs['epochs'] = remaining_epochs
+            epochs_to_train = remaining_epochs
+            logger.info(
+                f"Loaded checkpoint (epoch {current_epoch}), "
+                f"training {remaining_epochs} more epochs → target epoch {self.epochs}"
+            )
 
         results = model.train(**train_kwargs)
 
@@ -425,9 +493,10 @@ class UltralyticsTrainer:
         total_time = time.time() - start_time
 
         # Determine early stopping info
+        # epochs_to_train = remaining_epochs when resuming, self.epochs otherwise
         total_epochs_trained = len(history.get('val_metric', []))
-        early_stopped = total_epochs_trained < self.epochs
-        stopped_epoch = total_epochs_trained if early_stopped else self.epochs
+        early_stopped = total_epochs_trained < epochs_to_train
+        stopped_epoch = current_epoch + total_epochs_trained
 
         history['early_stopped'] = early_stopped
         history['stopped_epoch'] = stopped_epoch

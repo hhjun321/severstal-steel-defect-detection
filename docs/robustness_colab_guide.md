@@ -193,7 +193,9 @@ print(f"Saved: {out_dir}/lpips_results.json")
 ## P1 — Multi-Seed 반복 실험
 
 > **이 단계가 가장 오래 걸립니다.**  
-> seed 3개 × group 3개 = 9번 학습. T4 기준 약 13–18시간.
+> model 2개(yolo_mfd, eb_yolov8) × group 3개 × seed 3개 = 18번 학습. T4 기준 약 9–12시간.  
+> DeepLabV3+는 논문에서 제거됨 — Detection 2종(YOLO-MFD, EB-YOLOv8)만 사용.  
+> H3은 Friedman 대신 방향 일치 정성 확인으로 대체 — §참고 참조.
 
 ### P1-1. 학습 이미지 로컬 디스크 복사 (Drive I/O 병목 해소)
 
@@ -207,10 +209,12 @@ print(f"Saved: {out_dir}/lpips_results.json")
 
 ```python
 # 셀 P1-2-seed42
+# --models yolo_mfd eb_yolov8: 논문 대상 모델 2종 (DeepLabV3+는 논문에서 제거됨)
 !python $SCRIPTS/run_benchmark.py \
   --config    $CONFIG \
   --data-dir  $LOCAL_IMAGES \
   --groups    baseline_raw casda_composed_pruning copypaste \
+  --models    yolo_mfd eb_yolov8 \
   --casda-dir $AUG_DATASET \
   --yolo-dir  $YOLO_DATASETS \
   --seed      42 \
@@ -224,6 +228,7 @@ print(f"Saved: {out_dir}/lpips_results.json")
   --config    $CONFIG \
   --data-dir  $LOCAL_IMAGES \
   --groups    baseline_raw casda_composed_pruning copypaste \
+  --models    yolo_mfd eb_yolov8 \
   --casda-dir $AUG_DATASET \
   --yolo-dir  $YOLO_DATASETS \
   --seed      123 \
@@ -237,6 +242,7 @@ print(f"Saved: {out_dir}/lpips_results.json")
   --config    $CONFIG \
   --data-dir  $LOCAL_IMAGES \
   --groups    baseline_raw casda_composed_pruning copypaste \
+  --models    yolo_mfd eb_yolov8 \
   --casda-dir $AUG_DATASET \
   --yolo-dir  $YOLO_DATASETS \
   --seed      456 \
@@ -246,7 +252,8 @@ print(f"Saved: {out_dir}/lpips_results.json")
 
 > **중단 후 재시작 시** `--resume` 추가:
 > ```python
-> !python $SCRIPTS/run_benchmark.py ... --resume \
+> !python $SCRIPTS/run_benchmark.py ... \
+>   --models yolo_mfd eb_yolov8 --resume \
 >   --output-dir $BENCHMARK_RESULTS/multiseed/seed_42
 > ```
 
@@ -330,9 +337,15 @@ Wilcoxon 검정의 최소 p-value는 n에 따라 제한된다.
 | n | 최소 p-value (단측) |
 |---|-------------------|
 | 3 | 0.125 |
+| 6 (3 seed × 2 model) | ~0.016 |
 | 9 (3 seed × 3 model) | ~0.004 |
 
-H4, H6는 3 seed × 3 모델 = **n=9 관측값** → α=0.05 달성 가능.
+DeepLabV3+ 제외 후: H4, H6는 3 seed × 2 모델 = **n=6 관측값** → 단측 최소 p≈0.016, α=0.05 달성 가능.
+
+**H3 Friedman 검정 재설계 필요:**  
+Friedman test는 3개 이상의 그룹(모델)이 필요하다. 모델이 2개(yolo_mfd, eb_yolov8)로 줄어들면 Friedman 대신 **Wilcoxon signed-rank (paired)** 로 대체한다.  
+비교 쌍: (casda − baseline) 차이를 yolo_mfd vs eb_yolov8 간 paired 검정.  
+H3 주장("아키텍처 독립적 향상")은 두 모델 모두에서 방향이 일치하는지 확인으로 서술 가능.
 
 ### KID 해석
 

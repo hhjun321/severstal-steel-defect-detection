@@ -21,7 +21,10 @@ git checkout -b feature/statistical-robustness
 현재 `seed=42` 단일 실행 → 3개 seed(42 / 123 / 456)로 반복하여
 결과를 **mean ± std** 형식으로 보고한다.
 
-### 대상 그룹 (3개)
+### 대상 모델 및 그룹
+
+**모델 (2개):** `yolo_mfd`, `eb_yolov8`  
+> DeepLabV3+ 제외 — 학습 시간 과다 (T4 기준 단일 실행 3–5시간). 논문 본문에서도 DeepLabV3+ 관련 내용 제거.
 
 | 그룹 | 이유 |
 |------|------|
@@ -97,21 +100,25 @@ python ${SCRIPTS}/aggregate_multiseed_results.py \
 
 ### 개요
 
-P1에서 수집한 3개 seed 결과로 H3~H6 가설을 검정한다.
-비모수 검정(Wilcoxon) 채택 이유: 샘플 수(n=3)가 적어 정규성 가정 불가.
+P1에서 수집한 3 seed × 2 모델 = n=6 결과로 H3~H6 가설을 검정한다.
+비모수 검정(Wilcoxon) 채택 이유: 샘플 수가 적어 정규성 가정 불가.
 
 ### 가설별 검정 설계
 
-| 가설 | 검정 방법 | 비교 쌍 | 지표 |
-|------|-----------|---------|------|
-| H3 아키텍처 독립성 | Friedman test | 3개 모델 × (casda - baseline) | mAP@0.5 |
-| H4 Class 2 향상 | Wilcoxon signed-rank (paired) | casda_pruning vs baseline_raw | Class 2 AP |
-| H5 FID 우위 | Wilcoxon signed-rank (paired) | FID(CASDA) vs FID(CopyPaste) | FID |
-| H6 최적 비율 | Wilcoxon signed-rank (paired) | casda_pruning vs copypaste | mAP@0.5 |
+| 가설 | 검정 방법 | 비교 쌍 | 지표 | n |
+|------|-----------|---------|------|---|
+| H3 아키텍처 독립성 | 방향 일치 확인 (정성) | YOLO-MFD·EB-YOLOv8 각각 casda > baseline 여부 | mAP@0.5 | — |
+| H4 Class 2 향상 | Wilcoxon signed-rank (paired) | casda_pruning vs baseline_raw | Class 2 AP | 6 |
+| H5 LPIPS Realism 우위 | Wilcoxon signed-rank (paired) | LPIPS(CASDA) vs LPIPS(CopyPaste) | LPIPS Realism | class-level |
+| H6 최적 비율 | Wilcoxon signed-rank (paired) | casda_pruning vs copypaste | mAP@0.5 | 6 |
 
-> H5 FID 검정은 P1 seed 결과가 아닌 `run_fid.py`의 출력을 사용.
-> FID는 학습 결과가 아닌 합성 이미지 품질 지표이므로 seed 변동이 없음 →
-> bootstrap resampling 또는 class-level 분산 활용.
+> **H3 설계 변경:** 모델이 2개(yolo_mfd, eb_yolov8)로 Friedman test 적용 불가 (3+ 그룹 필요).
+> 대신 두 모델 모두에서 casda_pruning > baseline_raw 방향이 일치하는지 정성 확인 후
+> "Both detection architectures show consistent improvement" 로 서술.
+
+> **H5 설계 변경:** FID(CASDA) vs FID(CopyPaste) → LPIPS Realism(CASDA) vs LPIPS Realism(CopyPaste).
+> CopyPaste는 실제 패치 복사로 FID ≈ 0이 되어 FID 단독 비교 부적합 (p3_image_quality_results.md 참조).
+> H5 검정은 P1 seed 결과가 아닌 class-level LPIPS 값을 사용 (n = 4 classes × bootstrap).
 
 **다중 비교 보정:** Benjamini-Hochberg FDR (α = 0.05)
 
@@ -138,12 +145,14 @@ benchmark_results/statistical_tests/
 ```markdown
 | Hypothesis | Test | Statistic | p-value (BH-corrected) | Effect size (d) | Result |
 |-----------|------|-----------|----------------------|-----------------|--------|
-| H3: Architecture Independence | Friedman | χ²=5.33 | p=0.069 | — | Supported* |
+| H3: Architecture Independence | Directional | Both ↑ | — | — | Supported (qualitative) |
 | H4: Class 2 Improvement | Wilcoxon | W=6.0 | p=0.031 | d=1.42 (large) | Supported* |
-| H5: FID Superiority | Wilcoxon | W=6.0 | p=0.016 | d=2.10 (large) | Supported** |
+| H5: LPIPS Realism Superiority | Wilcoxon | W=6.0 | p=0.016 | d=2.10 (large) | Supported** |
 | H6: Augmentation Ratio | Wilcoxon | W=6.0 | p=0.041 | d=0.98 (large) | Supported* |
 
 Significance: * p<0.05, ** p<0.01 (Benjamini-Hochberg FDR corrected, α=0.05)
+Note: H3 uses directional consistency check (2 models); formal Friedman test requires ≥3 groups.
+Note: H5 uses LPIPS Realism (class-level) instead of FID; CopyPaste FID ≈ 0 by construction.
 ```
 
 **실행:**

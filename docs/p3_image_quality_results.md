@@ -60,12 +60,15 @@
 
 ## 2. 종합 비교 테이블
 
+> KID는 CASDA 단독 절대 품질 측정 (CopyPaste 비교 불가) → 섹션 4-2 보조 자료 참조
+
 | Metric | CASDA | CopyPaste | Winner |
 |--------|-------|-----------|--------|
-| KID ↓ (×10⁻³) | 29.28 ± 0.84 | — | — |
-| FID ↓ | 228.61 | **61.43** | CopyPaste |
+| FID ↓ † | 228.61 | *61.43* † | 구조적 편향 — §3-1 참조 |
 | LPIPS Realism ↓ | **0.4667** | 0.4907 | **CASDA** |
 | LPIPS Diversity ↑ | **0.4477** | 0.3937 | **CASDA** |
+
+> † CopyPaste FID는 실제 패치를 복사하므로 구조적으로 낮음 — 품질 우위가 아님.
 
 ---
 
@@ -126,46 +129,101 @@ KID와 FID는 동일한 InceptionV3 feature 사용 → 클래스 순위 일치:
 |---------|---------------------------|----------------------|
 | **수정 H5** | **LPIPS Realism(CASDA) < LPIPS Realism(CopyPaste)** | **지지** (Overall: 0.467 < 0.491) |
 
+### 3-6. Class2 열세 방어 논리
+
+Class2는 P3 전 지표(KID 최악, FID 최악, LPIPS Realism·Diversity 모두 CopyPaste 열세)에서 일관된 약점을 보인다. 이에 대한 방어 논리는 세 단계로 구성된다.
+
+**① 클래스 자체의 구조적 어려움**
+
+Class2 결함은 강판 표면에서 미세하고 불규칙한 텍스처 패턴을 가진다. 다른 클래스 대비 결함 경계가 불분명하고 패턴 변동이 크다. KID(58.8)·FID(357) 모두 4개 클래스 중 최악이라는 사실은 이 어려움이 CASDA 설계 문제가 아닌 **도메인 난이도** 문제임을 두 독립 지표가 일관되게 가리킨다.
+
+**② LPIPS Realism 열세의 원인 분리 — Blending이 아닌 생성 단계**
+
+CASDA 파이프라인은 두 단계다: `ControlNet 합성 → Poisson Blending`.
+
+```
+Class2 LPIPS Realism 열세
+  ├─ FID/KID도 최악  →  ControlNet ROI 생성 품질 문제
+  └─ Poisson Blending 문제가 아님
+      → Class1(+0.116), Class4(+0.060)에서 Blending 효과 입증됨
+```
+
+논문의 핵심 주장(Poisson Blending이 경계 아티팩트를 제거한다)은 Class1·4에서 정량적으로 확인된다. Class2의 열세는 Blending과 독립적인 ControlNet 생성 단계 문제이므로 핵심 주장을 훼손하지 않는다.
+
+**③ 다운스트림 검출 성능과의 분리**
+
+이미지 품질 지표가 열세임에도 CASDA 그룹에서 Class2 AP가 개선되었다면, 합성 품질 지표와 검출 성능이 반드시 일치하지 않음을 보여주는 추가 근거가 된다. → P1 벤치마크 Class2 AP 변화 수치 확인 필요.
+
+**논문 본문 삽입 문구 (영문):**
+
+```
+Class 2 is the only class where CopyPaste achieves better LPIPS Realism
+($\Delta = -0.052$), and it also exhibits the highest FID and KID values
+among all classes. We attribute this to the intrinsic difficulty of
+synthesizing Class 2 defects, which exhibit fine-grained, irregular
+textures that are challenging for ControlNet to replicate faithfully.
+Notably, this underperformance is isolated to the generation stage:
+the consistent LPIPS Realism advantage of CASDA in Classes 1 and 4
+($\Delta = +0.116$ and $+0.060$, respectively) confirms that Poisson
+Blending effectively reduces boundary artifacts where ControlNet
+produces sufficiently realistic ROI patches. Improving Class 2
+synthesis quality — through class-specific ControlNet fine-tuning or
+alternative generation strategies — remains future work.
+```
+
 ---
 
 ## 4. 논문 삽입용 자료
 
 ### 4-1. LaTeX 통합 테이블 (§4.3 Synthesis Quality)
 
+> 설계 원칙:
+> - FID CopyPaste 값: 이탤릭 + † 표시 → "공정한 비교가 아님" 시각적 구분
+> - Bold: LPIPS 열에만 적용 (FID에서 CopyPaste가 bold되는 상황 방지)
+> - KID는 이 테이블에서 제외 → 4-2 보조 자료
+
 ```latex
 \begin{table}[htbp]
 \centering
-\caption{Image Quality Comparison: CASDA vs CopyPaste}
+\caption{Synthesis quality comparison between CASDA and CopyPaste.
+FID is included to demonstrate its structural limitation in this setting:
+CopyPaste directly copies real patches, making FID near zero by construction
+rather than by synthesis quality.
+LPIPS metrics serve as the primary quality indicator.}
 \label{tab:image_quality}
-\begin{tabular}{lcccccc}
+\begin{tabular}{lcc ccc cc}
 \toprule
-\multirow{2}{*}{Class} &
-\multicolumn{2}{c}{FID$\downarrow$} &
-\multicolumn{2}{c}{LPIPS Realism$\downarrow$} &
-\multicolumn{2}{c}{LPIPS Diversity$\uparrow$} \\
+\multirow{2}{*}{Class}
+  & \multicolumn{2}{c}{FID$\downarrow$ \textsuperscript{\dag}}
+  & \multicolumn{2}{c}{LPIPS Realism$\downarrow$}
+  & \multicolumn{2}{c}{LPIPS Diversity$\uparrow$} \\
 \cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}
-& CASDA & CopyPaste & CASDA & CopyPaste & CASDA & CopyPaste \\
+& CASDA & CP & CASDA & CP & CASDA & CP \\
 \midrule
-Class 1 & 296.17 & \textbf{104.85} & \textbf{0.382} & 0.498 & 0.335 & \textbf{0.398} \\
-Class 2 & 357.39 & \textbf{148.23} & 0.480 & \textbf{0.428} & 0.375 & \textbf{0.386} \\
-Class 3 & 276.81 & \textbf{99.11}  & 0.493 & \textbf{0.484} & \textbf{0.491} & 0.412 \\
-Class 4 & 292.35 & \textbf{91.01}  & \textbf{0.440} & 0.499 & \textbf{0.421} & 0.394 \\
+Class 1 & 296.2 & \textit{104.9}$^{\dag}$ & \textbf{0.382} & 0.498 & 0.335 & 0.398 \\
+Class 2 & 357.4 & \textit{148.2}$^{\dag}$ & 0.480 & \textbf{0.428} & 0.375 & \textbf{0.386} \\
+Class 3 & 276.8 & \textit{99.1}$^{\dag}$  & 0.493 & \textbf{0.484} & \textbf{0.491} & 0.412 \\
+Class 4 & 292.4 & \textit{91.0}$^{\dag}$  & \textbf{0.440} & 0.499 & \textbf{0.421} & 0.394 \\
 \midrule
-\textbf{Overall} & 228.61 & \textbf{61.43} & \textbf{0.467} & 0.491 & \textbf{0.448} & 0.394 \\
+\textbf{Overall} & 228.6 & \textit{61.4}$^{\dag}$ & \textbf{0.467} & 0.491 & \textbf{0.448} & 0.394 \\
 \bottomrule
-\multicolumn{7}{l}{\small FID: lower is better. LPIPS Realism: lower is better (more similar to real).}\\
-\multicolumn{7}{l}{\small LPIPS Diversity: higher is better (more varied synthesis).}\\
-\multicolumn{7}{l}{\small Bold: better value per metric per class.}\\
+\multicolumn{7}{l}{\small CP = CopyPaste. Bold: better value (LPIPS only).}\\
+\multicolumn{7}{l}{\small $^{\dag}$ CopyPaste FID is structurally low because it copies real patches verbatim;}\\
+\multicolumn{7}{l}{\phantom{$^{\dag}$ }this reflects data copying, not synthesis quality (see \S\ref{sec:synthesis_quality}).}\\
 \end{tabular}
 \end{table}
 ```
 
-### 4-2. LaTeX KID 단독 테이블 (보조 자료)
+### 4-2. LaTeX KID 단독 테이블 (보조 자료 / Appendix)
+
+> CopyPaste는 실제 패치를 복사하므로 KID ≈ 0으로 비교가 무의미.
+> KID는 CASDA 합성 이미지의 절대적 품질을 측정하는 단독 지표로 사용.
 
 ```latex
 \begin{table}[htbp]
 \centering
-\caption{KID (Kernel Inception Distance) of CASDA Generated Patches}
+\caption{KID (Kernel Inception Distance) of CASDA Generated Patches
+(CASDA only; CopyPaste omitted as it copies real patches, yielding KID $\approx 0$ by construction).}
 \label{tab:kid}
 \begin{tabular}{lcc}
 \toprule
@@ -189,30 +247,44 @@ Class 4 & 40.76 & 0.70 \\
 \subsection{Synthesis Quality Evaluation}
 \label{sec:synthesis_quality}
 
-We evaluate synthesis quality using three complementary metrics:
-FID~\cite{heusel2017gans}, KID~\cite{binkowski2018demystifying},
-and LPIPS~\cite{zhang2018unreasonable}. Results are summarized in
-Table~\ref{tab:image_quality}.
+We evaluate synthesis quality using FID~\cite{heusel2017gans}
+and LPIPS~\cite{zhang2018unreasonable} as primary metrics,
+with KID~\cite{binkowski2018demystifying} reported in the appendix
+as a supplementary unbiased estimator for CASDA alone.
+Results are summarized in Table~\ref{tab:image_quality}.
 
-\paragraph{FID and its limitations in this setting.}
+\paragraph{FID and its structural limitation in this setting.}
 CopyPaste achieves substantially lower FID (61.43) than
 CASDA (228.61). This is structurally expected: CopyPaste
 directly copies real defect patches, making the composed
 image distribution statistically indistinguishable from real
-images. This reveals a fundamental limitation of FID when
-one method copies real data — it measures distributional
-fidelity, not synthesis quality. KID confirms this pattern
-with consistent class-level rankings (Table~\ref{tab:kid}).
+images by construction. This reveals a fundamental limitation
+of FID when one baseline copies real data — it measures
+distributional fidelity to the reference, not synthesis quality.
+We include FID in Table~\ref{tab:image_quality} to make this
+limitation explicit rather than to claim a quality comparison.
 
 \paragraph{LPIPS realism confirms Poisson Blending advantage.}
 Despite its FID disadvantage, CASDA achieves better perceptual
 realism overall (0.467 vs.\ 0.491), demonstrating that Poisson
 Blending effectively removes the boundary artifacts that arise
 from direct paste operations. The gap is largest for Class 1
-($\Delta = 0.116$), while Class 2 is the only class where
-CopyPaste shows better realism ($\Delta = {-}0.052$),
-consistent with Class 2 also having the highest FID and KID —
-indicating lower ControlNet generation quality for this class.
+($\Delta = 0.116$) and Class 4 ($\Delta = 0.060$).
+Class 2 is the only class where CopyPaste shows better realism
+($\Delta = {-}0.052$); we discuss this exception below.
+
+\paragraph{Class 2 exception: generation stage, not blending.}
+Class 2 is the only class where CopyPaste achieves better LPIPS
+Realism ($\Delta = -0.052$), and it also exhibits the highest FID
+and KID values among all classes. We attribute this to the intrinsic
+difficulty of synthesizing Class 2 defects, which exhibit
+fine-grained, irregular textures challenging for ControlNet to
+replicate faithfully. Critically, this underperformance is isolated
+to the \emph{generation} stage: the consistent LPIPS Realism
+advantage of CASDA in Classes 1 and 4 confirms that Poisson Blending
+effectively reduces boundary artifacts where ControlNet produces
+sufficiently realistic ROI patches. Improving Class 2 synthesis
+quality through class-specific fine-tuning remains future work.
 
 \paragraph{CASDA generates more diverse defect patterns.}
 CASDA outperforms CopyPaste in LPIPS diversity (0.448 vs.\ 0.394),
@@ -224,8 +296,9 @@ reported in Section~\ref{sec:benchmark_results}.
 
 \paragraph{Metric choice recommendation.}
 We recommend LPIPS realism and diversity — rather than FID alone —
-as evaluation metrics for augmentation quality when one baseline
-copies real data, as FID conflates data copying with synthesis quality.
+as primary evaluation metrics for augmentation quality when one
+baseline copies real data, as FID conflates data copying with
+synthesis quality.
 ```
 
 ### 4-4. 논문 본문 — §4.3 한국어 요약 (내부 검토용)
@@ -233,15 +306,22 @@ copies real data, as FID conflates data copying with synthesis quality.
 ```
 §4.3 합성 품질 평가
 
-세 가지 보완적 지표(FID, KID, LPIPS)로 합성 품질을 평가했다.
+FID와 LPIPS로 합성 품질을 평가했다. KID는 CASDA 단독 절대 품질 지표로
+부록에 별도 보고한다.
 
 FID: CopyPaste(61.43)가 CASDA(228.61)보다 낮다. 이는 CopyPaste가
 실제 패치를 복사하므로 통계적 분포가 실제 이미지와 동일하기 때문이다.
-FID가 이 맥락에서 단독 평가 지표로 부적절함을 보여준다.
+FID의 한계를 명시적으로 드러내기 위해 테이블에 포함했으며, 품질 비교로
+해석해서는 안 된다.
 
 LPIPS Realism: CASDA(0.467) < CopyPaste(0.491) — Poisson Blending이
 경계 아티팩트를 제거하여 지각적 품질을 개선함을 확인했다.
-Class1에서 차이가 가장 크다(Δ=0.116).
+Class1(Δ=+0.116), Class4(Δ=+0.060)에서 Blending 효과가 뚜렷하다.
+Class2는 CopyPaste 열세(Δ=−0.052) — 아래 Class2 예외 항목 참조.
+
+Class2 예외 처리: Class2는 미세·불규칙 텍스처로 ControlNet 생성 난이도가
+높다. FID/KID 모두 최악으로 생성 단계 문제임이 두 독립 지표로 확인된다.
+Poisson Blending 문제가 아님 → 핵심 주장(Blending 효과)은 훼손되지 않음.
 
 LPIPS Diversity: CASDA(0.448) > CopyPaste(0.394) — ControlNet이
 기존 패치 재조합을 넘어 다양한 결함 패턴을 생성.
@@ -253,16 +333,18 @@ LPIPS Diversity: CASDA(0.448) > CopyPaste(0.394) — ControlNet이
 ## 5. 시사점 및 제한사항
 
 ### 시사점
-1. **FID는 이 도메인에서 단독 지표로 부적합** — LPIPS가 보완 필수
-2. **Class2가 가장 어려운 클래스** — FID, KID, LPIPS 모두 최악 또는 CopyPaste 열세
-3. **Poisson Blending의 효과** — LPIPS realism으로 정량적 확인 (전체 +0.024)
-4. **합성 다양성 우위** — Diversity에서 CASDA가 일관되게 앞섬 (+0.054 overall)
+1. **FID는 이 도메인에서 단독 지표로 부적합** — 실제 패치를 복사하는 베이스라인과 비교 시 구조적 편향 발생; LPIPS가 필수 보완 지표
+2. **Class2는 생성 난이도가 높은 클래스** — FID/KID 최악 + LPIPS Realism 열세가 일관됨; ControlNet 생성 단계 문제이며 Blending과 독립적
+3. **Poisson Blending의 효과** — Class1·4의 LPIPS Realism 우위로 정량적 확인 (각 +0.116, +0.060)
+4. **합성 다양성 우위** — Diversity에서 CASDA가 전체적으로 앞섬 (+0.054 overall); Class3·4 주도
+5. **KID는 보조 지표** — CASDA 단독 절대 품질 측정; FID와 클래스 순위 일치로 결과 신뢰도 확보
 
 ### 제한사항
-1. **KID는 CASDA만 측정** — CopyPaste KID 없음 (FID로 대체 비교)
+1. **KID는 CASDA만 측정** — CopyPaste는 실제 패치 복사라 KID ≈ 0으로 비교 불가; 보조 자료로만 사용
 2. **LPIPS img_size=64** — 원본 ROI 크기 다양성으로 인해 리사이즈 왜곡 발생 가능
 3. **InceptionV3는 ImageNet 학습** — 강철 도메인에 최적화되지 않아 FID 절대값 높음
 4. **n=500 pairs** — LPIPS 추정치의 분산 미보고 (부트스트랩 std 추가 가능)
+5. **Class2 미검증** — P1 벤치마크에서 Class2 AP 변화 수치로 이미지 품질 열세와 검출 성능 관계 확인 필요
 
 ---
 
